@@ -2,6 +2,9 @@
 //!
 //! Provides common functionality for all sz-* command-line utilities including
 //! input/output handling, UTF-8 validation, and line iteration.
+//!
+//! Note: Not all functions are used by every binary. The #[allow(dead_code)]
+//! attributes prevent warnings for legitimately shared code.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
@@ -11,6 +14,7 @@ use memmap2::Mmap;
 use stringzilla::sz::find;
 
 /// Represents the input source - either a memory-mapped file or buffered stdin
+#[allow(dead_code)]
 pub enum InputSource {
     /// Memory-mapped file for zero-copy access
     MappedFile(Mmap),
@@ -18,6 +22,7 @@ pub enum InputSource {
     Buffer(Vec<u8>),
 }
 
+#[allow(dead_code)]
 impl InputSource {
     /// Get the input data as a byte slice
     pub fn as_bytes(&self) -> &[u8] {
@@ -29,6 +34,7 @@ impl InputSource {
 }
 
 /// Create an InputSource from either a file path or stdin
+#[allow(dead_code)]
 pub fn get_input(path: Option<&str>) -> io::Result<InputSource> {
     match path {
         None | Some("-") => {
@@ -45,6 +51,7 @@ pub fn get_input(path: Option<&str>) -> io::Result<InputSource> {
 }
 
 /// Create an output writer from either a file path or stdout
+#[allow(dead_code)]
 pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
     match path {
         None | Some("-") => Ok(Box::new(BufWriter::new(io::stdout()))),
@@ -56,6 +63,7 @@ pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
 }
 
 /// Validate that data is valid UTF-8
+#[allow(dead_code)]
 pub fn validate_utf8(data: &[u8]) -> Result<(), io::Error> {
     str::from_utf8(data).map_err(|e| {
         io::Error::new(
@@ -67,11 +75,13 @@ pub fn validate_utf8(data: &[u8]) -> Result<(), io::Error> {
 }
 
 /// Iterator over lines in a byte slice, using StringZilla for fast newline search
+#[allow(dead_code)]
 pub struct LineIterator<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
+#[allow(dead_code)]
 impl<'a> LineIterator<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
@@ -111,6 +121,7 @@ impl<'a> Iterator for LineIterator<'a> {
 }
 
 /// Count lines in data using SIMD-accelerated search
+#[allow(dead_code)]
 pub fn count_lines(data: &[u8]) -> usize {
     let mut count = 0;
     let mut pos = 0;
@@ -133,6 +144,7 @@ pub fn count_lines(data: &[u8]) -> usize {
 }
 
 /// Count words in data (whitespace-separated sequences)
+#[allow(dead_code)]
 pub fn count_words(data: &[u8]) -> usize {
     let mut count = 0;
     let mut in_word = false;
@@ -151,13 +163,10 @@ pub fn count_words(data: &[u8]) -> usize {
 }
 
 /// Count UTF-8 characters (code points) in data
+#[allow(dead_code)]
 pub fn count_chars_utf8(data: &[u8]) -> Result<usize, io::Error> {
-    let text = str::from_utf8(data).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid UTF-8: {}", e),
-        )
-    })?;
+    let text = str::from_utf8(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid UTF-8: {}", e)))?;
     Ok(text.chars().count())
 }
 

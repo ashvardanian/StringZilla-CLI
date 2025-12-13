@@ -31,6 +31,7 @@ use clap::Parser;
 use ignore::WalkBuilder;
 use memmap2::Mmap;
 use stringzilla::sz;
+use stringzilla::sz::{StringZillableBinary, StringZillableUnary};
 
 mod shared;
 
@@ -94,125 +95,54 @@ struct Args {
     no_ignore: bool,
 }
 
-/// Count lines using ASCII newlines (fast path)
-fn count_lines_ascii(data: &[u8]) -> usize {
-    let mut count = 0;
-    let mut pos = 0;
-
-    while pos < data.len() {
-        if let Some(found) = sz::find(&data[pos..], b"\n") {
-            count += 1;
-            pos += found + 1;
-        } else {
-            break;
-        }
-    }
-
-    // If data doesn't end with newline but has content, count the last line
-    if !data.is_empty() && data.last() != Some(&b'\n') {
-        count += 1;
-    }
-
-    count
-}
-
-/// Count lines using Unicode newlines (UTF-8 mode)
-fn count_lines_utf8(data: &[u8]) -> usize {
-    let mut count = 0;
-    let mut pos = 0;
-
-    while pos < data.len() {
-        if let Some(span) = sz::find_newline_utf8(&data[pos..]) {
-            count += 1;
-            pos += span.offset + span.length;
-        } else {
-            break;
-        }
-    }
-
-    // If data doesn't end with newline but has content, count the last line
-    if !data.is_empty() {
-        let last_bytes = &data[data.len().saturating_sub(3)..];
-        if sz::find_newline_utf8(last_bytes).is_none() {
-            count += 1;
-        }
-    }
-
-    count
-}
-
-/// Count words using ASCII whitespace (fast path)
-fn count_words_ascii(data: &[u8]) -> usize {
-    let mut count = 0;
-    let mut in_word = false;
-
-    for &byte in data {
-        let is_whitespace = byte.is_ascii_whitespace();
-        if !is_whitespace && !in_word {
-            count += 1;
-            in_word = true;
-        } else if is_whitespace {
-            in_word = false;
-        }
-    }
-
-    count
-}
-
-/// Count words using Unicode whitespace (UTF-8 mode)
-fn count_words_utf8(data: &[u8]) -> usize {
-    let mut count = 0;
-    let mut in_word = false;
-    let mut pos = 0;
-
-    while pos < data.len() {
-        if let Some(span) = sz::find_whitespace_utf8(&data[pos..]) {
-            if span.offset > 0 && !in_word {
-                count += 1;
-                in_word = true;
-            }
-            in_word = false;
-            pos += span.offset + span.length;
-        } else {
-            // No more whitespace, check if we're in a word
-            if pos < data.len() && !in_word {
-                count += 1;
-            }
-            break;
-        }
-    }
-
-    count
-}
-
-/// Count all metrics for given data
+/// Count all metrics for given data using StringZilla iterators (single-pass)
 fn count_data(data: &[u8], utf8_mode: bool) -> io::Result<Counts> {
     let bytes = data.len();
+    let mut lines = 0;
+    let mut words = 0;
+    let mut chars = 0;
 
-    let lines = if utf8_mode {
-        count_lines_utf8(data)
+    if utf8_mode {
+        // UTF-8 mode: nested iteration through lines -> words -> chars
+        for line in data.sz_utf8_newline_splits() {
+            lines += 1;
+            for word in line.sz_utf8_whitespace_splits() {
+                words += 1;
+                // Count UTF-8 characters in this word
+                chars += sz::count_utf8(word);
+            }
+        }
+
+        Ok(Counts {
+            lines,
+            words,
+            bytes,
+            chars: Some(chars),
+        })
     } else {
-        count_lines_ascii(data)
-    };
+        // ASCII mode: nested iteration through lines -> words
+        for line in data.sz_splits(b"\n") {
+            lines += 1;
+            // Split line by ASCII whitespace
+            let mut in_word = false;
+            for &byte in line {
+                let is_whitespace = byte.is_ascii_whitespace();
+                if !is_whitespace && !in_word {
+                    words += 1;
+                    in_word = true;
+                } else if is_whitespace {
+                    in_word = false;
+                }
+            }
+        }
 
-    let words = if utf8_mode {
-        count_words_utf8(data)
-    } else {
-        count_words_ascii(data)
-    };
-
-    let chars = if utf8_mode {
-        Some(sz::count_utf8(data))
-    } else {
-        None
-    };
-
-    Ok(Counts {
-        lines,
-        words,
-        bytes,
-        chars,
-    })
+        Ok(Counts {
+            lines,
+            words,
+            bytes,
+            chars: None,
+        })
+    }
 }
 
 /// Count a single file
