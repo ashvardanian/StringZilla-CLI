@@ -11,7 +11,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::str;
 
 use memmap2::Mmap;
-use stringzilla::sz::find;
+use stringzilla::sz::{find, find_newline_utf8};
 
 /// Represents the input source - either a memory-mapped file or buffered stdin
 #[allow(dead_code)]
@@ -120,6 +120,49 @@ impl<'a> Iterator for LineIterator<'a> {
     }
 }
 
+/// UTF-8 aware line iterator that handles Unicode newlines
+///
+/// Unlike LineIterator which only handles LF (`\n`), this handles:
+/// - LF (`\n`), CR (`\r`), CRLF (`\r\n`)
+/// - Unicode NEL (U+0085)
+/// - Unicode LINE SEPARATOR (U+2028)
+/// - Unicode PARAGRAPH SEPARATOR (U+2029)
+#[allow(dead_code)]
+pub struct Utf8LineIterator<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+#[allow(dead_code)]
+impl<'a> Utf8LineIterator<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for Utf8LineIterator<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+
+        let start = self.pos;
+        match find_newline_utf8(&self.data[self.pos..]) {
+            Some(span) => {
+                let end = self.pos + span.offset;
+                self.pos = end + span.length; // skip the newline (variable length)
+                Some(&self.data[start..end])
+            }
+            None => {
+                self.pos = self.data.len();
+                Some(&self.data[start..])
+            }
+        }
+    }
+}
+
 /// Count lines in data using SIMD-accelerated search
 #[allow(dead_code)]
 pub fn count_lines(data: &[u8]) -> usize {
@@ -223,5 +266,39 @@ mod tests {
         assert!(validate_utf8(b"hello").is_ok());
         assert!(validate_utf8("héllo".as_bytes()).is_ok());
         assert!(validate_utf8(&[0xFF, 0xFE]).is_err());
+    }
+
+    #[test]
+    fn test_utf8_line_iterator() {
+        let data = b"line1\nline2\nline3\n";
+        let lines: Vec<_> = Utf8LineIterator::new(data).collect();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], b"line1");
+        assert_eq!(lines[1], b"line2");
+        assert_eq!(lines[2], b"line3");
+    }
+
+    #[test]
+    fn test_utf8_line_iterator_crlf() {
+        let data = b"line1\r\nline2\r\nline3";
+        let lines: Vec<_> = Utf8LineIterator::new(data).collect();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], b"line1");
+        assert_eq!(lines[1], b"line2");
+        assert_eq!(lines[2], b"line3");
+    }
+
+    #[test]
+    fn test_utf8_line_iterator_mixed() {
+        // Mix of LF and CRLF
+        let data = b"line1\nline2\r\nline3\n";
+        let lines: Vec<_> = Utf8LineIterator::new(data).collect();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], b"line1");
+        assert_eq!(lines[1], b"line2");
+        assert_eq!(lines[2], b"line3");
     }
 }
