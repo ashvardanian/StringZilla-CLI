@@ -16,14 +16,11 @@ memmap2 = "0.9"                                   # Memory-mapped file I/O
 stringzilla = { path = "../StringZilla" }         # SIMD-accelerated string operations
 walkdir = "2.4"                                   # Directory traversal
 ignore = "0.4"                                    # .gitignore support
+glob = "0.3"                                      # Glob pattern matching
 
 [dev-dependencies]
 tempfile = "3.10"
-criterion = { version = "0.8.1", features = ["html_reports"] }
 
-[[bench]]
-name = "benchmarks"
-harness = false
 
 [profile.release]
 lto = true        # Link-time optimization
@@ -58,3 +55,7 @@ path = "sz_cols.rs"
 [[bin]]
 name = "sz-rows"
 path = "sz_rows.rs"
+
+[[bin]]
+name = "sz-outline"
+path = "sz_outline.rs"

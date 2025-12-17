@@ -14,20 +14,18 @@ It provides the following subcommands:
 
 - `sz-find`: find all inclusions of a substring in a file similar to `grep`, but with a saner syntax
 - `sz-outline`: provide LLM with an outline of a file for Markdown, HTML, C, C++, and Python source files
-- `sz-replace`: replace all inclusions of a substring in a file... with a saner syntax than `sed` and `awk`; safe for larger-than-memory files
 - `sz-count`: 3x faster `wc` word count, that can actually handle UTF-8 properly
-- `sz-split`: 4x faster `split` file splitting, that won't break UTF-8 characters or lines
 - `sz-dedup`: deduplicate lines; safe for larger-than-memory files
+- `sz-split`: 4x faster `split` file splitting, that won't break UTF-8 characters or lines
 - `sz-cols`: extract columns from delimited text; replaces `cut -f` and `awk '{print $N}'` with simpler syntax
 - `sz-rows`: extract rows by index or range; replaces `sed -n`, `head`, `tail`, and `awk 'NR==N'`
 - :soon: `sz-sort`: sort lines
-- :soon: `sz-context`: provide LLM context for a given token substring match in a file with minimal token waste
 - :soon: `sz-fuzzy-find`: combination of exact and Levenshtein-bounded substring search
 
 ## Installation
 
 ```bash
-cargo install --git https://github.com/ashvardanian/StringZillaCLI  # install from GitHub
+cargo install --git https://github.com/ashvardanian/StringZilla-CLI # install from GitHub
 cargo install --path . --force                                      # or install from local clone
 ```
 

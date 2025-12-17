@@ -267,6 +267,20 @@ pub fn count_chars_utf8(data: &[u8]) -> Result<usize, io::Error> {
     Ok(text.chars().count())
 }
 
+// TODO: Implement natively in StringZilla as sz_count_byte() for better SIMD performance
+/// Count occurrences of a single byte using SIMD-accelerated search
+#[allow(dead_code)]
+pub fn count_byte(data: &[u8], byte: u8) -> usize {
+    let needle = [byte];
+    let mut count = 0;
+    let mut pos = 0;
+    while let Some(offset) = find(&data[pos..], &needle) {
+        count += 1;
+        pos += offset + 1;
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
