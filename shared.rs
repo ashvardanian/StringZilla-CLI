@@ -6,18 +6,20 @@
 //! Note: Not all functions are used by every binary. The #[allow(dead_code)]
 //! attributes prevent warnings for legitimately shared code.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::str;
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 use stringzilla::sz::{find, find_newline_utf8};
 
 /// Represents the input source - either a memory-mapped file or buffered stdin
 #[allow(dead_code)]
 pub enum InputSource {
-    /// Memory-mapped file for zero-copy access
+    /// Memory-mapped file for zero-copy access (read-only)
     MappedFile(Mmap),
+    /// Mutable memory-mapped file for in-place modification
+    MutableMappedFile(MmapMut, File),
     /// Buffered stdin data
     Buffer(Vec<u8>),
 }
@@ -28,12 +30,35 @@ impl InputSource {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             InputSource::MappedFile(mmap) => &mmap[..],
+            InputSource::MutableMappedFile(mmap, _) => &mmap[..],
             InputSource::Buffer(buf) => buf,
+        }
+    }
+
+    /// Get mutable access to the input data (only for mutable sources)
+    pub fn as_mut_bytes(&mut self) -> Option<&mut [u8]> {
+        match self {
+            InputSource::MutableMappedFile(mmap, _) => Some(&mut mmap[..]),
+            InputSource::Buffer(buf) => Some(&mut buf[..]),
+            InputSource::MappedFile(_) => None,
+        }
+    }
+
+    /// Flush changes and truncate file to new length.
+    /// Only works for MutableMappedFile; no-op for other variants.
+    pub fn truncate_and_flush(&mut self, new_len: u64) -> io::Result<()> {
+        match self {
+            InputSource::MutableMappedFile(mmap, file) => {
+                mmap.flush()?;
+                file.set_len(new_len)?;
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 }
 
-/// Create an InputSource from either a file path or stdin
+/// Create an InputSource from either a file path or stdin (read-only)
 #[allow(dead_code)]
 pub fn get_input(path: Option<&str>) -> io::Result<InputSource> {
     match path {
@@ -48,6 +73,14 @@ pub fn get_input(path: Option<&str>) -> io::Result<InputSource> {
             Ok(InputSource::MappedFile(mmap))
         }
     }
+}
+
+/// Create a mutable InputSource for in-place file modification
+#[allow(dead_code)]
+pub fn get_input_mutable(path: &str) -> io::Result<InputSource> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mmap = unsafe { MmapMut::map_mut(&file)? };
+    Ok(InputSource::MutableMappedFile(mmap, file))
 }
 
 /// Create an output writer from either a file path or stdout
