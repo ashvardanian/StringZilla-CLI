@@ -614,28 +614,44 @@ fn line_matches(line: &[u8], config: &SearchConfig) -> bool {
     }
 }
 
-/// Highlight matches in a line
-fn highlight_line(line: &[u8], config: &SearchConfig) -> Vec<u8> {
+/// Highlight matches in a line, writing to a reusable buffer.
+///
+/// Returns the number of bytes written. If 0, no highlighting was needed
+/// (caller should use the original line directly for zero-copy output).
+fn highlight_line(line: &[u8], config: &SearchConfig, buffer: &mut Vec<u8>) -> usize {
+    buffer.clear();
+
+    // Return 0 if no highlighting needed
     if config.colors.match_highlight.is_empty() || config.invert_match {
-        return line.to_vec();
+        return 0;
     }
 
-    let mut result = Vec::with_capacity(line.len() + 64);
+    // Reserve capacity to minimize allocations during building
+    buffer.reserve(line.len() + 64);
+
     let mut last_end = 0;
+    let mut found_match = false;
 
     for m in matches(line, config) {
+        found_match = true;
         // Add text before this match
-        result.extend_from_slice(&line[last_end..m.offset]);
+        buffer.extend_from_slice(&line[last_end..m.offset]);
         // Add highlighted match
-        result.extend_from_slice(config.colors.match_highlight.as_bytes());
-        result.extend_from_slice(&line[m.offset..m.offset + m.length]);
-        result.extend_from_slice(config.colors.reset.as_bytes());
+        buffer.extend_from_slice(config.colors.match_highlight.as_bytes());
+        buffer.extend_from_slice(&line[m.offset..m.offset + m.length]);
+        buffer.extend_from_slice(config.colors.reset.as_bytes());
         last_end = m.offset + m.length;
     }
 
+    // If no matches found, return 0
+    if !found_match {
+        buffer.clear();
+        return 0;
+    }
+
     // Add remaining text after last match
-    result.extend_from_slice(&line[last_end..]);
-    result
+    buffer.extend_from_slice(&line[last_end..]);
+    buffer.len()
 }
 
 /// Search result for a single file
@@ -657,6 +673,7 @@ fn search_mmap(
         search_multiline(data, filename, config, output, max_reached)
     } else if config.utf8 {
         search_intraline(
+            data,
             Utf8LineIterator::new(data),
             filename,
             config,
@@ -665,6 +682,7 @@ fn search_mmap(
         )
     } else {
         search_intraline(
+            data,
             LineIterator::new(data),
             filename,
             config,
@@ -674,11 +692,16 @@ fn search_mmap(
     }
 }
 
-/// Context line info: (line_number, byte_offset, line_content)
-type ContextLine = (usize, usize, Vec<u8>);
+/// Context line info: (line_number, start_offset, end_offset)
+/// The actual line data is sliced from the original buffer when needed.
+type ContextLine = (usize, usize, usize);
 
 /// Search using intra-line matching (lazy iteration)
+///
+/// `data` is the original buffer - lines from the iterator are slices into this buffer.
+/// This allows storing offsets in the context buffer instead of copying line data.
 fn search_intraline<'a, I>(
+    data: &'a [u8],
     iter: I,
     filename: &str,
     config: &SearchConfig,
@@ -697,6 +720,8 @@ where
     let mut last_printed_line: Option<usize> = None;
     let mut need_separator = false;
     let mut printed_heading = false;
+    // Reusable buffer for highlighting (avoids per-line allocation)
+    let mut highlight_buffer = Vec::with_capacity(512);
 
     for (line_num, line) in iter.enumerate() {
         lines_searched += 1;
@@ -724,12 +749,16 @@ where
                 || config.files_with_matches
                 || config.files_without_match
             {
-                // Maintain context buffer even when not printing
+                // Maintain context buffer even when not printing (store offsets, not copies)
                 if config.before_context > 0 {
                     if context_before.len() >= config.before_context {
                         context_before.pop_front();
                     }
-                    context_before.push_back((line_num_1based, current_byte_offset, line.to_vec()));
+                    context_before.push_back((
+                        line_num_1based,
+                        current_byte_offset,
+                        current_byte_offset + line.len(),
+                    ));
                 }
                 continue;
             }
@@ -767,35 +796,39 @@ where
                 }
             }
 
-            // Print buffered context_before lines
-            for (ctx_line_num, ctx_byte_offset, ctx_line) in context_before.iter() {
-                if last_printed_line.map_or(true, |lp| *ctx_line_num > lp) {
+            // Print buffered context_before lines (slice from original data)
+            for &(ctx_line_num, ctx_start, ctx_end) in context_before.iter() {
+                if last_printed_line.map_or(true, |lp| ctx_line_num > lp) {
+                    let ctx_line = &data[ctx_start..ctx_end];
                     print_line(
                         output,
                         ctx_line,
-                        *ctx_line_num,
-                        *ctx_byte_offset,
+                        ctx_line_num,
+                        ctx_start,
                         filename,
                         config,
                         false,
                     )?;
-                    last_printed_line = Some(*ctx_line_num);
+                    last_printed_line = Some(ctx_line_num);
                 }
             }
 
             // Print matching line (highlight only for standard/heading modes)
-            let line_to_print = if config.output_format == OutputFormat::Json
-                || config.output_format == OutputFormat::Vimgrep
-                || config.only_matching
-            {
-                line.to_vec()
-            } else {
-                highlight_line(line, config)
-            };
+            // Use highlight_buffer to avoid per-line allocation
+            let needs_highlight = config.output_format != OutputFormat::Json
+                && config.output_format != OutputFormat::Vimgrep
+                && !config.only_matching;
+
+            let line_to_print: &[u8] =
+                if needs_highlight && highlight_line(line, config, &mut highlight_buffer) > 0 {
+                    &highlight_buffer
+                } else {
+                    line
+                };
 
             print_line(
                 output,
-                &line_to_print,
+                line_to_print,
                 line_num_1based,
                 current_byte_offset,
                 filename,
@@ -820,12 +853,16 @@ where
             pending_after -= 1;
         }
 
-        // Maintain rolling context_before buffer
+        // Maintain rolling context_before buffer (store offsets, not copies)
         if config.before_context > 0 {
             if context_before.len() >= config.before_context {
                 context_before.pop_front();
             }
-            context_before.push_back((line_num_1based, current_byte_offset, line.to_vec()));
+            context_before.push_back((
+                line_num_1based,
+                current_byte_offset,
+                current_byte_offset + line.len(),
+            ));
         }
     }
 
@@ -1833,8 +1870,10 @@ mod tests {
         let mut config = make_config(b"hello");
         config.colors = Colors::enabled();
 
-        let highlighted = highlight_line(line, &config);
-        let result = String::from_utf8(highlighted).unwrap();
+        let mut buffer = Vec::new();
+        let len = highlight_line(line, &config, &mut buffer);
+        assert!(len > 0);
+        let result = String::from_utf8(buffer).unwrap();
 
         assert!(result.contains("\x1b[1;31m")); // Contains highlight
         assert!(result.contains("\x1b[0m")); // Contains reset
