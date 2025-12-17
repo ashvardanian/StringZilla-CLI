@@ -150,20 +150,6 @@ fn main() {
 
     let data = input.as_bytes();
 
-    // Validate UTF-8 if requested
-    if args.utf8 {
-        if let Err(e) = validate_utf8(data) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-
-        // Also validate replacement string
-        if let Err(e) = validate_utf8(args.replacement.as_bytes()) {
-            eprintln!("Error in replacement string: {}", e);
-            process::exit(1);
-        }
-    }
-
     // Perform replacement
     let (result, count) = replace_all(
         data,

@@ -143,14 +143,6 @@ fn main() {
 
     let data = input.as_bytes();
 
-    // Validate UTF-8 if requested
-    if args.utf8 {
-        if let Err(e) = validate_utf8(data) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-    }
-
     if let Err(e) = split_by_lines(data, &args.prefix, args.lines, args.suffix_length) {
         eprintln!("Error splitting file: {}", e);
         process::exit(1);

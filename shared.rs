@@ -95,18 +95,6 @@ pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
     }
 }
 
-/// Validate that data is valid UTF-8
-#[allow(dead_code)]
-pub fn validate_utf8(data: &[u8]) -> Result<(), io::Error> {
-    str::from_utf8(data).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid UTF-8 at byte {}: {}", e.valid_up_to(), e),
-        )
-    })?;
-    Ok(())
-}
-
 /// Iterator over lines in a byte slice, using StringZilla for fast newline search
 #[allow(dead_code)]
 pub struct LineIterator<'a> {
@@ -292,13 +280,6 @@ mod tests {
         assert_eq!(count_chars_utf8("héllo".as_bytes()).unwrap(), 5);
         assert_eq!(count_chars_utf8("こんにちは".as_bytes()).unwrap(), 5);
         assert!(count_chars_utf8(&[0xFF, 0xFE]).is_err()); // Invalid UTF-8
-    }
-
-    #[test]
-    fn test_validate_utf8() {
-        assert!(validate_utf8(b"hello").is_ok());
-        assert!(validate_utf8("héllo".as_bytes()).is_ok());
-        assert!(validate_utf8(&[0xFF, 0xFE]).is_err());
     }
 
     #[test]

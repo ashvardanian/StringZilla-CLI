@@ -1242,14 +1242,6 @@ fn main() {
         }
     };
 
-    // Validate UTF-8 if requested
-    if args.utf8 {
-        if let Err(e) = shared::validate_utf8(&data) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-    }
-
     // Parse based on file type
     let elements = match file_type {
         FileType::Markdown => parse_markdown(&data, verbosity),

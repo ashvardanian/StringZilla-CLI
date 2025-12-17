@@ -392,14 +392,6 @@ fn main() {
             }
         };
 
-        // Validate UTF-8 if requested
-        if args.utf8 {
-            if let Err(e) = validate_utf8(input.as_bytes()) {
-                eprintln!("Error: {}", e);
-                process::exit(1);
-            }
-        }
-
         let data = input.as_mut_bytes().unwrap();
         let (new_len, unique_count) = dedup_in_place(data, args.ignore_case);
 
@@ -420,14 +412,6 @@ fn main() {
         };
 
         let data = input.as_bytes();
-
-        // Validate UTF-8 if requested
-        if args.utf8 {
-            if let Err(e) = validate_utf8(data) {
-                eprintln!("Error: {}", e);
-                process::exit(1);
-            }
-        }
 
         let mut output = match get_output(args.output.as_deref()) {
             Ok(output) => output,

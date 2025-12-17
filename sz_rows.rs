@@ -258,14 +258,6 @@ fn main() {
 
     let data = input.as_bytes();
 
-    // Validate UTF-8 if requested
-    if args.utf8 {
-        if let Err(e) = validate_utf8(data) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-    }
-
     let mut output = io::stdout();
 
     if let Err(e) = extract_rows_by_selector(data, &selector, args.line_numbers, &mut output) {

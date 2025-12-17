@@ -197,14 +197,6 @@ fn main() {
 
     let data = input.as_bytes();
 
-    // Validate UTF-8 if requested
-    if args.utf8 {
-        if let Err(e) = validate_utf8(data) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-    }
-
     let delimiter = args.delimiter.as_bytes();
     let output_delimiter = args
         .output_delimiter
