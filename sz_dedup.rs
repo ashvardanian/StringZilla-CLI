@@ -119,7 +119,7 @@ impl Default for LineEntry {
 /// Grows 2x when load factor exceeds 60%.
 struct AppendOnlyFlatHashSet {
     slots: Vec<LineEntry>,
-    count: usize,
+    populated_count: usize,
 }
 
 impl AppendOnlyFlatHashSet {
@@ -128,7 +128,7 @@ impl AppendOnlyFlatHashSet {
         const INITIAL_CAPACITY: usize = 1024;
         Self {
             slots: vec![LineEntry::default(); INITIAL_CAPACITY],
-            count: 0,
+            populated_count: 0,
         }
     }
 
@@ -155,7 +155,7 @@ impl AppendOnlyFlatHashSet {
     #[inline]
     fn insert(&mut self, hash: u64, offset: u64, length: u64) {
         // Grow if load factor > 60%
-        if self.count * 100 > self.slots.len() * 60 {
+        if self.populated_count * 100 > self.slots.len() * 60 {
             self.grow();
         }
 
@@ -175,14 +175,14 @@ impl AppendOnlyFlatHashSet {
             offset,
             length,
         };
-        self.count += 1;
+        self.populated_count += 1;
     }
 
     /// Double the capacity and rehash all entries
     fn grow(&mut self) {
         let new_cap = self.slots.len() * 2;
         let old_slots = std::mem::replace(&mut self.slots, vec![LineEntry::default(); new_cap]);
-        self.count = 0;
+        self.populated_count = 0;
 
         for entry in old_slots {
             if !entry.is_empty() {
@@ -261,8 +261,9 @@ fn lines_equal(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
 /// Deduplicate lines in-place, compacting the buffer.
 ///
 /// Returns (new_length, unique_count).
-/// Supports all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
-fn dedup_in_place(data: &mut [u8], ignore_case: bool) -> (usize, usize) {
+/// When `utf8` is true, handles all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
+/// When `utf8` is false, only handles LF newlines.
+fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> (usize, usize) {
     let mut seen = AppendOnlyFlatHashSet::new();
     let mut scratch = Vec::new();
 
@@ -271,10 +272,19 @@ fn dedup_in_place(data: &mut [u8], ignore_case: bool) -> (usize, usize) {
     let mut unique_count: usize = 0;
 
     while read_pos < data.len() {
-        // Find end of current line (SIMD-accelerated, UTF-8 aware)
-        let (line_end, newline_len) = match find_newline_utf8(&data[read_pos..]) {
-            Some(span) => (read_pos + span.offset, span.length),
-            None => (data.len(), 0),
+        // Find end of current line
+        let (line_end, newline_len) = if utf8 {
+            // UTF-8 aware: handles LF, CR, CRLF, NEL, LS, PS
+            match find_newline_utf8(&data[read_pos..]) {
+                Some(span) => (read_pos + span.offset, span.length),
+                None => (data.len(), 0),
+            }
+        } else {
+            // Byte-level: only LF
+            match sz::find(&data[read_pos..], b"\n") {
+                Some(pos) => (read_pos + pos, 1),
+                None => (data.len(), 0),
+            }
         };
 
         let line_len = line_end - read_pos;
@@ -316,14 +326,22 @@ fn dedup_in_place(data: &mut [u8], ignore_case: bool) -> (usize, usize) {
 }
 
 /// Deduplicate lines, writing to output stream (for stdin or explicit output file).
-/// Supports all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
+/// When `utf8` is true, handles all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
+/// When `utf8` is false, only handles LF newlines.
 /// Output is normalized to LF newlines.
-fn dedup_to_writer(data: &[u8], output: &mut dyn Write, ignore_case: bool) -> io::Result<usize> {
+fn dedup_to_writer(
+    data: &[u8],
+    output: &mut dyn Write,
+    ignore_case: bool,
+    utf8: bool,
+) -> io::Result<usize> {
     let mut seen = AppendOnlyFlatHashSet::new();
     let mut scratch = Vec::new();
     let mut unique_count = 0;
 
-    for line in Utf8LineIterator::new(data) {
+    let lines = LineIter::new(data, utf8);
+
+    for line in lines {
         let line_offset = line.as_ptr() as usize - data.as_ptr() as usize;
         let hash = compute_hash(line, ignore_case, &mut scratch);
 
@@ -368,13 +386,16 @@ struct Args {
     #[arg(short = 'c', long)]
     count: bool,
 
-    /// Enable UTF-8 mode (validate input)
+    /// Enable UTF-8 mode (handle Unicode newlines: CR, CRLF, NEL, LS, PS)
     #[arg(long)]
     utf8: bool,
 }
 
 fn main() {
     let args = Args::parse();
+
+    // UTF-8 mode is implicit when case-insensitive (case folding requires UTF-8)
+    let utf8_mode = args.utf8 || args.ignore_case;
 
     // Determine mode: in-place (file, no output) vs streaming (stdin or explicit output)
     let in_place =
@@ -393,7 +414,7 @@ fn main() {
         };
 
         let data = input.as_mut_bytes().unwrap();
-        let (new_len, unique_count) = dedup_in_place(data, args.ignore_case);
+        let (new_len, unique_count) = dedup_in_place(data, args.ignore_case, utf8_mode);
 
         if let Err(e) = input.truncate_and_flush(new_len as u64) {
             eprintln!("Error truncating file: {}", e);
@@ -421,7 +442,7 @@ fn main() {
             }
         };
 
-        match dedup_to_writer(data, &mut output, args.ignore_case) {
+        match dedup_to_writer(data, &mut output, args.ignore_case, utf8_mode) {
             Ok(count) => count,
             Err(e) => {
                 if e.kind() == io::ErrorKind::BrokenPipe {
@@ -453,7 +474,7 @@ mod tests {
         set.insert(456, 20, 5);
         set.insert(123, 50, 8); // Same hash, different entry
 
-        assert_eq!(set.count, 3);
+        assert_eq!(set.populated_count, 3);
         assert_eq!(set.find(123).count(), 2);
         assert_eq!(set.find(456).count(), 1);
         assert_eq!(set.find(789).count(), 0);
@@ -467,7 +488,7 @@ mod tests {
             set.insert(i, i * 10, i);
         }
         assert!(set.slots.len() > 1024);
-        assert_eq!(set.count, 700);
+        assert_eq!(set.populated_count, 700);
 
         // Verify all entries are still findable
         for i in 1..=700 {
@@ -478,7 +499,7 @@ mod tests {
     #[test]
     fn test_dedup_in_place_basic() {
         let mut data = b"line1\nline2\nline1\nline3\n".to_vec();
-        let (new_len, count) = dedup_in_place(&mut data, false);
+        let (new_len, count) = dedup_in_place(&mut data, false, false);
 
         assert_eq!(count, 3);
         let result = String::from_utf8(data[..new_len].to_vec()).unwrap();
@@ -489,7 +510,7 @@ mod tests {
     #[test]
     fn test_dedup_in_place_case_insensitive() {
         let mut data = b"Hello\nhello\nworld\nWORLD\n".to_vec();
-        let (new_len, count) = dedup_in_place(&mut data, true);
+        let (new_len, count) = dedup_in_place(&mut data, true, true);
 
         assert_eq!(count, 2);
         let result = String::from_utf8(data[..new_len].to_vec()).unwrap();
@@ -500,7 +521,7 @@ mod tests {
     #[test]
     fn test_dedup_in_place_unicode() {
         let mut data = "MÜNCHEN\nmünchen\nberlin\n".as_bytes().to_vec();
-        let (new_len, count) = dedup_in_place(&mut data, true);
+        let (new_len, count) = dedup_in_place(&mut data, true, true);
 
         assert_eq!(count, 2);
         let result = String::from_utf8(data[..new_len].to_vec()).unwrap();
@@ -511,7 +532,7 @@ mod tests {
     #[test]
     fn test_dedup_in_place_all_duplicates() {
         let mut data = b"dup\ndup\ndup\ndup\n".to_vec();
-        let (new_len, count) = dedup_in_place(&mut data, false);
+        let (new_len, count) = dedup_in_place(&mut data, false, false);
 
         assert_eq!(count, 1);
         assert_eq!(&data[..new_len], b"dup\n");
@@ -521,7 +542,7 @@ mod tests {
     fn test_dedup_in_place_no_change() {
         let mut data = b"a\nb\nc\n".to_vec();
         let original_len = data.len();
-        let (new_len, count) = dedup_in_place(&mut data, false);
+        let (new_len, count) = dedup_in_place(&mut data, false, false);
 
         assert_eq!(count, 3);
         assert_eq!(new_len, original_len);
@@ -532,7 +553,7 @@ mod tests {
         let data = b"line1\nline2\nline1\nline3\n";
         let mut output = Vec::new();
 
-        let count = dedup_to_writer(data, &mut output, false).unwrap();
+        let count = dedup_to_writer(data, &mut output, false, false).unwrap();
 
         assert_eq!(count, 3);
         let result = String::from_utf8(output).unwrap();
@@ -545,7 +566,7 @@ mod tests {
         let data = b"Hello\nhello\nHELLO\nworld\n";
         let mut output = Vec::new();
 
-        let count = dedup_to_writer(data, &mut output, true).unwrap();
+        let count = dedup_to_writer(data, &mut output, true, true).unwrap();
 
         assert_eq!(count, 2);
         let result = String::from_utf8(output).unwrap();
@@ -558,7 +579,7 @@ mod tests {
         let data = b"First\nfirst\nFIRST\n";
         let mut output = Vec::new();
 
-        dedup_to_writer(data, &mut output, true).unwrap();
+        dedup_to_writer(data, &mut output, true, true).unwrap();
 
         let result = String::from_utf8(output).unwrap();
         assert_eq!(result, "First\n");
@@ -569,7 +590,7 @@ mod tests {
         let data = b"";
         let mut output = Vec::new();
 
-        let count = dedup_to_writer(data, &mut output, false).unwrap();
+        let count = dedup_to_writer(data, &mut output, false, false).unwrap();
 
         assert_eq!(count, 0);
         assert!(output.is_empty());
@@ -580,7 +601,7 @@ mod tests {
         let data = b"\n\n\ntext\n\n";
         let mut output = Vec::new();
 
-        let count = dedup_to_writer(data, &mut output, false).unwrap();
+        let count = dedup_to_writer(data, &mut output, false, false).unwrap();
 
         assert_eq!(count, 2); // "" and "text"
     }

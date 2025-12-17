@@ -184,6 +184,39 @@ impl<'a> Iterator for Utf8LineIterator<'a> {
     }
 }
 
+/// Stack-allocated enum to dispatch between line iterator types.
+/// Use this when you need to choose between byte-level (LF only) and
+/// UTF-8 aware (LF, CR, CRLF, NEL, LS, PS) line iteration at runtime.
+#[allow(dead_code)]
+pub enum LineIter<'a> {
+    Byte(LineIterator<'a>),
+    Utf8(Utf8LineIterator<'a>),
+}
+
+#[allow(dead_code)]
+impl<'a> LineIter<'a> {
+    /// Create a line iterator based on utf8 flag
+    pub fn new(data: &'a [u8], utf8: bool) -> Self {
+        if utf8 {
+            LineIter::Utf8(Utf8LineIterator::new(data))
+        } else {
+            LineIter::Byte(LineIterator::new(data))
+        }
+    }
+}
+
+impl<'a> Iterator for LineIter<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            LineIter::Byte(iter) => iter.next(),
+            LineIter::Utf8(iter) => iter.next(),
+        }
+    }
+}
+
 /// Count lines in data using SIMD-accelerated search
 #[allow(dead_code)]
 pub fn count_lines(data: &[u8]) -> usize {
