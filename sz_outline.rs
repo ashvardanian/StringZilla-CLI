@@ -1,8 +1,10 @@
 //! SIMD-accelerated file outlining utility
 //!
 //! Extract structural outlines from source files including:
-//! - Markdown: headings, code blocks, tables, blockquotes, images
-//! - C/C++: includes, function declarations, function definitions
+//! - Markdown (`.md`, `.markdown`): headings, code blocks, tables, blockquotes, images
+//! - C (`.c`, `.h`): includes, function declarations, function definitions
+//!
+//! File type is taken from the extension or forced with `-t {md,c,h}`.
 //!
 //! # Examples
 //!
@@ -31,9 +33,7 @@ use stringzilla::sz::find;
 
 mod shared;
 
-// ============================================================================
-// Data Structures
-// ============================================================================
+// region: Data Structures
 
 /// Verbosity level for output
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -101,9 +101,9 @@ impl OutlineElement {
     }
 }
 
-// ============================================================================
-// CLI Interface
-// ============================================================================
+// endregion: Data Structures
+
+// region: CLI Interface
 
 /// Extract structural outline from source files
 #[derive(Parser)]
@@ -127,9 +127,9 @@ struct Args {
     utf8: bool,
 }
 
-// ============================================================================
-// File Type Detection
-// ============================================================================
+// endregion: CLI Interface
+
+// region: File Type Detection
 
 fn detect_file_type(path: &str) -> FileType {
     let path = Path::new(path);
@@ -150,9 +150,9 @@ fn parse_file_type(type_str: &str) -> FileType {
     }
 }
 
-// ============================================================================
-// Markdown Parser
-// ============================================================================
+// endregion: File Type Detection
+
+// region: Markdown Parser
 
 /// Parse Markdown file and extract outline elements
 fn parse_markdown(data: &[u8], verbosity: Verbosity) -> Vec<OutlineElement> {
@@ -596,9 +596,9 @@ fn finalize_table(
     *in_table = false;
 }
 
-// ============================================================================
-// C Parser
-// ============================================================================
+// endregion: Markdown Parser
+
+// region: C Parser
 
 /// Parse C/C++ source file and extract outline elements
 fn parse_c(data: &[u8], _verbosity: Verbosity) -> Vec<OutlineElement> {
@@ -961,9 +961,9 @@ fn normalize_signature(data: &[u8]) -> String {
     result.trim().to_string()
 }
 
-// ============================================================================
-// String Utilities
-// ============================================================================
+// endregion: C Parser
+
+// region: String Utilities
 
 /// Trim leading whitespace (up to max_spaces)
 fn trim_start(data: &[u8], max_spaces: usize) -> &[u8] {
@@ -1017,9 +1017,9 @@ fn trim_trailing_hashes(data: &[u8]) -> &[u8] {
     &data[..end]
 }
 
-// ============================================================================
-// Output Formatting
-// ============================================================================
+// endregion: String Utilities
+
+// region: Output Formatting
 
 fn format_element(elem: &OutlineElement, verbosity: Verbosity, file_type: FileType) -> String {
     match file_type {
@@ -1189,9 +1189,9 @@ fn format_c_element(elem: &OutlineElement, verbosity: Verbosity) -> String {
     output
 }
 
-// ============================================================================
-// Input Handling
-// ============================================================================
+// endregion: Output Formatting
+
+// region: Input Handling
 
 fn get_input(path: &str) -> io::Result<Vec<u8>> {
     if path == "-" {
@@ -1205,9 +1205,9 @@ fn get_input(path: &str) -> io::Result<Vec<u8>> {
     }
 }
 
-// ============================================================================
-// Main
-// ============================================================================
+// endregion: Input Handling
+
+// region: Main
 
 fn main() {
     let args = Args::parse();
@@ -1265,9 +1265,9 @@ fn main() {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+// endregion: Main
+
+// region: Tests
 
 #[cfg(test)]
 mod tests {
@@ -1381,3 +1381,5 @@ mod tests {
         assert!(matches!(elements[1].kind, ElementKind::FunctionDefinition));
     }
 }
+
+// endregion: Tests

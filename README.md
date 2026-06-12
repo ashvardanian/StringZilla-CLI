@@ -4,16 +4,17 @@
 
 Most text processing command-line utilities have obscure syntax, limited portability across operating systems, can't deal with larger-than-memory datasets, and are not actively leveraging modern SIMD capabilities, such as AVX-512 on x86 and SVE on ARM.
 This utility is written in Rust, leveraging StringZilla for both pipe and file-based text processing across Linux, macOS, and Windows.
-Just one command to install it from Crates.io:
+Install it straight from the GitHub repository:
 
 ```bash
-cargo install stringzilla-cli
+cargo install --git https://github.com/ashvardanian/StringZilla-CLI
 ```
 
 It provides the following subcommands:
 
 - `sz-find`: find all inclusions of a substring in a file similar to `grep`, but with a saner syntax
-- `sz-outline`: provide LLM with an outline of a file for Markdown, HTML, C, C++, and Python source files
+- `sz-replace`: replace a substring in a file or stream; a literal-match alternative to `sed s///`
+- `sz-outline`: provide an LLM with an outline of a Markdown or C/C++ source file
 - `sz-count`: 3x faster `wc` word count, that can actually handle UTF-8 properly
 - `sz-dedup`: deduplicate lines; safe for larger-than-memory files
 - `sz-split`: 4x faster `split` file splitting, that won't break UTF-8 characters or lines
@@ -50,12 +51,15 @@ sz-find -c "pattern" file.txt
 # Context lines (like grep -B/-A/-C)
 sz-find -B 2 -A 2 "error" log.txt
 
-# Multi-line patterns (pattern can span lines)
-sz-find -m "hello\nworld" file.txt
+# Match across line boundaries (pattern can span lines)
+sz-find -M "hello\nworld" file.txt
 
 # UTF-8 mode (handles Unicode newlines: NEL, LINE SEPARATOR, etc.)
 sz-find --utf8 "pattern" file.txt
 ```
+
+Beyond the flags above, `sz-find` also covers most of the `grep`/`ripgrep` surface: whole-word matching (`-w`), inverted matches (`-v`), only-matching output (`-o`), recursive directory walking with `.gitignore` awareness, type/glob filters (`-t`, `-g`), and `--json`/`--vimgrep` output.
+Passing `-r/--replace` turns it into an in-place find-and-replace; for stream-oriented replacement use the dedicated `sz-replace` below.
 
 There is partial support for Unicode case folding in `ripgrep` (`rg -i`).
 The only tool seemingly implementing full folding is `pcre2`, designed for RegEx, rather than substring search.
@@ -98,6 +102,7 @@ The difference becomes significant when searching legal documents, German/Swiss 
 Extract structural outlines from source files for LLM context windows.
 When feeding large files to language models, you often need a high-level overview without the full content.
 `sz-outline` extracts headings, function signatures, includes, and other structural elements.
+File type is inferred from the extension — Markdown (`.md`, `.markdown`) and C (`.c`, `.h`) — or forced with `-t {md,c,h}` (required when reading from stdin).
 
 ```bash
 # Outline a Markdown file (headings only)
@@ -109,7 +114,7 @@ sz-outline -v README.md
 # Detailed mode with child blocks (-vv)
 sz-outline -vv README.md
 
-# Outline C/C++ source (includes + function signatures)
+# Outline C source (includes + function signatures)
 sz-outline src/main.c
 
 # Force file type detection
@@ -171,6 +176,7 @@ Function signatures are normalized (whitespace collapsed) and categorized as dec
 
 The `wc` utility on Linux can be used to count the number of lines, words, and bytes in a file.
 Using SIMD-accelerated character and character-set search, StringZilla can be noticeably faster, even with slow SSDs.
+Output is a labelled, aligned table; pass `--utf8` to also count Unicode code points, or `-H` for human-readable suffixes.
 
 ```bash
 $ time wc enwik9.txt
@@ -180,8 +186,9 @@ real    0m3.562s
 user    0m3.470s
 sys     0m0.092s
 
-$ time sz-count --wc enwik9.txt
-  13147025 139132610 1000000000 enwik9.txt # Note: word count differs due to stricter ASCII whitespace handling
+$ time sz-count enwik9.txt
+                                  lines   words   bytes
+enwik9.txt                     13147025 139132610 1000000000 # word count differs due to stricter ASCII whitespace handling
 
 real    0m1.165s
 user    0m1.121s
@@ -200,11 +207,30 @@ real    0m6.424s
 user    0m0.179s
 sys     0m0.663s
 
-$ time sz_split -l 100000 enwik9.txt ...
+$ time sz-split -l 100000 enwik9.txt ...
 
 real    0m1.482s
 user    0m1.020s
 sys     0m0.460s
+```
+
+## `sz-replace`: Substring Replacement
+
+A literal-match alternative to `sed 's/old/new/g'` with the same Unicode case-folding engine as `sz-find`.
+Reads from a file or stdin and writes to stdout, a file, or back in-place.
+
+```bash
+# Replace on a stream (writes to stdout)
+sz-replace "old" "new" file.txt
+
+# Edit a file in-place
+sz-replace -i "old" "new" file.txt
+
+# Case-insensitive replace (full Unicode case folding)
+sz-replace -I "straße" "strasse" file.txt
+
+# Preview without writing, and report the number of replacements
+sz-replace -n -c "old" "new" file.txt
 ```
 
 ## `sz-cols`: Extract Columns

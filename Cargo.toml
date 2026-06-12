@@ -1,32 +1,31 @@
 [package]
-name = "sz-cli"
-version = "0.1.0"
-edition = "2021"
 authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
-description = "SIMD-accelerated command-line text processing utilities built on StringZilla"
-readme = "README.md"
-license = "Apache-2.0"
-keywords = ["cli", "text-processing", "simd", "performance"]
 categories = ["command-line-utilities", "text-processing"]
-repository = "https://github.com/ashvardanian/StringZillaCLI"
+description = "SIMD-accelerated command-line text processing utilities built on StringZilla"
+edition = "2021"
+keywords = ["cli", "text-processing", "simd", "performance"]
+license = "Apache-2.0"
+name = "stringzilla-cli"
+readme = "README.md"
+repository = "https://github.com/ashvardanian/StringZilla-CLI"
+version = "0.1.0"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] } # CLI argument parsing
-memmap2 = "0.9"                                   # Memory-mapped file I/O
-stringzilla = { path = "../StringZilla" }         # SIMD-accelerated string operations
-walkdir = "2.4"                                   # Directory traversal
-ignore = "0.4"                                    # .gitignore support
-glob = "0.3"                                      # Glob pattern matching
+clap = {version = "4.5", features = ["derive"]}# CLI argument parsing 
+glob = "0.3" # Glob pattern matching
+ignore = "0.4" # .gitignore support
+memmap2 = "0.9" # Memory-mapped file I/O
+stringzilla = "4" # SIMD-accelerated string operations
+walkdir = "2.4" # Directory traversal
 
 [dev-dependencies]
 tempfile = "3.10"
 
-
 [profile.release]
-lto = true        # Link-time optimization
 codegen-units = 1 # Better optimization, slower compile
-opt-level = 3     # Maximum optimization
-strip = true      # Strip symbols for smaller binary
+lto = true # Link-time optimization
+opt-level = 3 # Maximum optimization
+strip = true # Strip symbols for smaller binary
 
 [[bin]]
 name = "sz-count"

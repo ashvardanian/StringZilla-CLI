@@ -16,7 +16,7 @@
 //! sz-count src/
 //!
 //! # Human-readable output
-//! sz-count -h src/
+//! sz-count -H src/
 //!
 //! # UTF-8 mode (count characters, Unicode whitespace/newlines)
 //! sz-count --utf8 docs/

@@ -2,6 +2,7 @@
 //!
 //! A grep-like tool with simpler syntax, using StringZilla for fast searching.
 //! Unlike grep, uses literal substring matching (not regex) for maximum speed.
+//! Passing `-r/--replace` switches to in-place find-and-replace.
 //!
 //! # Examples
 //!

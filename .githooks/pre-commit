@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+#
+# Reject comment-style banner separators (runs of '=' or '-' after a comment
+# lead-in, e.g. `// =====` or `# -----`). Section regions must be annotated with
+# rust-analyzer fold markers instead:
+#
+#     // region: Some Section
+#     ...
+#     // endregion: Some Section
+#
+# Bare Markdown rules / setext underlines and table separators are NOT comments,
+# so they are intentionally left alone.
+set -euo pipefail
+
+# Comment lead-in (//, #, /*, *, ;, --) followed by 4+ '=' or '-'.
+pattern='(^|[[:space:]])(//|#|/\*|\*|;|--)[[:space:]]*(={4,}|-{4,})'
+
+violations=""
+while IFS= read -r -d '' file; do
+    # Only scan added/modified text files that still exist on disk.
+    [ -f "$file" ] || continue
+    case "$file" in
+        *.png|*.jpg|*.jpeg|*.gif|*.ico|Cargo.lock) continue ;;
+    esac
+    if hits=$(grep -nEH "$pattern" -- "$file" 2>/dev/null); then
+        violations+="$hits"$'\n'
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACM -z)
+
+if [ -n "${violations//[$'\n']/}" ]; then
+    echo "error: banner-style comment separators are banned; use '// region:' / '// endregion:' instead." >&2
+    echo "$violations" >&2
+    exit 1
+fi
