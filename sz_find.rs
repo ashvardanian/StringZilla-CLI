@@ -1769,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    fn test_match_iter_basic() {
+    fn match_iter_basic() {
         let line = b"hello world";
         assert!(has_match(line, b"hello", false, false));
         assert!(has_match(line, b"world", false, false));
@@ -1777,7 +1777,7 @@ mod tests {
     }
 
     #[test]
-    fn test_match_iter_case_insensitive() {
+    fn match_iter_case_insensitive() {
         let line = b"Hello World";
         assert!(has_match(line, b"hello", true, false));
         assert!(has_match(line, b"WORLD", true, false));
@@ -1785,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    fn test_match_iter_word_boundary() {
+    fn match_iter_word_boundary() {
         let line = b"hello world";
         assert!(has_match(line, b"hello", false, true));
         assert!(has_match(line, b"world", false, true));
@@ -1794,14 +1794,14 @@ mod tests {
     }
 
     #[test]
-    fn test_match_iter_word_boundary_multiple() {
+    fn match_iter_word_boundary_multiple() {
         // Test that word boundary check finds matches after non-boundary matches
         let line = b"fn_name fn";
         assert!(has_match(line, b"fn", false, true)); // Should find standalone "fn"
     }
 
     #[test]
-    fn test_line_matches_invert() {
+    fn line_matches_invert() {
         let line = b"hello world";
         let mut config = make_config(b"hello");
         assert!(line_matches(line, &config));
@@ -1814,14 +1814,14 @@ mod tests {
     }
 
     #[test]
-    fn test_is_binary() {
+    fn is_binary() {
         assert!(is_binary(b"hello\0world"));
         assert!(!is_binary(b"hello world"));
         assert!(!is_binary(b"hello\nworld\n"));
     }
 
     #[test]
-    fn test_search_basic() {
+    fn search_basic() {
         let data = b"line1\nerror here\nline3\n";
         let config = make_config(b"error");
         let max_reached = AtomicBool::new(false);
@@ -1835,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_with_context() {
+    fn search_with_context() {
         let data = b"line1\nline2\nerror here\nline4\nline5\n";
         let mut config = make_config(b"error");
         config.before_context = 1;
@@ -1852,7 +1852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_max_count() {
+    fn search_max_count() {
         let data = b"error1\nerror2\nerror3\nerror4\n";
         let mut config = make_config(b"error");
         config.max_count = Some(2);
@@ -1866,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn test_highlight_line() {
+    fn highlight_line() {
         let line = b"hello world hello";
         let mut config = make_config(b"hello");
         config.colors = Colors::enabled();
@@ -1881,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiline_search() {
+    fn multiline_search() {
         let data = b"hello\nworld\nfoo bar\n";
         let mut config = make_config(b"hello\nworld");
         config.multiline = true;

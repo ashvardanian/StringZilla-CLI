@@ -286,7 +286,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_line_iterator() {
+    fn line_iterator() {
         let data = b"line1\nline2\nline3\n";
         let lines: Vec<_> = LineIterator::new(data).collect();
 
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_line_iterator_no_trailing_newline() {
+    fn line_iterator_no_trailing_newline() {
         let data = b"line1\nline2\nline3";
         let lines: Vec<_> = LineIterator::new(data).collect();
 
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_lines() {
+    fn counting_lines() {
         assert_eq!(count_lines(b"line1\nline2\nline3\n"), 3);
         assert_eq!(count_lines(b"line1\nline2\nline3"), 3);
         assert_eq!(count_lines(b"single"), 1);
@@ -314,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_words() {
+    fn counting_words() {
         assert_eq!(count_words(b"hello world"), 2);
         assert_eq!(count_words(b"  hello   world  "), 2);
         assert_eq!(count_words(b"one\ntwo\tthree"), 3);
@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_chars_utf8() {
+    fn counting_chars_utf8() {
         assert_eq!(count_chars_utf8(b"hello").unwrap(), 5);
         assert_eq!(count_chars_utf8("héllo".as_bytes()).unwrap(), 5);
         assert_eq!(count_chars_utf8("こんにちは".as_bytes()).unwrap(), 5);
@@ -330,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_utf8_line_iterator() {
+    fn utf8_line_iterator() {
         let data = b"line1\nline2\nline3\n";
         let lines: Vec<_> = Utf8LineIterator::new(data).collect();
 
@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn test_utf8_line_iterator_crlf() {
+    fn utf8_line_iterator_crlf() {
         let data = b"line1\r\nline2\r\nline3";
         let lines: Vec<_> = Utf8LineIterator::new(data).collect();
 
@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn test_utf8_line_iterator_mixed() {
+    fn utf8_line_iterator_mixed() {
         // Mix of LF and CRLF
         let data = b"line1\nline2\r\nline3\n";
         let lines: Vec<_> = Utf8LineIterator::new(data).collect();

@@ -468,7 +468,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_flat_hash_set_basic() {
+    fn flat_hash_set_basic() {
         let mut set = AppendOnlyFlatHashSet::new();
         set.insert(123, 0, 10);
         set.insert(456, 20, 5);
@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flat_hash_set_growth() {
+    fn flat_hash_set_growth() {
         let mut set = AppendOnlyFlatHashSet::new();
         // Insert more than 60% of initial capacity to trigger growth
         for i in 1..=700 {
@@ -497,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_in_place_basic() {
+    fn dedup_in_place_basic() {
         let mut data = b"line1\nline2\nline1\nline3\n".to_vec();
         let (new_len, count) = dedup_in_place(&mut data, false, false);
 
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_in_place_case_insensitive() {
+    fn dedup_in_place_case_insensitive() {
         let mut data = b"Hello\nhello\nworld\nWORLD\n".to_vec();
         let (new_len, count) = dedup_in_place(&mut data, true, true);
 
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_in_place_unicode() {
+    fn dedup_in_place_unicode() {
         let mut data = "MÜNCHEN\nmünchen\nberlin\n".as_bytes().to_vec();
         let (new_len, count) = dedup_in_place(&mut data, true, true);
 
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_in_place_all_duplicates() {
+    fn dedup_in_place_all_duplicates() {
         let mut data = b"dup\ndup\ndup\ndup\n".to_vec();
         let (new_len, count) = dedup_in_place(&mut data, false, false);
 
@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_in_place_no_change() {
+    fn dedup_in_place_no_change() {
         let mut data = b"a\nb\nc\n".to_vec();
         let original_len = data.len();
         let (new_len, count) = dedup_in_place(&mut data, false, false);
@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_to_writer_basic() {
+    fn dedup_to_writer_basic() {
         let data = b"line1\nline2\nline1\nline3\n";
         let mut output = Vec::new();
 
@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_to_writer_case_insensitive() {
+    fn dedup_to_writer_case_insensitive() {
         let data = b"Hello\nhello\nHELLO\nworld\n";
         let mut output = Vec::new();
 
@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_preserves_first() {
+    fn dedup_preserves_first() {
         let data = b"First\nfirst\nFIRST\n";
         let mut output = Vec::new();
 
@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_empty() {
+    fn dedup_empty() {
         let data = b"";
         let mut output = Vec::new();
 
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_empty_lines() {
+    fn dedup_empty_lines() {
         let data = b"\n\n\ntext\n\n";
         let mut output = Vec::new();
 
@@ -607,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_line_entry_empty() {
+    fn line_entry_empty() {
         assert!(LineEntry::EMPTY.is_empty());
         assert!(LineEntry::default().is_empty());
 

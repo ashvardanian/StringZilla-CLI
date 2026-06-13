@@ -274,7 +274,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_rows_single() {
+    fn parse_rows_single() {
         match parse_rows("5").unwrap() {
             RowSelector::Indices(indices) => {
                 assert!(indices.contains(&4)); // 0-based
@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rows_list() {
+    fn parse_rows_list() {
         match parse_rows("1,5,10").unwrap() {
             RowSelector::Indices(indices) => {
                 assert!(indices.contains(&0));
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rows_range() {
+    fn parse_rows_range() {
         match parse_rows("5-10").unwrap() {
             RowSelector::Range(start, end) => {
                 assert_eq!(start, 4); // 0-based
@@ -309,14 +309,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rows_errors() {
+    fn parse_rows_errors() {
         assert!(parse_rows("0").is_err()); // 0 not allowed
         assert!(parse_rows("10-5").is_err()); // invalid range
         assert!(parse_rows("abc").is_err()); // not a number
     }
 
     #[test]
-    fn test_extract_single_row() {
+    fn extract_single_row() {
         let data = b"line1\nline2\nline3\nline4\n";
         let mut output = Vec::new();
 
@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_range() {
+    fn extract_range() {
         let data = b"line1\nline2\nline3\nline4\nline5\n";
         let mut output = Vec::new();
 
@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_tail() {
+    fn extract_tail() {
         let data = b"line1\nline2\nline3\nline4\nline5\n";
         let mut output = Vec::new();
 
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_every() {
+    fn extract_every() {
         let data = b"line1\nline2\nline3\nline4\nline5\nline6\n";
         let mut output = Vec::new();
 
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_with_line_numbers() {
+    fn extract_with_line_numbers() {
         let data = b"line1\nline2\nline3\n";
         let mut output = Vec::new();
 
@@ -382,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_multiple_indices() {
+    fn extract_multiple_indices() {
         let data = b"a\nb\nc\nd\ne\n";
         let mut output = Vec::new();
 
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_beyond_file() {
+    fn extract_beyond_file() {
         let data = b"line1\nline2\n";
         let mut output = Vec::new();
 
@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tail_larger_than_file() {
+    fn tail_larger_than_file() {
         let data = b"line1\nline2\n";
         let mut output = Vec::new();
 

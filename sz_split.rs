@@ -156,7 +156,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_generate_suffix() {
+    fn generate_suffix() {
         assert_eq!(generate_suffix(0, 2), "aa");
         assert_eq!(generate_suffix(1, 2), "ab");
         assert_eq!(generate_suffix(25, 2), "az");
@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn test_split_by_lines() {
+    fn split_by_lines() {
         let temp_dir = TempDir::new().unwrap();
         let prefix = temp_dir.path().join("test_").to_str().unwrap().to_string();
 
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn test_split_single_line_per_file() {
+    fn split_single_line_per_file() {
         let temp_dir = TempDir::new().unwrap();
         let prefix = temp_dir
             .path()
@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn test_split_no_trailing_newline() {
+    fn split_no_trailing_newline() {
         let temp_dir = TempDir::new().unwrap();
         let prefix = temp_dir
             .path()

@@ -1274,7 +1274,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_heading_detection() {
+    fn heading_detection() {
         assert_eq!(parse_heading(b"# Title"), Some((1, "Title".to_string())));
         assert_eq!(
             parse_heading(b"## Level 2"),
@@ -1293,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_code_fence_detection() {
+    fn code_fence_detection() {
         assert!(is_code_fence(b"```").is_some());
         assert!(is_code_fence(b"```rust").is_some());
         assert!(is_code_fence(b"~~~").is_some());
@@ -1308,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_include_parsing() {
+    fn include_parsing() {
         assert_eq!(
             parse_include(b"#include <stdio.h>"),
             Some(("stdio.h".to_string(), true))
@@ -1320,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_brace_counting() {
+    fn brace_counting() {
         assert_eq!(count_braces(b"{"), 1);
         assert_eq!(count_braces(b"}"), -1);
         assert_eq!(count_braces(b"{}"), 0);
@@ -1330,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_last_identifier() {
+    fn extract_last_identifier() {
         assert_eq!(
             extract_last_identifier(b"int main"),
             Some("main".to_string())
@@ -1346,14 +1346,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ends_with_identifier() {
+    fn ends_with_identifier() {
         assert!(ends_with_identifier(b"if", b"if"));
         assert!(ends_with_identifier(b"   if", b"if"));
         assert!(!ends_with_identifier(b"elif", b"if"));
     }
 
     #[test]
-    fn test_markdown_parsing() {
+    fn markdown_parsing() {
         let md = b"# Title\n\nSome text.\n\n## Section\n\n```rust\ncode\n```\n";
         let elements = parse_markdown(md, Verbosity::Names);
 
@@ -1369,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn test_c_parsing() {
+    fn c_parsing() {
         let c = b"#include <stdio.h>\n\nint main(void) {\n    return 0;\n}\n";
         let elements = parse_c(c, Verbosity::Names);
 

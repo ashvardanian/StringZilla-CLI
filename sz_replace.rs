@@ -209,7 +209,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_replace_all_basic() {
+    fn replace_all_basic() {
         let data = b"hello world hello";
         let (result, count) = replace_all(data, b"hello", b"hi", false);
 
@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_all_no_matches() {
+    fn replace_all_no_matches() {
         let data = b"hello world";
         let (result, count) = replace_all(data, b"foo", b"bar", false);
 
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_all_case_insensitive() {
+    fn replace_all_case_insensitive() {
         let data = b"Hello HELLO hello";
         let (result, count) = replace_all(data, b"hello", b"hi", true);
 
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_all_empty_pattern() {
+    fn replace_all_empty_pattern() {
         let data = b"hello";
         let (result, count) = replace_all(data, b"", b"x", false);
 
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_all_longer_replacement() {
+    fn replace_all_longer_replacement() {
         let data = b"a b a";
         let (result, count) = replace_all(data, b"a", b"foo", false);
 
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_all_shorter_replacement() {
+    fn replace_all_shorter_replacement() {
         let data = b"hello hello";
         let (result, count) = replace_all(data, b"hello", b"hi", false);
 
@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_overlapping() {
+    fn replace_overlapping() {
         let data = b"aaa";
         let (result, count) = replace_all(data, b"aa", b"b", false);
 
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_utf8_content() {
+    fn replace_utf8_content() {
         let data = "héllo wörld héllo".as_bytes();
         let (result, count) = replace_all(data, "héllo".as_bytes(), "hi".as_bytes(), false);
 
@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_at_boundaries() {
+    fn replace_at_boundaries() {
         // Pattern at start
         let data = b"hello world";
         let (result, count) = replace_all(data, b"hello", b"hi", false);
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_entire_content() {
+    fn replace_entire_content() {
         let data = b"hello";
         let (result, count) = replace_all(data, b"hello", b"goodbye", false);
 
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_with_empty() {
+    fn replace_with_empty() {
         let data = b"hello world hello";
         let (result, count) = replace_all(data, b"hello", b"", false);
 
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_case_insensitive_preserves_replacement() {
+    fn replace_case_insensitive_preserves_replacement() {
         // Case insensitive finds, but replacement is literal
         let data = b"HELLO hello HeLLo";
         let (result, count) = replace_all(data, b"hello", b"hi", true);
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_single_char() {
+    fn replace_single_char() {
         let data = b"a b a c a";
         let (result, count) = replace_all(data, b"a", b"x", false);
 
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_newlines() {
+    fn replace_newlines() {
         let data = b"line1\nline2\nline1\n";
         let (result, count) = replace_all(data, b"line1", b"first", false);
 

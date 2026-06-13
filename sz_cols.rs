@@ -227,58 +227,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_fields_single() {
+    fn parse_fields_single() {
         assert_eq!(parse_fields("2").unwrap(), vec![1]); // 0-based
         assert_eq!(parse_fields("1").unwrap(), vec![0]);
     }
 
     #[test]
-    fn test_parse_fields_list() {
+    fn parse_fields_list() {
         assert_eq!(parse_fields("1,3,5").unwrap(), vec![0, 2, 4]);
         assert_eq!(parse_fields("2, 4").unwrap(), vec![1, 3]); // with spaces
     }
 
     #[test]
-    fn test_parse_fields_range() {
+    fn parse_fields_range() {
         assert_eq!(parse_fields("2-5").unwrap(), vec![1, 2, 3, 4]);
         assert_eq!(parse_fields("1-3").unwrap(), vec![0, 1, 2]);
     }
 
     #[test]
-    fn test_parse_fields_mixed() {
+    fn parse_fields_mixed() {
         assert_eq!(parse_fields("1,3-5,7").unwrap(), vec![0, 2, 3, 4, 6]);
     }
 
     #[test]
-    fn test_parse_fields_errors() {
+    fn parse_fields_errors() {
         assert!(parse_fields("0").is_err()); // 0 not allowed
         assert!(parse_fields("5-2").is_err()); // invalid range
         assert!(parse_fields("abc").is_err()); // not a number
     }
 
     #[test]
-    fn test_split_fields_tab() {
+    fn split_fields_tab() {
         let line = b"a\tb\tc";
         let fields = split_fields(line, b"\t");
         assert_eq!(fields, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
     }
 
     #[test]
-    fn test_split_fields_comma() {
+    fn split_fields_comma() {
         let line = b"one,two,three";
         let fields = split_fields(line, b",");
         assert_eq!(fields, vec![b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]);
     }
 
     #[test]
-    fn test_split_fields_multi_char_delimiter() {
+    fn split_fields_multi_char_delimiter() {
         let line = b"a::b::c";
         let fields = split_fields(line, b"::");
         assert_eq!(fields, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
     }
 
     #[test]
-    fn test_extract_cols_basic() {
+    fn extract_cols_basic() {
         let data = b"a\tb\tc\n1\t2\t3\n";
         let mut output = Vec::new();
 
@@ -289,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_cols_multiple() {
+    fn extract_cols_multiple() {
         let data = b"a\tb\tc\td\n";
         let mut output = Vec::new();
 
@@ -299,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_cols_missing_field() {
+    fn extract_cols_missing_field() {
         let data = b"a\tb\n";
         let mut output = Vec::new();
 
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_cols_min_fields() {
+    fn extract_cols_min_fields() {
         let data = b"a\tb\tc\na\n1\t2\t3\n";
         let mut output = Vec::new();
 
