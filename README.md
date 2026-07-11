@@ -20,7 +20,7 @@ It provides the following subcommands:
 - `sz-split`: 4x faster `split` file splitting, that won't break UTF-8 characters or lines
 - `sz-cols`: extract columns from delimited text; replaces `cut -f` and `awk '{print $N}'` with simpler syntax
 - `sz-rows`: extract rows by index or range; replaces `sed -n`, `head`, `tail`, and `awk 'NR==N'`
-- :soon: `sz-sort`: sort lines
+- `sz-sort`: sort lines; Unicode-correct and `sort -u`-style deduplication
 - :soon: `sz-fuzzy-find`: combination of exact and Levenshtein-bounded substring search
 
 ## Installation
@@ -288,4 +288,29 @@ $ sz-rows --every 5 file.txt
 
 # Show line numbers in output
 $ sz-rows -n -r 5-10 file.txt
+```
+
+## `sz-sort`: Sort Lines
+
+A faster, Unicode-correct `sort` built on StringZilla's `argsort`.
+Comparison is unsigned byte-wise, which for valid UTF-8 is exactly Unicode code-point order (UTF-8 preserves code-point ordering under unsigned byte comparison), so `--utf8` only governs newline handling and output matches `LC_ALL=C sort`.
+
+```bash
+# Sort to stdout (replaces: sort file.txt)
+$ sz-sort file.txt
+
+# Reverse / descending (replaces: sort -r)
+$ sz-sort -r file.txt
+
+# Sort and drop duplicates (replaces: sort -u)
+$ sz-sort -u file.txt
+
+# Case-insensitive sort with full Unicode case folding (replaces: sort -f)
+$ sz-sort -i file.txt
+
+# Write to a file (replaces: sort -o sorted.txt file.txt)
+$ sz-sort file.txt -o sorted.txt
+
+# Check whether the input is already sorted; exit 1 if not (replaces: sort -c)
+$ sz-sort -c file.txt
 ```
