@@ -22,14 +22,13 @@
 //! sz-outline -t md document.txt
 //! ```
 
-use std::fs::File;
-use std::io::{self, Read, Write};
+use std::borrow::Cow;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process;
 
 use clap::Parser;
-use memmap2::Mmap;
-use stringzilla::sz::find;
+use stringzilla::sz::{find, StringZillableUnary};
 
 mod shared;
 
@@ -173,7 +172,7 @@ fn parse_markdown(data: &[u8], verbosity: Verbosity) -> Vec<OutlineElement> {
     let mut table_start: Option<(usize, usize)> = None;
     let mut paragraph_start: Option<(usize, usize)> = None;
 
-    for line in shared::LineIterator::new(data) {
+    for line in shared::LineIter::new(data, false) {
         line_number += 1;
         let line_start = byte_offset;
         let line_len = line.len();
@@ -615,7 +614,7 @@ fn parse_c(data: &[u8], _verbosity: Verbosity) -> Vec<OutlineElement> {
     let mut in_multiline_comment = false;
     let mut pending_signature: Option<(usize, usize, Vec<u8>)> = None;
 
-    for line in shared::LineIterator::new(data) {
+    for line in shared::LineIter::new(data, false) {
         line_number += 1;
         let line_start = byte_offset;
         let line_len = line.len();
@@ -940,25 +939,18 @@ fn extract_last_identifier(data: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&trimmed[start..end]).into_owned())
 }
 
-/// Normalize function signature (collapse whitespace)
+/// Normalize a function signature: collapse whitespace runs to single spaces,
+/// via StringZilla's SIMD whitespace splitter. Builds one output string (the old
+/// char-loop allocated twice: the buffer plus a trimmed copy).
 fn normalize_signature(data: &[u8]) -> String {
-    let s = String::from_utf8_lossy(data);
     let mut result = String::new();
-    let mut prev_space = true;
-
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if !prev_space {
-                result.push(' ');
-                prev_space = true;
-            }
-        } else {
-            result.push(c);
-            prev_space = false;
+    for token in data.sz_utf8_split_whitespaces().skip_empty() {
+        if !result.is_empty() {
+            result.push(' ');
         }
+        result.push_str(&String::from_utf8_lossy(token));
     }
-
-    result.trim().to_string()
+    result
 }
 
 // endregion: C Parser
@@ -1021,53 +1013,57 @@ fn trim_trailing_hashes(data: &[u8]) -> &[u8] {
 
 // region: Output Formatting
 
-fn format_element(elem: &OutlineElement, verbosity: Verbosity, file_type: FileType) -> String {
+fn write_element(
+    out: &mut dyn Write,
+    elem: &OutlineElement,
+    verbosity: Verbosity,
+    file_type: FileType,
+) -> io::Result<()> {
     match file_type {
-        FileType::Markdown => format_markdown_element(elem, verbosity),
-        FileType::CSource | FileType::CHeader => format_c_element(elem, verbosity),
-        FileType::Unknown => String::new(),
+        FileType::Markdown => write_markdown_element(out, elem, verbosity),
+        FileType::CSource | FileType::CHeader => write_c_element(out, elem, verbosity),
+        FileType::Unknown => Ok(()),
     }
 }
 
-fn format_markdown_element(elem: &OutlineElement, verbosity: Verbosity) -> String {
-    let mut output = String::new();
-
+fn write_markdown_element(
+    out: &mut dyn Write,
+    elem: &OutlineElement,
+    verbosity: Verbosity,
+) -> io::Result<()> {
     match &elem.kind {
         ElementKind::Heading { level } => {
-            let prefix = "#".repeat(*level as usize);
-
+            // Headings are levels 1..=6 — slice a static run, no allocation.
+            let prefix = &"######"[..(*level as usize).min(6)];
             match verbosity {
-                Verbosity::Names => {
-                    output.push_str(&format!("{} {}\n", prefix, elem.name));
-                }
-                Verbosity::LineNumbers => {
-                    output.push_str(&format!(
-                        "{} {:40} [L{}, @{}]\n",
-                        prefix, elem.name, elem.line_number, elem.byte_offset
-                    ));
-                }
+                Verbosity::Names => writeln!(out, "{} {}", prefix, elem.name)?,
+                Verbosity::LineNumbers => writeln!(
+                    out,
+                    "{} {:40} [L{}, @{}]",
+                    prefix, elem.name, elem.line_number, elem.byte_offset
+                )?,
                 Verbosity::Detailed => {
                     let end_line = elem.line_number + elem.line_count - 1;
                     if elem.line_count > 1 {
-                        output.push_str(&format!(
-                            "{} {:40} [L{}-{}, @{}, {}B]\n",
+                        writeln!(
+                            out,
+                            "{} {:40} [L{}-{}, @{}, {}B]",
                             prefix,
                             elem.name,
                             elem.line_number,
                             end_line,
                             elem.byte_offset,
                             elem.byte_length
-                        ));
+                        )?;
                     } else {
-                        output.push_str(&format!(
-                            "{} {:40} [L{}, @{}, {}B]\n",
+                        writeln!(
+                            out,
+                            "{} {:40} [L{}, @{}, {}B]",
                             prefix, elem.name, elem.line_number, elem.byte_offset, elem.byte_length
-                        ));
+                        )?;
                     }
-
-                    // Print children
                     for child in &elem.children {
-                        output.push_str(&format_child_block(child));
+                        write_child_block(out, child)?;
                     }
                 }
             }
@@ -1075,137 +1071,119 @@ fn format_markdown_element(elem: &OutlineElement, verbosity: Verbosity) -> Strin
         ElementKind::CodeBlock { language } => {
             if verbosity >= Verbosity::Detailed {
                 let lang_str = language.as_deref().unwrap_or("code");
-                output.push_str(&format!(
-                    "  - {} [L{}-{}, {}B]\n",
+                writeln!(
+                    out,
+                    "  - {} [L{}-{}, {}B]",
                     lang_str,
                     elem.line_number,
                     elem.line_number + elem.line_count - 1,
                     elem.byte_length
-                ));
+                )?;
             }
         }
         _ => {}
     }
-
-    output
+    Ok(())
 }
 
-fn format_child_block(elem: &OutlineElement) -> String {
-    let kind_str = match &elem.kind {
-        ElementKind::CodeBlock { language } => language
-            .as_ref()
-            .map(|l| format!("code ({})", l))
-            .unwrap_or_else(|| "code".to_string()),
-        ElementKind::Blockquote => "blockquote".to_string(),
-        ElementKind::Table => "table".to_string(),
-        ElementKind::Image { alt } => format!("image: {}", alt),
-        ElementKind::Paragraph => "paragraph".to_string(),
-        _ => "block".to_string(),
+fn write_child_block(out: &mut dyn Write, elem: &OutlineElement) -> io::Result<()> {
+    // Constant labels borrow; only code(lang)/image build a small owned label for the {:36} pad.
+    let kind_str: Cow<str> = match &elem.kind {
+        ElementKind::CodeBlock { language } => match language {
+            Some(l) => Cow::Owned(format!("code ({})", l)),
+            None => Cow::Borrowed("code"),
+        },
+        ElementKind::Blockquote => Cow::Borrowed("blockquote"),
+        ElementKind::Table => Cow::Borrowed("table"),
+        ElementKind::Image { alt } => Cow::Owned(format!("image: {}", alt)),
+        ElementKind::Paragraph => Cow::Borrowed("paragraph"),
+        _ => Cow::Borrowed("block"),
     };
 
     if elem.line_count > 1 {
-        format!(
-            "  - {:36} [L{}-{}, {}B]\n",
+        writeln!(
+            out,
+            "  - {:36} [L{}-{}, {}B]",
             kind_str,
             elem.line_number,
             elem.line_number + elem.line_count - 1,
             elem.byte_length
         )
     } else {
-        format!(
-            "  - {:36} [L{}, {}B]\n",
+        writeln!(
+            out,
+            "  - {:36} [L{}, {}B]",
             kind_str, elem.line_number, elem.byte_length
         )
     }
 }
 
-fn format_c_element(elem: &OutlineElement, verbosity: Verbosity) -> String {
-    let mut output = String::new();
-
+fn write_c_element(
+    out: &mut dyn Write,
+    elem: &OutlineElement,
+    verbosity: Verbosity,
+) -> io::Result<()> {
     match &elem.kind {
         ElementKind::Include { is_system } => {
-            let path = if *is_system {
-                format!("<{}>", elem.name)
-            } else {
-                format!("\"{}\"", elem.name)
-            };
-
+            let (open, close) = if *is_system { ("<", ">") } else { ("\"", "\"") };
             match verbosity {
                 Verbosity::Names => {
-                    output.push_str(&format!("#include {}\n", path));
+                    writeln!(out, "#include {}{}{}", open, elem.name, close)?;
                 }
                 Verbosity::LineNumbers | Verbosity::Detailed => {
-                    output.push_str(&format!(
-                        "#include {:36} [L{}, @{}]\n",
+                    // Build the padded `<path>` field (small, per include) for {:36}.
+                    let path = format!("{}{}{}", open, elem.name, close);
+                    writeln!(
+                        out,
+                        "#include {:36} [L{}, @{}]",
                         path, elem.line_number, elem.byte_offset
-                    ));
+                    )?;
                 }
             }
         }
         ElementKind::FunctionDeclaration => match verbosity {
-            Verbosity::Names => {
-                output.push_str(&format!("{:44} [declaration]\n", elem.name));
-            }
-            Verbosity::LineNumbers => {
-                output.push_str(&format!(
-                    "{:44} [L{}, @{}, declaration]\n",
-                    elem.name, elem.line_number, elem.byte_offset
-                ));
-            }
-            Verbosity::Detailed => {
-                output.push_str(&format!(
-                    "{:44} [L{}, @{}, {}B, declaration]\n",
-                    elem.name, elem.line_number, elem.byte_offset, elem.byte_length
-                ));
-            }
+            Verbosity::Names => writeln!(out, "{:44} [declaration]", elem.name)?,
+            Verbosity::LineNumbers => writeln!(
+                out,
+                "{:44} [L{}, @{}, declaration]",
+                elem.name, elem.line_number, elem.byte_offset
+            )?,
+            Verbosity::Detailed => writeln!(
+                out,
+                "{:44} [L{}, @{}, {}B, declaration]",
+                elem.name, elem.line_number, elem.byte_offset, elem.byte_length
+            )?,
         },
         ElementKind::FunctionDefinition => match verbosity {
-            Verbosity::Names => {
-                output.push_str(&format!("{:44} [definition]\n", elem.name));
-            }
+            Verbosity::Names => writeln!(out, "{:44} [definition]", elem.name)?,
             Verbosity::LineNumbers => {
                 let end_line = elem.line_number + elem.line_count - 1;
-                output.push_str(&format!(
-                    "{:44} [L{}-{}, @{}, definition]\n",
+                writeln!(
+                    out,
+                    "{:44} [L{}-{}, @{}, definition]",
                     elem.name, elem.line_number, end_line, elem.byte_offset
-                ));
+                )?;
             }
             Verbosity::Detailed => {
                 let end_line = elem.line_number + elem.line_count - 1;
-                output.push_str(&format!(
-                    "{:44} [L{}-{}, @{}, {}B, {} lines, definition]\n",
+                writeln!(
+                    out,
+                    "{:44} [L{}-{}, @{}, {}B, {} lines, definition]",
                     elem.name,
                     elem.line_number,
                     end_line,
                     elem.byte_offset,
                     elem.byte_length,
                     elem.line_count
-                ));
+                )?;
             }
         },
         _ => {}
     }
-
-    output
+    Ok(())
 }
 
 // endregion: Output Formatting
-
-// region: Input Handling
-
-fn get_input(path: &str) -> io::Result<Vec<u8>> {
-    if path == "-" {
-        let mut buffer = Vec::new();
-        io::stdin().read_to_end(&mut buffer)?;
-        Ok(buffer)
-    } else {
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        Ok(mmap.to_vec())
-    }
-}
-
-// endregion: Input Handling
 
 // region: Main
 
@@ -1233,19 +1211,20 @@ fn main() {
         process::exit(1);
     }
 
-    // Get input
-    let data = match get_input(&args.input) {
-        Ok(data) => data,
+    // Get input — mmap is borrowed, not copied.
+    let input = match shared::get_input(Some(&args.input)) {
+        Ok(input) => input,
         Err(e) => {
             eprintln!("Error reading input: {}", e);
             process::exit(1);
         }
     };
+    let data = input.as_bytes();
 
     // Parse based on file type
     let elements = match file_type {
-        FileType::Markdown => parse_markdown(&data, verbosity),
-        FileType::CSource | FileType::CHeader => parse_c(&data, verbosity),
+        FileType::Markdown => parse_markdown(data, verbosity),
+        FileType::CSource | FileType::CHeader => parse_c(data, verbosity),
         FileType::Unknown => Vec::new(),
     };
 
@@ -1254,8 +1233,7 @@ fn main() {
     let mut handle = stdout.lock();
 
     for elem in &elements {
-        let formatted = format_element(elem, verbosity, file_type);
-        if let Err(e) = handle.write_all(formatted.as_bytes()) {
+        if let Err(e) = write_element(&mut handle, elem, verbosity, file_type) {
             if e.kind() == io::ErrorKind::BrokenPipe {
                 break;
             }
@@ -1330,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_last_identifier() {
+    fn extract_last_identifier_works() {
         assert_eq!(
             extract_last_identifier(b"int main"),
             Some("main".to_string())
@@ -1346,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn ends_with_identifier() {
+    fn ends_with_identifier_works() {
         assert!(ends_with_identifier(b"if", b"if"));
         assert!(ends_with_identifier(b"   if", b"if"));
         assert!(!ends_with_identifier(b"elif", b"if"));

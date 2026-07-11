@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use clap::Parser;
 use ignore::WalkBuilder;
 use memmap2::Mmap;
-use stringzilla::sz::{find, rfind, utf8_case_insensitive_find};
+use stringzilla::sz::{find, rfind, utf8_uncased_search, StringZillableBinary};
 
 mod shared;
 use shared::*;
@@ -350,7 +350,7 @@ impl MatchInfo {
 /// Zero-allocation iterator over pattern matches in data.
 ///
 /// Uses StringZilla's SIMD-accelerated search functions directly.
-/// For case-insensitive matching, uses `utf8_case_insensitive_find` which
+/// For case-insensitive matching, uses `utf8_uncased_search` which
 /// may return matches of different lengths than the pattern.
 struct MatchIter<'a> {
     data: &'a [u8],
@@ -381,7 +381,7 @@ impl<'a> Iterator for MatchIter<'a> {
             let remaining = &self.data[self.pos..];
 
             let (offset, len) = if self.ignore_case {
-                utf8_case_insensitive_find(remaining, self.pattern)?
+                utf8_uncased_search(remaining, self.pattern)?
             } else {
                 let off = find(remaining, self.pattern)?;
                 (off, self.pattern.len())
@@ -675,7 +675,7 @@ fn search_mmap(
     } else if config.utf8 {
         search_intraline(
             data,
-            Utf8LineIterator::new(data),
+            LineIter::new(data, true),
             filename,
             config,
             output,
@@ -684,7 +684,7 @@ fn search_mmap(
     } else {
         search_intraline(
             data,
-            LineIterator::new(data),
+            LineIter::new(data, false),
             filename,
             config,
             output,
@@ -897,7 +897,7 @@ fn search_multiline(
     let mut match_count = 0;
     let mut pos = 0;
     let mut last_printed_end: usize = 0;
-    let lines_searched = count_byte(data, b'\n') + 1;
+    let lines_searched = data.sz_matches(b"\n").count() + 1;
 
     while pos < data.len() {
         // Check max count
@@ -910,7 +910,7 @@ fn search_multiline(
 
         // Find next match
         let match_result = if config.ignore_case {
-            utf8_case_insensitive_find(&data[pos..], config.pattern)
+            utf8_uncased_search(&data[pos..], config.pattern)
                 .map(|(off, len)| (pos + off, len))
         } else {
             find(&data[pos..], config.pattern).map(|off| (pos + off, config.pattern.len()))
@@ -990,10 +990,10 @@ fn search_multiline(
                 || config.byte_offset
                 || config.output_format != OutputFormat::Standard
             {
-                let line_num = count_byte(&data[..actual_start], b'\n') + 1;
+                let line_num = data[..actual_start].sz_matches(b"\n").count() + 1;
                 let region = &data[actual_start..output_end];
                 let mut line_byte_offset = actual_start;
-                for (i, line) in region.split(|&b| b == b'\n').enumerate() {
+                for (i, line) in region.sz_splits(b"\n").enumerate() {
                     if !line.is_empty() || i == 0 {
                         print_line(
                             output,
@@ -1814,7 +1814,7 @@ mod tests {
     }
 
     #[test]
-    fn is_binary() {
+    fn detects_binary() {
         assert!(is_binary(b"hello\0world"));
         assert!(!is_binary(b"hello world"));
         assert!(!is_binary(b"hello\nworld\n"));
@@ -1866,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn highlight_line() {
+    fn highlights_line() {
         let line = b"hello world hello";
         let mut config = make_config(b"hello");
         config.colors = Colors::enabled();

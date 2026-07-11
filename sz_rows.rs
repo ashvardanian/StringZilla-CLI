@@ -28,7 +28,7 @@
 //! cat file.txt | sz-rows -r 5-10
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 use std::process;
 
@@ -159,7 +159,7 @@ fn extract_rows_by_selector(
     match selector {
         RowSelector::Indices(indices) => {
             let max_index = *indices.iter().max().unwrap_or(&0);
-            for (i, line) in LineIterator::new(data).enumerate() {
+            for (i, line) in LineIter::new(data, false).enumerate() {
                 if i > max_index {
                     break; // No need to continue past the last requested index
                 }
@@ -174,7 +174,7 @@ fn extract_rows_by_selector(
             }
         }
         RowSelector::Range(start, end) => {
-            for (i, line) in LineIterator::new(data).enumerate() {
+            for (i, line) in LineIter::new(data, false).enumerate() {
                 if i > *end {
                     break;
                 }
@@ -189,12 +189,20 @@ fn extract_rows_by_selector(
             }
         }
         RowSelector::Tail(n) => {
-            // Collect line positions, then output last N
-            let lines: Vec<_> = LineIterator::new(data).collect();
-            let start = lines.len().saturating_sub(*n);
-            for (i, line) in lines[start..].iter().enumerate() {
+            // Keep only the last N lines in a ring buffer — O(n) memory, not O(file).
+            let n = *n;
+            let mut ring: VecDeque<(usize, &[u8])> = VecDeque::with_capacity(n);
+            for (i, line) in LineIter::new(data, false).enumerate() {
+                if n > 0 {
+                    if ring.len() == n {
+                        ring.pop_front();
+                    }
+                    ring.push_back((i, line));
+                }
+            }
+            for (i, line) in ring {
                 if show_line_numbers {
-                    write!(output, "{}:", start + i + 1)?;
+                    write!(output, "{}:", i + 1)?;
                 }
                 output.write_all(line)?;
                 output.write_all(b"\n")?;
@@ -202,7 +210,7 @@ fn extract_rows_by_selector(
             }
         }
         RowSelector::Every(n) => {
-            for (i, line) in LineIterator::new(data).enumerate() {
+            for (i, line) in LineIter::new(data, false).enumerate() {
                 if (i + 1) % n == 0 {
                     if show_line_numbers {
                         write!(output, "{}:", i + 1)?;

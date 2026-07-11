@@ -26,7 +26,7 @@ use std::io::{self, Write};
 use std::process;
 
 use clap::Parser;
-use stringzilla::sz::find;
+use stringzilla::sz::{FindSplits, MatcherType};
 
 mod shared;
 use shared::*;
@@ -106,32 +106,16 @@ fn parse_fields(spec: &str) -> Result<Vec<usize>, String> {
     Ok(fields)
 }
 
-/// Split a line into fields using the delimiter
-fn split_fields<'a>(line: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
-    let mut fields = Vec::new();
-    let mut pos = 0;
-
-    while pos < line.len() {
-        if let Some(found) = find(&line[pos..], delimiter) {
-            fields.push(&line[pos..pos + found]);
-            pos += found + delimiter.len();
-        } else {
-            fields.push(&line[pos..]);
-            break;
-        }
+/// Split a line into `out` on the delimiter (SIMD `FindSplits`), reusing the
+/// caller's buffer to avoid a per-line allocation. Separator semantics give the
+/// trailing empty field on a trailing delimiter for free; an empty line has no
+/// fields (matching `cut`).
+fn split_fields<'a>(line: &'a [u8], delimiter: &'a [u8], out: &mut Vec<&'a [u8]>) {
+    out.clear();
+    if line.is_empty() {
+        return;
     }
-
-    // Handle trailing delimiter (empty last field)
-    if !line.is_empty() && line.ends_with(delimiter) {
-        fields.push(&[][..]);
-    }
-
-    // Handle empty input
-    if fields.is_empty() && !line.is_empty() {
-        fields.push(line);
-    }
-
-    fields
+    out.extend(FindSplits::new(line, MatcherType::Find(delimiter)));
 }
 
 /// Extract specified columns from data
@@ -144,9 +128,10 @@ fn extract_cols(
     output: &mut dyn Write,
 ) -> io::Result<usize> {
     let mut line_count = 0;
+    let mut fields: Vec<&[u8]> = Vec::new(); // reused across lines
 
-    for line in LineIterator::new(data) {
-        let fields = split_fields(line, delimiter);
+    for line in LineIter::new(data, false) {
+        split_fields(line, delimiter, &mut fields);
 
         // Skip lines with too few fields if min_fields is set
         if let Some(min) = min_fields {
@@ -256,25 +241,34 @@ mod tests {
         assert!(parse_fields("abc").is_err()); // not a number
     }
 
+    fn fields<'a>(line: &'a [u8], delimiter: &'a [u8]) -> Vec<&'a [u8]> {
+        let mut out = Vec::new();
+        split_fields(line, delimiter, &mut out);
+        out
+    }
+
     #[test]
     fn split_fields_tab() {
-        let line = b"a\tb\tc";
-        let fields = split_fields(line, b"\t");
-        assert_eq!(fields, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            fields(b"a\tb\tc", b"\t"),
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
     }
 
     #[test]
     fn split_fields_comma() {
-        let line = b"one,two,three";
-        let fields = split_fields(line, b",");
-        assert_eq!(fields, vec![b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]);
+        assert_eq!(
+            fields(b"one,two,three", b","),
+            vec![b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]
+        );
     }
 
     #[test]
     fn split_fields_multi_char_delimiter() {
-        let line = b"a::b::c";
-        let fields = split_fields(line, b"::");
-        assert_eq!(fields, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            fields(b"a::b::c", b"::"),
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
     }
 
     #[test]

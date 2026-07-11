@@ -8,10 +8,9 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
-use std::str;
 
 use memmap2::{Mmap, MmapMut};
-use stringzilla::sz::{find, find_newline_utf8};
+use stringzilla::sz::{FindSplits, StringZillableBinary, StringZillableUnary, Utf8SplitNewlines};
 
 /// Represents the input source - either a memory-mapped file or buffered stdin
 #[allow(dead_code)]
@@ -95,112 +94,26 @@ pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
     }
 }
 
-/// Iterator over lines in a byte slice, using StringZilla for fast newline search
-#[allow(dead_code)]
-pub struct LineIterator<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-#[allow(dead_code)]
-impl<'a> LineIterator<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    /// Find the next newline starting from the given position
-    #[inline]
-    fn find_newline(&self, start: usize) -> Option<usize> {
-        if start >= self.data.len() {
-            return None;
-        }
-        let remaining = &self.data[start..];
-        find(remaining, b"\n").map(|i| start + i)
-    }
-}
-
-impl<'a> Iterator for LineIterator<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.data.len() {
-            return None;
-        }
-
-        let line_start = self.pos;
-        let line_end = self.find_newline(self.pos).unwrap_or(self.data.len());
-
-        // Move position past the newline
-        self.pos = if line_end < self.data.len() {
-            line_end + 1
-        } else {
-            line_end
-        };
-
-        Some(&self.data[line_start..line_end])
-    }
-}
-
-/// UTF-8 aware line iterator that handles Unicode newlines
-///
-/// Unlike LineIterator which only handles LF (`\n`), this handles:
-/// - LF (`\n`), CR (`\r`), CRLF (`\r\n`)
-/// - Unicode NEL (U+0085)
-/// - Unicode LINE SEPARATOR (U+2028)
-/// - Unicode PARAGRAPH SEPARATOR (U+2029)
-#[allow(dead_code)]
-pub struct Utf8LineIterator<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-#[allow(dead_code)]
-impl<'a> Utf8LineIterator<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-}
-
-impl<'a> Iterator for Utf8LineIterator<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.data.len() {
-            return None;
-        }
-
-        let start = self.pos;
-        match find_newline_utf8(&self.data[self.pos..]) {
-            Some(span) => {
-                let end = self.pos + span.offset;
-                self.pos = end + span.length; // skip the newline (variable length)
-                Some(&self.data[start..end])
-            }
-            None => {
-                self.pos = self.data.len();
-                Some(&self.data[start..])
-            }
-        }
-    }
-}
-
-/// Stack-allocated enum to dispatch between line iterator types.
-/// Use this when you need to choose between byte-level (LF only) and
-/// UTF-8 aware (LF, CR, CRLF, NEL, LS, PS) line iteration at runtime.
+/// Iterator over lines with terminator semantics — a trailing newline does not
+/// yield a final empty line (matching `str::lines`). Newline detection is delegated
+/// to StringZilla's native split kernels: byte-level LF (`sz_splits(b"\n")`) or all
+/// eight Unicode newlines incl. CRLF (`sz_utf8_split_newlines`), selected by `utf8`.
+/// Those kernels split on *separators* (a trailing delimiter emits a final empty
+/// segment), so we drop that single trailing empty to recover terminator semantics.
 #[allow(dead_code)]
 pub enum LineIter<'a> {
-    Byte(LineIterator<'a>),
-    Utf8(Utf8LineIterator<'a>),
+    Byte(std::iter::Peekable<FindSplits<'a>>),
+    Utf8(std::iter::Peekable<Utf8SplitNewlines<'a>>),
 }
 
 #[allow(dead_code)]
 impl<'a> LineIter<'a> {
-    /// Create a line iterator based on utf8 flag
+    /// Create a line iterator; `utf8` selects all-Unicode-newlines vs LF-only.
     pub fn new(data: &'a [u8], utf8: bool) -> Self {
         if utf8 {
-            LineIter::Utf8(Utf8LineIterator::new(data))
+            LineIter::Utf8(data.sz_utf8_split_newlines().peekable())
         } else {
-            LineIter::Byte(LineIterator::new(data))
+            LineIter::Byte(data.sz_splits(b"\n").peekable())
         }
     }
 }
@@ -211,155 +124,68 @@ impl<'a> Iterator for LineIter<'a> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            LineIter::Byte(iter) => iter.next(),
-            LineIter::Utf8(iter) => iter.next(),
+            LineIter::Byte(iter) => drop_trailing_empty(iter),
+            LineIter::Utf8(iter) => drop_trailing_empty(iter),
         }
     }
 }
 
-/// Count lines in data using SIMD-accelerated search
-#[allow(dead_code)]
-pub fn count_lines(data: &[u8]) -> usize {
-    let mut count = 0;
-    let mut pos = 0;
-
-    while pos < data.len() {
-        if let Some(found) = find(&data[pos..], b"\n") {
-            count += 1;
-            pos += found + 1;
-        } else {
-            break;
-        }
+/// Yield the next segment, suppressing a single trailing empty segment (the one a
+/// separator-splitter emits after a trailing delimiter) for line-terminator semantics.
+/// Interior blank lines are preserved — unlike `.skip_empty()`, which drops them all.
+#[inline]
+fn drop_trailing_empty<'a, I: Iterator<Item = &'a [u8]>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Option<&'a [u8]> {
+    let line = iter.next()?;
+    if line.is_empty() && iter.peek().is_none() {
+        return None;
     }
-
-    // If data doesn't end with newline but has content, count the last line
-    if !data.is_empty() && (data.len() == 0 || data[data.len() - 1] != b'\n') {
-        count += 1;
-    }
-
-    count
+    Some(line)
 }
 
-/// Count words in data (whitespace-separated sequences)
-#[allow(dead_code)]
-pub fn count_words(data: &[u8]) -> usize {
-    let mut count = 0;
-    let mut in_word = false;
-
-    for &byte in data {
-        let is_whitespace = byte.is_ascii_whitespace();
-        if !is_whitespace && !in_word {
-            count += 1;
-            in_word = true;
-        } else if is_whitespace {
-            in_word = false;
-        }
-    }
-
-    count
-}
-
-/// Count UTF-8 characters (code points) in data
-#[allow(dead_code)]
-pub fn count_chars_utf8(data: &[u8]) -> Result<usize, io::Error> {
-    let text = str::from_utf8(data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid UTF-8: {}", e)))?;
-    Ok(text.chars().count())
-}
-
-// TODO: Implement natively in StringZilla as sz_count_byte() for better SIMD performance
-/// Count occurrences of a single byte using SIMD-accelerated search
-#[allow(dead_code)]
-pub fn count_byte(data: &[u8], byte: u8) -> usize {
-    let needle = [byte];
-    let mut count = 0;
-    let mut pos = 0;
-    while let Some(offset) = find(&data[pos..], &needle) {
-        count += 1;
-        pos += offset + 1;
-    }
-    count
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn line_iterator() {
-        let data = b"line1\nline2\nline3\n";
-        let lines: Vec<_> = LineIterator::new(data).collect();
-
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], b"line1");
-        assert_eq!(lines[1], b"line2");
-        assert_eq!(lines[2], b"line3");
+    fn lines(data: &[u8], utf8: bool) -> Vec<&[u8]> {
+        LineIter::new(data, utf8).collect()
     }
 
     #[test]
-    fn line_iterator_no_trailing_newline() {
-        let data = b"line1\nline2\nline3";
-        let lines: Vec<_> = LineIterator::new(data).collect();
-
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[2], b"line3");
+    fn lines_lf() {
+        assert_eq!(lines(b"a\nb\nc\n", false), vec![&b"a"[..], b"b", b"c"]);
     }
 
     #[test]
-    fn counting_lines() {
-        assert_eq!(count_lines(b"line1\nline2\nline3\n"), 3);
-        assert_eq!(count_lines(b"line1\nline2\nline3"), 3);
-        assert_eq!(count_lines(b"single"), 1);
-        assert_eq!(count_lines(b""), 0);
+    fn lines_lf_no_trailing_newline() {
+        assert_eq!(lines(b"a\nb\nc", false), vec![&b"a"[..], b"b", b"c"]);
     }
 
     #[test]
-    fn counting_words() {
-        assert_eq!(count_words(b"hello world"), 2);
-        assert_eq!(count_words(b"  hello   world  "), 2);
-        assert_eq!(count_words(b"one\ntwo\tthree"), 3);
-        assert_eq!(count_words(b""), 0);
+    fn lines_utf8_all_newlines() {
+        // LF, CR, CRLF, NEL, LINE/PARAGRAPH SEPARATOR — CRLF counts as one break.
+        let data = "a\nb\r\nc\u{0085}d\u{2028}e\u{2029}".as_bytes();
+        assert_eq!(lines(data, true), vec![&b"a"[..], b"b", b"c", b"d", b"e"]);
     }
 
     #[test]
-    fn counting_chars_utf8() {
-        assert_eq!(count_chars_utf8(b"hello").unwrap(), 5);
-        assert_eq!(count_chars_utf8("héllo".as_bytes()).unwrap(), 5);
-        assert_eq!(count_chars_utf8("こんにちは".as_bytes()).unwrap(), 5);
-        assert!(count_chars_utf8(&[0xFF, 0xFE]).is_err()); // Invalid UTF-8
+    fn lines_utf8_no_trailing_newline() {
+        assert_eq!(lines(b"a\r\nb\r\nc", true), vec![&b"a"[..], b"b", b"c"]);
     }
 
     #[test]
-    fn utf8_line_iterator() {
-        let data = b"line1\nline2\nline3\n";
-        let lines: Vec<_> = Utf8LineIterator::new(data).collect();
-
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], b"line1");
-        assert_eq!(lines[1], b"line2");
-        assert_eq!(lines[2], b"line3");
+    fn lines_preserve_interior_blanks() {
+        // Terminator semantics: a trailing newline drops only the *final* empty line;
+        // interior blank lines are kept (unlike `.skip_empty()`).
+        assert_eq!(lines(b"a\n\nb\n", false), vec![&b"a"[..], b"", b"b"]);
+        assert_eq!(lines(b"a\r\n\r\nb\r\n", true), vec![&b"a"[..], b"", b"b"]);
     }
 
     #[test]
-    fn utf8_line_iterator_crlf() {
-        let data = b"line1\r\nline2\r\nline3";
-        let lines: Vec<_> = Utf8LineIterator::new(data).collect();
-
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], b"line1");
-        assert_eq!(lines[1], b"line2");
-        assert_eq!(lines[2], b"line3");
-    }
-
-    #[test]
-    fn utf8_line_iterator_mixed() {
-        // Mix of LF and CRLF
-        let data = b"line1\nline2\r\nline3\n";
-        let lines: Vec<_> = Utf8LineIterator::new(data).collect();
-
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], b"line1");
-        assert_eq!(lines[1], b"line2");
-        assert_eq!(lines[2], b"line3");
+    fn lines_empty_input() {
+        assert!(lines(b"", false).is_empty());
+        assert!(lines(b"", true).is_empty());
     }
 }

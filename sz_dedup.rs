@@ -50,10 +50,10 @@
 //!
 //! ## Case-Insensitive Mode
 //!
-//! For `-i` mode, uses proper Unicode case folding via `utf8_case_fold()`:
+//! For `-i` mode, uses proper Unicode case folding via `utf8_uncased_fold()`:
 //!
 //! 1. **Hashing**: Case-fold line into scratch buffer, then hash the folded form
-//! 2. **Collision check**: Use `utf8_case_insensitive_order()` directly on original
+//! 2. **Collision check**: Use `utf8_uncased_order()` directly on original
 //!    lines (no re-folding needed for comparison)
 //!
 //! # Examples
@@ -80,7 +80,7 @@ use std::io::{self, Write};
 use std::process;
 
 use clap::Parser;
-use stringzilla::sz::{self, find_newline_utf8};
+use stringzilla::sz;
 
 mod shared;
 use shared::*;
@@ -237,7 +237,7 @@ fn compute_hash(line: &[u8], ignore_case: bool, scratch: &mut Vec<u8>) -> u64 {
         // UTF-8 case folding can expand characters (e.g., ß → ss), max ~3x
         scratch.clear();
         scratch.resize(line.len().saturating_mul(3).max(64), 0);
-        let folded_len = sz::utf8_case_fold(line, &mut scratch[..]);
+        let folded_len = sz::utf8_uncased_fold(line, &mut scratch[..]);
         sz::hash(&scratch[..folded_len])
     } else {
         sz::hash(line)
@@ -248,7 +248,7 @@ fn compute_hash(line: &[u8], ignore_case: bool, scratch: &mut Vec<u8>) -> u64 {
 #[inline]
 fn lines_equal(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
     if ignore_case {
-        sz::utf8_case_insensitive_order(a, b) == Ordering::Equal
+        sz::utf8_uncased_order(a, b) == Ordering::Equal
     } else {
         a == b
     }
@@ -264,62 +264,55 @@ fn lines_equal(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
 /// When `utf8` is true, handles all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
 /// When `utf8` is false, only handles LF newlines.
 fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> (usize, usize) {
+    // Compaction only overwrites `[0..write_pos]`, which is always behind `line_start`,
+    // so the tail `data[line_start..]` is intact — find each newline lazily there with
+    // no up-front offset buffer.
+    let base = data.as_ptr() as usize;
     let mut seen = AppendOnlyFlatHashSet::new();
     let mut scratch = Vec::new();
-
-    let mut read_pos: usize = 0;
     let mut write_pos: usize = 0;
     let mut unique_count: usize = 0;
+    let mut line_start: usize = 0;
 
-    while read_pos < data.len() {
-        // Find end of current line
+    while line_start < data.len() {
+        // Next newline in the untouched tail; the final line has none (len 0).
         let (line_end, newline_len) = if utf8 {
-            // UTF-8 aware: handles LF, CR, CRLF, NEL, LS, PS
-            match find_newline_utf8(&data[read_pos..]) {
-                Some(span) => (read_pos + span.offset, span.length),
+            // UTF-8 aware: first of all 8 Unicode newlines, CRLF as one run.
+            match sz::Utf8Newlines::new(&data[line_start..]).next() {
+                Some(run) => (run.as_ptr() as usize - base, run.len()),
                 None => (data.len(), 0),
             }
         } else {
-            // Byte-level: only LF
-            match sz::find(&data[read_pos..], b"\n") {
-                Some(pos) => (read_pos + pos, 1),
+            match sz::find(&data[line_start..], b"\n") {
+                Some(offset) => (line_start + offset, 1),
                 None => (data.len(), 0),
             }
         };
 
-        let line_len = line_end - read_pos;
+        let line_len = line_end - line_start;
+        let hash = compute_hash(&data[line_start..line_end], ignore_case, &mut scratch);
 
-        // Compute hash
-        let hash = compute_hash(&data[read_pos..line_end], ignore_case, &mut scratch);
-
-        // Check for duplicate against already-written lines in [0..write_pos]
+        // Check for duplicate against already-written lines in [0..write_pos].
         let is_duplicate = seen.find(hash).any(|entry| {
             let existing = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
-            let current = &data[read_pos..line_end];
-            lines_equal(existing, current, ignore_case)
+            lines_equal(existing, &data[line_start..line_end], ignore_case)
         });
 
         if !is_duplicate {
-            // Record this line's position (in compacted buffer)
             seen.insert(hash, write_pos as u64, line_len as u64);
-
-            // Copy line to write position if needed
-            if write_pos != read_pos {
-                data.copy_within(read_pos..line_end, write_pos);
+            if write_pos != line_start {
+                data.copy_within(line_start..line_end, write_pos);
             }
             write_pos += line_len;
-
-            // Copy original newline sequence if present
+            // Preserve the original newline sequence.
             if newline_len > 0 {
                 data.copy_within(line_end..line_end + newline_len, write_pos);
                 write_pos += newline_len;
             }
-
             unique_count += 1;
         }
 
-        // Advance read position past line and newline
-        read_pos = line_end + newline_len;
+        line_start = line_end + newline_len;
     }
 
     (write_pos, unique_count)

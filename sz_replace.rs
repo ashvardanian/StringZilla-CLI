@@ -22,13 +22,12 @@
 //! cat file.txt | sz-replace foo bar
 //! ```
 
-use std::borrow::Cow;
 use std::fs;
 use std::io::{self, Write};
 use std::process;
 
 use clap::Parser;
-use stringzilla::sz::find;
+use stringzilla::sz::{find, utf8_uncased_search};
 
 mod shared;
 use shared::*;
@@ -72,54 +71,48 @@ struct Args {
     utf8: bool,
 }
 
-/// Replace all occurrences of pattern with replacement
-fn replace_all(
+/// Replace all occurrences of `pattern` with `replacement`, streaming the output
+/// into `out` (no full-file buffer). Returns the replacement count.
+///
+/// Case-insensitive matching uses StringZilla's full-Unicode `utf8_uncased_search`
+/// (no whole-file `to_ascii_lowercase` copy), and advances by the matched length —
+/// which case folding may make differ from the pattern length (e.g. ß ↔ SS).
+fn replace_all_to(
     data: &[u8],
     pattern: &[u8],
     replacement: &[u8],
     ignore_case: bool,
-) -> (Vec<u8>, usize) {
+    out: &mut dyn Write,
+) -> io::Result<usize> {
     if pattern.is_empty() {
-        return (data.to_vec(), 0);
+        out.write_all(data)?;
+        return Ok(0);
     }
 
-    let mut result = Vec::with_capacity(data.len());
     let mut pos = 0;
     let mut count = 0;
-
-    // For case-insensitive, we need to work with lowercased versions
-    // Use Cow to avoid unnecessary allocations when ignore_case is false
-    let search_data: Cow<[u8]> = if ignore_case {
-        Cow::Owned(data.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(data)
-    };
-    let search_pattern: Cow<[u8]> = if ignore_case {
-        Cow::Owned(pattern.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(pattern)
-    };
-
     while pos < data.len() {
-        if let Some(found) = find(&search_data[pos..], &search_pattern) {
-            let match_pos = pos + found;
-
-            // Copy everything before the match
-            result.extend_from_slice(&data[pos..match_pos]);
-
-            // Add replacement
-            result.extend_from_slice(replacement);
-
-            count += 1;
-            pos = match_pos + pattern.len();
+        let matched = if ignore_case {
+            utf8_uncased_search(&data[pos..], pattern)
         } else {
-            // No more matches, copy rest of data
-            result.extend_from_slice(&data[pos..]);
-            break;
+            find(&data[pos..], pattern).map(|off| (off, pattern.len()))
+        };
+
+        match matched {
+            Some((offset, match_len)) => {
+                let match_pos = pos + offset;
+                out.write_all(&data[pos..match_pos])?;
+                out.write_all(replacement)?;
+                count += 1;
+                pos = match_pos + match_len;
+            }
+            None => {
+                out.write_all(&data[pos..])?;
+                break;
+            }
         }
     }
-
-    (result, count)
+    Ok(count)
 }
 
 fn main() {
@@ -149,36 +142,30 @@ fn main() {
     };
 
     let data = input.as_bytes();
+    let pattern = args.pattern.as_bytes();
+    let replacement = args.replacement.as_bytes();
 
-    // Perform replacement
-    let (result, count) = replace_all(
-        data,
-        args.pattern.as_bytes(),
-        args.replacement.as_bytes(),
-        args.ignore_case,
-    );
-
-    // Show count if requested
-    if args.count {
-        eprintln!("Replaced {} occurrence(s)", count);
-    }
-
-    // Handle dry run
+    // Dry run: count via a sink — no output buffer materialized.
     if args.dry_run {
+        let count = replace_all_to(data, pattern, replacement, args.ignore_case, &mut io::sink())
+            .expect("writing to a sink cannot fail");
         eprintln!("Dry run: would replace {} occurrence(s)", count);
         process::exit(0);
     }
 
-    // Write output
-    if args.in_place {
-        // Write back to input file
+    let count = if args.in_place {
+        // In-place needs the whole transformed buffer before rewriting the file.
         let input_path = args.input.as_ref().unwrap();
-        if let Err(e) = fs::write(input_path, &result) {
+        let mut buf = Vec::with_capacity(data.len());
+        let count = replace_all_to(data, pattern, replacement, args.ignore_case, &mut buf)
+            .expect("writing to a Vec cannot fail");
+        if let Err(e) = fs::write(input_path, &buf) {
             eprintln!("Error writing to file: {}", e);
             process::exit(1);
         }
+        count
     } else {
-        // Write to output file or stdout
+        // Stream directly to stdout / -o — no full-output buffer.
         let mut output = match get_output(args.output.as_deref()) {
             Ok(output) => output,
             Err(e) => {
@@ -186,27 +173,38 @@ fn main() {
                 process::exit(1);
             }
         };
-
-        if let Err(e) = output.write_all(&result) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
+        let count = match replace_all_to(data, pattern, replacement, args.ignore_case, &mut *output) {
+            Ok(count) => count,
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => process::exit(0),
+            Err(e) => {
+                eprintln!("Error writing output: {}", e);
+                process::exit(1);
             }
-            eprintln!("Error writing output: {}", e);
-            process::exit(1);
-        }
-
+        };
         if let Err(e) = output.flush() {
             if e.kind() != io::ErrorKind::BrokenPipe {
                 eprintln!("Error flushing output: {}", e);
                 process::exit(1);
             }
         }
+        count
+    };
+
+    if args.count {
+        eprintln!("Replaced {} occurrence(s)", count);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: run the streaming replace into a buffer and return it.
+    fn replace_all(data: &[u8], pattern: &[u8], replacement: &[u8], ignore_case: bool) -> (Vec<u8>, usize) {
+        let mut buf = Vec::new();
+        let count = replace_all_to(data, pattern, replacement, ignore_case, &mut buf).unwrap();
+        (buf, count)
+    }
 
     #[test]
     fn replace_all_basic() {

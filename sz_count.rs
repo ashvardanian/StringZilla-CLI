@@ -31,7 +31,7 @@ use clap::Parser;
 use ignore::WalkBuilder;
 use memmap2::Mmap;
 use stringzilla::sz;
-use stringzilla::sz::{StringZillableBinary, StringZillableUnary};
+use stringzilla::sz::StringZillableUnary;
 
 mod shared;
 
@@ -103,10 +103,12 @@ fn count_data(data: &[u8], utf8_mode: bool) -> io::Result<Counts> {
     let mut chars = 0;
 
     if utf8_mode {
-        // UTF-8 mode: nested iteration through lines -> words -> chars
-        for line in data.sz_utf8_newline_splits() {
+        // UTF-8 mode: nested iteration through lines -> words -> chars.
+        // `LineIter` gives line-terminator semantics (a trailing newline is not a
+        // final empty line); `.skip_empty()` yields whitespace-separated tokens.
+        for line in shared::LineIter::new(data, true) {
             lines += 1;
-            for word in line.sz_utf8_whitespace_splits() {
+            for word in line.sz_utf8_split_whitespaces().skip_empty() {
                 words += 1;
                 // Count UTF-8 characters in this word
                 chars += sz::count_utf8(word);
@@ -121,7 +123,7 @@ fn count_data(data: &[u8], utf8_mode: bool) -> io::Result<Counts> {
         })
     } else {
         // ASCII mode: nested iteration through lines -> words
-        for line in data.sz_splits(b"\n") {
+        for line in shared::LineIter::new(data, false) {
             lines += 1;
             // Split line by ASCII whitespace
             let mut in_word = false;
