@@ -159,7 +159,7 @@ fn extract_rows_by_selector(
     match selector {
         RowSelector::Indices(indices) => {
             let max_index = *indices.iter().max().unwrap_or(&0);
-            for (i, line) in LineIter::new(data, false).enumerate() {
+            for (i, line) in LineIter::new(data, Newlines::Lf).enumerate() {
                 if i > max_index {
                     break; // No need to continue past the last requested index
                 }
@@ -174,7 +174,7 @@ fn extract_rows_by_selector(
             }
         }
         RowSelector::Range(start, end) => {
-            for (i, line) in LineIter::new(data, false).enumerate() {
+            for (i, line) in LineIter::new(data, Newlines::Lf).enumerate() {
                 if i > *end {
                     break;
                 }
@@ -192,7 +192,7 @@ fn extract_rows_by_selector(
             // Keep only the last N lines in a ring buffer — O(n) memory, not O(file).
             let n = *n;
             let mut ring: VecDeque<(usize, &[u8])> = VecDeque::with_capacity(n);
-            for (i, line) in LineIter::new(data, false).enumerate() {
+            for (i, line) in LineIter::new(data, Newlines::Lf).enumerate() {
                 if n > 0 {
                     if ring.len() == n {
                         ring.pop_front();
@@ -210,7 +210,7 @@ fn extract_rows_by_selector(
             }
         }
         RowSelector::Every(n) => {
-            for (i, line) in LineIter::new(data, false).enumerate() {
+            for (i, line) in LineIter::new(data, Newlines::Lf).enumerate() {
                 if (i + 1) % n == 0 {
                     if show_line_numbers {
                         write!(output, "{}:", i + 1)?;
@@ -282,7 +282,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_rows_single() {
+    fn parses_single_row_index() {
         match parse_rows("5").unwrap() {
             RowSelector::Indices(indices) => {
                 assert!(indices.contains(&4)); // 0-based
@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rows_list() {
+    fn parses_comma_separated_row_list() {
         match parse_rows("1,5,10").unwrap() {
             RowSelector::Indices(indices) => {
                 assert!(indices.contains(&0));
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rows_range() {
+    fn parses_row_range() {
         match parse_rows("5-10").unwrap() {
             RowSelector::Range(start, end) => {
                 assert_eq!(start, 4); // 0-based
@@ -317,14 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_rows_errors() {
+    fn rejects_invalid_row_specs() {
         assert!(parse_rows("0").is_err()); // 0 not allowed
         assert!(parse_rows("10-5").is_err()); // invalid range
         assert!(parse_rows("abc").is_err()); // not a number
     }
 
     #[test]
-    fn extract_single_row() {
+    fn extracts_single_row_by_index() {
         let data = b"line1\nline2\nline3\nline4\n";
         let mut output = Vec::new();
 
@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_range() {
+    fn extracts_row_range() {
         let data = b"line1\nline2\nline3\nline4\nline5\n";
         let mut output = Vec::new();
 
@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_tail() {
+    fn extracts_last_n_rows() {
         let data = b"line1\nline2\nline3\nline4\nline5\n";
         let mut output = Vec::new();
 
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_every() {
+    fn extracts_every_nth_row() {
         let data = b"line1\nline2\nline3\nline4\nline5\nline6\n";
         let mut output = Vec::new();
 
@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_with_line_numbers() {
+    fn prefixes_rows_with_line_numbers() {
         let data = b"line1\nline2\nline3\n";
         let mut output = Vec::new();
 
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_multiple_indices() {
+    fn extracts_multiple_indexed_rows() {
         let data = b"a\nb\nc\nd\ne\n";
         let mut output = Vec::new();
 
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_beyond_file() {
+    fn clamps_range_to_available_rows() {
         let data = b"line1\nline2\n";
         let mut output = Vec::new();
 
@@ -419,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn tail_larger_than_file() {
+    fn returns_all_rows_when_tail_exceeds_length() {
         let data = b"line1\nline2\n";
         let mut output = Vec::new();
 

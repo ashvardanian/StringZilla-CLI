@@ -94,13 +94,41 @@ pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
     }
 }
 
+/// Which newline set [`LineIter`] splits on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Newlines {
+    /// Byte-level: only LF (`\n`).
+    Lf,
+    /// All seven Unicode newline characters (LF, VT, FF, CR, NEL, LS, PS),
+    /// with CRLF collapsed into a single break.
+    Unicode,
+}
+
+#[allow(dead_code)]
+impl Newlines {
+    /// Map a `--utf8` flag to the newline set (LF-only when `false`).
+    #[inline]
+    pub fn from_utf8(utf8: bool) -> Self {
+        if utf8 {
+            Newlines::Unicode
+        } else {
+            Newlines::Lf
+        }
+    }
+}
+
 /// Iterator over lines with terminator semantics — a trailing newline does not
 /// yield a final empty line (matching `str::lines`). Newline detection is delegated
-/// to StringZilla's native split kernels: byte-level LF (`sz_splits(b"\n")`) or all
-/// eight Unicode newlines incl. CRLF (`sz_utf8_split_newlines`), selected by `utf8`.
+/// to StringZilla's native split kernels: byte-level LF (`sz_splits(b"\n")`) or the
+/// seven Unicode newline characters plus CRLF-as-one (`sz_utf8_split_newlines`).
 /// Those kernels split on *separators* (a trailing delimiter emits a final empty
 /// segment), so we drop that single trailing empty to recover terminator semantics.
-#[allow(dead_code)]
+//
+// Boxing the larger variant would add heap indirection on every `next()`; the
+// iterator is built once per file (not per line), so the size gap is a one-time
+// stack cost, not a hot-path allocation.
+#[allow(dead_code, clippy::large_enum_variant)]
 pub enum LineIter<'a> {
     Byte(std::iter::Peekable<FindSplits<'a>>),
     Utf8(std::iter::Peekable<Utf8SplitNewlines<'a>>),
@@ -108,12 +136,11 @@ pub enum LineIter<'a> {
 
 #[allow(dead_code)]
 impl<'a> LineIter<'a> {
-    /// Create a line iterator; `utf8` selects all-Unicode-newlines vs LF-only.
-    pub fn new(data: &'a [u8], utf8: bool) -> Self {
-        if utf8 {
-            LineIter::Utf8(data.sz_utf8_split_newlines().peekable())
-        } else {
-            LineIter::Byte(data.sz_splits(b"\n").peekable())
+    /// Create a line iterator over the chosen [`Newlines`] set.
+    pub fn new(data: &'a [u8], newlines: Newlines) -> Self {
+        match newlines {
+            Newlines::Unicode => LineIter::Utf8(data.sz_utf8_split_newlines().peekable()),
+            Newlines::Lf => LineIter::Byte(data.sz_splits(b"\n").peekable()),
         }
     }
 }
@@ -144,39 +171,38 @@ fn drop_trailing_empty<'a, I: Iterator<Item = &'a [u8]>>(
     Some(line)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn lines(data: &[u8], utf8: bool) -> Vec<&[u8]> {
-        LineIter::new(data, utf8).collect()
+        LineIter::new(data, Newlines::from_utf8(utf8)).collect()
     }
 
     #[test]
-    fn lines_lf() {
+    fn splits_lines_on_lf() {
         assert_eq!(lines(b"a\nb\nc\n", false), vec![&b"a"[..], b"b", b"c"]);
     }
 
     #[test]
-    fn lines_lf_no_trailing_newline() {
+    fn splits_lf_lines_without_trailing_newline() {
         assert_eq!(lines(b"a\nb\nc", false), vec![&b"a"[..], b"b", b"c"]);
     }
 
     #[test]
-    fn lines_utf8_all_newlines() {
+    fn splits_lines_on_all_unicode_newlines() {
         // LF, CR, CRLF, NEL, LINE/PARAGRAPH SEPARATOR — CRLF counts as one break.
         let data = "a\nb\r\nc\u{0085}d\u{2028}e\u{2029}".as_bytes();
         assert_eq!(lines(data, true), vec![&b"a"[..], b"b", b"c", b"d", b"e"]);
     }
 
     #[test]
-    fn lines_utf8_no_trailing_newline() {
+    fn splits_unicode_lines_without_trailing_newline() {
         assert_eq!(lines(b"a\r\nb\r\nc", true), vec![&b"a"[..], b"b", b"c"]);
     }
 
     #[test]
-    fn lines_preserve_interior_blanks() {
+    fn preserves_interior_blank_lines() {
         // Terminator semantics: a trailing newline drops only the *final* empty line;
         // interior blank lines are kept (unlike `.skip_empty()`).
         assert_eq!(lines(b"a\n\nb\n", false), vec![&b"a"[..], b"", b"b"]);
@@ -184,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn lines_empty_input() {
+    fn yields_no_lines_on_empty_input() {
         assert!(lines(b"", false).is_empty());
         assert!(lines(b"", true).is_empty());
     }

@@ -53,13 +53,13 @@ enum FileType {
 
 /// Types of outline elements
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ElementKind {
+enum ElementKind<'a> {
     // Markdown elements
     Heading { level: u8 },
-    CodeBlock { language: Option<String> },
+    CodeBlock { language: Option<Cow<'a, [u8]>> },
     Blockquote,
     Table,
-    Image { alt: String },
+    Image { alt: Cow<'a, [u8]> },
     Paragraph,
 
     // C elements
@@ -70,18 +70,23 @@ enum ElementKind {
 
 /// Represents an outline element with position info
 #[derive(Debug, Clone)]
-struct OutlineElement {
-    kind: ElementKind,
-    name: String,
+struct OutlineElement<'a> {
+    kind: ElementKind<'a>,
+    name: Cow<'a, [u8]>,
     line_number: usize,
     byte_offset: usize,
     byte_length: usize,
     line_count: usize,
-    children: Vec<OutlineElement>,
+    children: Vec<OutlineElement<'a>>,
 }
 
-impl OutlineElement {
-    fn new(kind: ElementKind, name: String, line_number: usize, byte_offset: usize) -> Self {
+impl<'a> OutlineElement<'a> {
+    fn new(
+        kind: ElementKind<'a>,
+        name: Cow<'a, [u8]>,
+        line_number: usize,
+        byte_offset: usize,
+    ) -> Self {
         Self {
             kind,
             name,
@@ -99,6 +104,9 @@ impl OutlineElement {
         self
     }
 }
+
+/// Pending code-block start while scanning: (start line, start byte offset, fence language).
+type CodeBlockStart<'a> = (usize, usize, Option<Cow<'a, [u8]>>);
 
 // endregion: Data Structures
 
@@ -154,15 +162,15 @@ fn parse_file_type(type_str: &str) -> FileType {
 // region: Markdown Parser
 
 /// Parse Markdown file and extract outline elements
-fn parse_markdown(data: &[u8], verbosity: Verbosity) -> Vec<OutlineElement> {
-    let mut elements: Vec<OutlineElement> = Vec::new();
+fn parse_markdown<'a>(data: &'a [u8], verbosity: Verbosity) -> Vec<OutlineElement<'a>> {
+    let mut elements: Vec<OutlineElement<'a>> = Vec::new();
     let mut line_number = 0usize;
     let mut byte_offset = 0usize;
 
     // State for code blocks
     let mut in_code_block = false;
     let mut code_fence_char: u8 = 0;
-    let mut code_block_start: Option<(usize, usize, Option<String>)> = None;
+    let mut code_block_start: Option<CodeBlockStart<'a>> = None;
 
     // State for v2 block tracking
     let mut current_section_idx: Option<usize> = None;
@@ -172,7 +180,7 @@ fn parse_markdown(data: &[u8], verbosity: Verbosity) -> Vec<OutlineElement> {
     let mut table_start: Option<(usize, usize)> = None;
     let mut paragraph_start: Option<(usize, usize)> = None;
 
-    for line in shared::LineIter::new(data, false) {
+    for line in shared::LineIter::new(data, shared::Newlines::Lf) {
         line_number += 1;
         let line_start = byte_offset;
         let line_len = line.len();
@@ -184,7 +192,7 @@ fn parse_markdown(data: &[u8], verbosity: Verbosity) -> Vec<OutlineElement> {
                 if let Some((start_line, start_offset, lang)) = code_block_start.take() {
                     let elem = OutlineElement::new(
                         ElementKind::CodeBlock { language: lang },
-                        "code".to_string(),
+                        Cow::Borrowed(b"code"),
                         start_line,
                         start_offset,
                     )
@@ -260,7 +268,7 @@ fn parse_markdown(data: &[u8], verbosity: Verbosity) -> Vec<OutlineElement> {
 
             let elem = OutlineElement::new(
                 ElementKind::Heading { level },
-                text,
+                Cow::Borrowed(text),
                 line_number,
                 line_start,
             )
@@ -282,8 +290,10 @@ fn parse_markdown(data: &[u8], verbosity: Verbosity) -> Vec<OutlineElement> {
                     verbosity,
                 );
                 let elem = OutlineElement::new(
-                    ElementKind::Image { alt: alt.clone() },
-                    alt,
+                    ElementKind::Image {
+                        alt: Cow::Borrowed(alt),
+                    },
+                    Cow::Borrowed(alt),
                     line_number,
                     line_start,
                 )
@@ -425,7 +435,7 @@ fn parse_markdown(data: &[u8], verbosity: Verbosity) -> Vec<OutlineElement> {
 }
 
 /// Check if line is a code fence, returns (fence_char, language)
-fn is_code_fence(line: &[u8]) -> Option<(u8, Option<String>)> {
+fn is_code_fence<'a>(line: &'a [u8]) -> Option<(u8, Option<Cow<'a, [u8]>>)> {
     let trimmed = trim_start(line, 3);
     if trimmed.len() < 3 {
         return None;
@@ -451,7 +461,7 @@ fn is_code_fence(line: &[u8]) -> Option<(u8, Option<String>)> {
         if lang_bytes.is_empty() {
             None
         } else {
-            Some(String::from_utf8_lossy(lang_bytes).into_owned())
+            Some(Cow::Borrowed(lang_bytes))
         }
     };
 
@@ -459,7 +469,7 @@ fn is_code_fence(line: &[u8]) -> Option<(u8, Option<String>)> {
 }
 
 /// Parse heading from line (ATX style)
-fn parse_heading(line: &[u8]) -> Option<(u8, String)> {
+fn parse_heading(line: &[u8]) -> Option<(u8, &[u8])> {
     if line.is_empty() || line[0] != b'#' {
         return None;
     }
@@ -471,11 +481,10 @@ fn parse_heading(line: &[u8]) -> Option<(u8, String)> {
     }
 
     // Must be followed by space or end of line
-    if line.len() > level {
-        if line[level] != b' ' && line[level] != b'\t' {
+    if line.len() > level
+        && line[level] != b' ' && line[level] != b'\t' {
             return None;
         }
-    }
 
     // Extract text
     let text_start = (level + 1).min(line.len());
@@ -484,20 +493,20 @@ fn parse_heading(line: &[u8]) -> Option<(u8, String)> {
     // Remove trailing # characters (optional closing)
     let text = trim_trailing_hashes(text);
 
-    Some((level as u8, String::from_utf8_lossy(text).into_owned()))
+    Some((level as u8, text))
 }
 
 /// Parse image from line: ![alt](url)
-fn parse_image(line: &[u8]) -> Option<String> {
+fn parse_image(line: &[u8]) -> Option<&[u8]> {
     let pos = find(line, b"![")?;
     let after_bang = &line[pos + 2..];
     let close_bracket = find(after_bang, b"]")?;
     let alt = &after_bang[..close_bracket];
-    Some(String::from_utf8_lossy(alt).into_owned())
+    Some(alt)
 }
 
-fn finalize_paragraph(
-    elements: &mut Vec<OutlineElement>,
+fn finalize_paragraph<'a>(
+    elements: &mut Vec<OutlineElement<'a>>,
     paragraph_start: &mut Option<(usize, usize)>,
     section_idx: Option<usize>,
     end_line: usize,
@@ -511,7 +520,7 @@ fn finalize_paragraph(
         if end_line >= start_line {
             let elem = OutlineElement::new(
                 ElementKind::Paragraph,
-                "paragraph".to_string(),
+                Cow::Borrowed(b"paragraph"),
                 start_line,
                 start_offset,
             )
@@ -529,8 +538,8 @@ fn finalize_paragraph(
     }
 }
 
-fn finalize_blockquote(
-    elements: &mut Vec<OutlineElement>,
+fn finalize_blockquote<'a>(
+    elements: &mut Vec<OutlineElement<'a>>,
     in_blockquote: &mut bool,
     blockquote_start: &mut Option<(usize, usize)>,
     section_idx: Option<usize>,
@@ -544,7 +553,7 @@ fn finalize_blockquote(
     if let Some((start_line, start_offset)) = blockquote_start.take() {
         let elem = OutlineElement::new(
             ElementKind::Blockquote,
-            "blockquote".to_string(),
+            Cow::Borrowed(b"blockquote"),
             start_line,
             start_offset,
         )
@@ -562,8 +571,8 @@ fn finalize_blockquote(
     *in_blockquote = false;
 }
 
-fn finalize_table(
-    elements: &mut Vec<OutlineElement>,
+fn finalize_table<'a>(
+    elements: &mut Vec<OutlineElement<'a>>,
     in_table: &mut bool,
     table_start: &mut Option<(usize, usize)>,
     section_idx: Option<usize>,
@@ -577,7 +586,7 @@ fn finalize_table(
     if let Some((start_line, start_offset)) = table_start.take() {
         let elem = OutlineElement::new(
             ElementKind::Table,
-            "table".to_string(),
+            Cow::Borrowed(b"table"),
             start_line,
             start_offset,
         )
@@ -600,21 +609,21 @@ fn finalize_table(
 // region: C Parser
 
 /// Parse C/C++ source file and extract outline elements
-fn parse_c(data: &[u8], _verbosity: Verbosity) -> Vec<OutlineElement> {
-    let mut elements = Vec::new();
+fn parse_c<'a>(data: &'a [u8], _verbosity: Verbosity) -> Vec<OutlineElement<'a>> {
+    let mut elements: Vec<OutlineElement<'a>> = Vec::new();
     let mut line_number = 0usize;
     let mut byte_offset = 0usize;
 
     // State for function body tracking
     let mut brace_depth = 0i32;
     let mut in_function_body = false;
-    let mut function_start: Option<(usize, usize, String)> = None;
+    let mut function_start: Option<(usize, usize, Cow<'a, [u8]>)> = None;
 
     // State for multi-line constructs
     let mut in_multiline_comment = false;
     let mut pending_signature: Option<(usize, usize, Vec<u8>)> = None;
 
-    for line in shared::LineIter::new(data, false) {
+    for line in shared::LineIter::new(data, shared::Newlines::Lf) {
         line_number += 1;
         let line_start = byte_offset;
         let line_len = line.len();
@@ -654,12 +663,13 @@ fn parse_c(data: &[u8], _verbosity: Verbosity) -> Vec<OutlineElement> {
             let has_open_brace = find(&sig_bytes, b"{").is_some();
 
             if has_semicolon {
-                // Declaration
-                if let Some(sig) = extract_function_signature(&sig_bytes) {
+                // Declaration — the signature was accumulated across lines into a
+                // fresh buffer, so it cannot borrow from `data`; keep it owned.
+                if let Some(sig) = extract_function_signature(sig_bytes) {
                     elements.push(
                         OutlineElement::new(
                             ElementKind::FunctionDeclaration,
-                            sig,
+                            Cow::Owned(sig.into_owned()),
                             start_line,
                             start_offset,
                         )
@@ -672,10 +682,10 @@ fn parse_c(data: &[u8], _verbosity: Verbosity) -> Vec<OutlineElement> {
                 pending_signature = None;
             } else if has_open_brace {
                 // Definition - start tracking body
-                if let Some(sig) = extract_function_signature(&sig_bytes) {
+                if let Some(sig) = extract_function_signature(sig_bytes) {
                     in_function_body = true;
-                    brace_depth = count_braces(&sig_bytes);
-                    function_start = Some((start_line, start_offset, sig));
+                    brace_depth = count_braces(sig_bytes);
+                    function_start = Some((start_line, start_offset, Cow::Owned(sig.into_owned())));
                 }
                 pending_signature = None;
             }
@@ -691,7 +701,7 @@ fn parse_c(data: &[u8], _verbosity: Verbosity) -> Vec<OutlineElement> {
                     elements.push(
                         OutlineElement::new(
                             ElementKind::Include { is_system },
-                            path,
+                            Cow::Borrowed(path),
                             line_number,
                             line_start,
                         )
@@ -759,14 +769,14 @@ fn parse_c(data: &[u8], _verbosity: Verbosity) -> Vec<OutlineElement> {
 }
 
 /// Result of attempting to parse a function line
-enum FunctionParseResult {
-    Declaration(String),
-    DefinitionStart(String),
+enum FunctionParseResult<'a> {
+    Declaration(Cow<'a, [u8]>),
+    DefinitionStart(Cow<'a, [u8]>),
     Incomplete(Vec<u8>),
 }
 
 /// Try to parse a line as a function signature
-fn try_parse_function_line(line: &[u8]) -> Option<FunctionParseResult> {
+fn try_parse_function_line<'a>(line: &'a [u8]) -> Option<FunctionParseResult<'a>> {
     // Must contain '(' for function
     let paren_pos = find(line, b"(")?;
 
@@ -797,8 +807,8 @@ fn try_parse_function_line(line: &[u8]) -> Option<FunctionParseResult> {
 
     // Skip macro-like names (all caps)
     if last_ident
-        .bytes()
-        .all(|b| b.is_ascii_uppercase() || b == b'_')
+        .iter()
+        .all(|&b| b.is_ascii_uppercase() || b == b'_')
         && last_ident.len() > 1
     {
         return None;
@@ -829,14 +839,14 @@ fn try_parse_function_line(line: &[u8]) -> Option<FunctionParseResult> {
 }
 
 /// Extract function signature from accumulated bytes
-fn extract_function_signature(data: &[u8]) -> Option<String> {
+fn extract_function_signature<'a>(data: &'a [u8]) -> Option<Cow<'a, [u8]>> {
     let paren_pos = find(data, b"(")?;
     let close_pos = paren_pos + find(&data[paren_pos..], b")")?;
     Some(normalize_signature(&data[..close_pos + 1]))
 }
 
 /// Parse #include directive
-fn parse_include(line: &[u8]) -> Option<(String, bool)> {
+fn parse_include(line: &[u8]) -> Option<(&[u8], bool)> {
     // Skip "#include"
     let after = &line[8..];
     let trimmed = trim_start(after, usize::MAX);
@@ -845,13 +855,13 @@ fn parse_include(line: &[u8]) -> Option<(String, bool)> {
         // System include
         if let Some(end) = find(trimmed, b">") {
             let path = &trimmed[1..end];
-            return Some((String::from_utf8_lossy(path).into_owned(), true));
+            return Some((path, true));
         }
     } else if trimmed.starts_with(b"\"") {
         // Local include
         if let Some(end) = find(&trimmed[1..], b"\"") {
             let path = &trimmed[1..end + 1];
-            return Some((String::from_utf8_lossy(path).into_owned(), false));
+            return Some((path, false));
         }
     }
 
@@ -908,7 +918,7 @@ fn ends_with_identifier(data: &[u8], ident: &[u8]) -> bool {
 }
 
 /// Extract last identifier from data
-fn extract_last_identifier(data: &[u8]) -> Option<String> {
+fn extract_last_identifier(data: &[u8]) -> Option<&[u8]> {
     let trimmed = trim_both(data);
 
     // Find end of identifier (work backwards)
@@ -936,21 +946,26 @@ fn extract_last_identifier(data: &[u8]) -> Option<String> {
         return None;
     }
 
-    Some(String::from_utf8_lossy(&trimmed[start..end]).into_owned())
+    Some(&trimmed[start..end])
 }
 
 /// Normalize a function signature: collapse whitespace runs to single spaces,
 /// via StringZilla's SIMD whitespace splitter. Builds one output string (the old
 /// char-loop allocated twice: the buffer plus a trimmed copy).
-fn normalize_signature(data: &[u8]) -> String {
-    let mut result = String::new();
+fn normalize_signature<'a>(data: &'a [u8]) -> Cow<'a, [u8]> {
+    let mut result: Vec<u8> = Vec::new();
     for token in data.sz_utf8_split_whitespaces().skip_empty() {
         if !result.is_empty() {
-            result.push(' ');
+            result.push(b' ');
         }
-        result.push_str(&String::from_utf8_lossy(token));
+        result.extend_from_slice(token);
     }
-    result
+    // Borrow the original bytes when collapsing was a no-op (already normalized).
+    if result == data {
+        Cow::Borrowed(data)
+    } else {
+        Cow::Owned(result)
+    }
 }
 
 // endregion: C Parser
@@ -1015,7 +1030,7 @@ fn trim_trailing_hashes(data: &[u8]) -> &[u8] {
 
 fn write_element(
     out: &mut dyn Write,
-    elem: &OutlineElement,
+    elem: &OutlineElement<'_>,
     verbosity: Verbosity,
     file_type: FileType,
 ) -> io::Result<()> {
@@ -1028,19 +1043,21 @@ fn write_element(
 
 fn write_markdown_element(
     out: &mut dyn Write,
-    elem: &OutlineElement,
+    elem: &OutlineElement<'_>,
     verbosity: Verbosity,
 ) -> io::Result<()> {
+    // `Cow<[u8]>` is not `Display`; `from_utf8_lossy` borrows for valid UTF-8.
+    let name = String::from_utf8_lossy(&elem.name);
     match &elem.kind {
         ElementKind::Heading { level } => {
             // Headings are levels 1..=6 — slice a static run, no allocation.
             let prefix = &"######"[..(*level as usize).min(6)];
             match verbosity {
-                Verbosity::Names => writeln!(out, "{} {}", prefix, elem.name)?,
+                Verbosity::Names => writeln!(out, "{} {}", prefix, name)?,
                 Verbosity::LineNumbers => writeln!(
                     out,
                     "{} {:40} [L{}, @{}]",
-                    prefix, elem.name, elem.line_number, elem.byte_offset
+                    prefix, name, elem.line_number, elem.byte_offset
                 )?,
                 Verbosity::Detailed => {
                     let end_line = elem.line_number + elem.line_count - 1;
@@ -1049,7 +1066,7 @@ fn write_markdown_element(
                             out,
                             "{} {:40} [L{}-{}, @{}, {}B]",
                             prefix,
-                            elem.name,
+                            name,
                             elem.line_number,
                             end_line,
                             elem.byte_offset,
@@ -1059,7 +1076,7 @@ fn write_markdown_element(
                         writeln!(
                             out,
                             "{} {:40} [L{}, @{}, {}B]",
-                            prefix, elem.name, elem.line_number, elem.byte_offset, elem.byte_length
+                            prefix, name, elem.line_number, elem.byte_offset, elem.byte_length
                         )?;
                     }
                     for child in &elem.children {
@@ -1070,7 +1087,8 @@ fn write_markdown_element(
         }
         ElementKind::CodeBlock { language } => {
             if verbosity >= Verbosity::Detailed {
-                let lang_str = language.as_deref().unwrap_or("code");
+                let lang_cow = language.as_ref().map(|l| String::from_utf8_lossy(l));
+                let lang_str = lang_cow.as_deref().unwrap_or("code");
                 writeln!(
                     out,
                     "  - {} [L{}-{}, {}B]",
@@ -1086,16 +1104,18 @@ fn write_markdown_element(
     Ok(())
 }
 
-fn write_child_block(out: &mut dyn Write, elem: &OutlineElement) -> io::Result<()> {
+fn write_child_block(out: &mut dyn Write, elem: &OutlineElement<'_>) -> io::Result<()> {
     // Constant labels borrow; only code(lang)/image build a small owned label for the {:36} pad.
     let kind_str: Cow<str> = match &elem.kind {
         ElementKind::CodeBlock { language } => match language {
-            Some(l) => Cow::Owned(format!("code ({})", l)),
+            Some(l) => Cow::Owned(format!("code ({})", String::from_utf8_lossy(l))),
             None => Cow::Borrowed("code"),
         },
         ElementKind::Blockquote => Cow::Borrowed("blockquote"),
         ElementKind::Table => Cow::Borrowed("table"),
-        ElementKind::Image { alt } => Cow::Owned(format!("image: {}", alt)),
+        ElementKind::Image { alt } => {
+            Cow::Owned(format!("image: {}", String::from_utf8_lossy(alt)))
+        }
         ElementKind::Paragraph => Cow::Borrowed("paragraph"),
         _ => Cow::Borrowed("block"),
     };
@@ -1120,19 +1140,21 @@ fn write_child_block(out: &mut dyn Write, elem: &OutlineElement) -> io::Result<(
 
 fn write_c_element(
     out: &mut dyn Write,
-    elem: &OutlineElement,
+    elem: &OutlineElement<'_>,
     verbosity: Verbosity,
 ) -> io::Result<()> {
+    // `Cow<[u8]>` is not `Display`; `from_utf8_lossy` borrows for valid UTF-8.
+    let name = String::from_utf8_lossy(&elem.name);
     match &elem.kind {
         ElementKind::Include { is_system } => {
             let (open, close) = if *is_system { ("<", ">") } else { ("\"", "\"") };
             match verbosity {
                 Verbosity::Names => {
-                    writeln!(out, "#include {}{}{}", open, elem.name, close)?;
+                    writeln!(out, "#include {}{}{}", open, name, close)?;
                 }
                 Verbosity::LineNumbers | Verbosity::Detailed => {
                     // Build the padded `<path>` field (small, per include) for {:36}.
-                    let path = format!("{}{}{}", open, elem.name, close);
+                    let path = format!("{}{}{}", open, name, close);
                     writeln!(
                         out,
                         "#include {:36} [L{}, @{}]",
@@ -1142,26 +1164,26 @@ fn write_c_element(
             }
         }
         ElementKind::FunctionDeclaration => match verbosity {
-            Verbosity::Names => writeln!(out, "{:44} [declaration]", elem.name)?,
+            Verbosity::Names => writeln!(out, "{:44} [declaration]", name)?,
             Verbosity::LineNumbers => writeln!(
                 out,
                 "{:44} [L{}, @{}, declaration]",
-                elem.name, elem.line_number, elem.byte_offset
+                name, elem.line_number, elem.byte_offset
             )?,
             Verbosity::Detailed => writeln!(
                 out,
                 "{:44} [L{}, @{}, {}B, declaration]",
-                elem.name, elem.line_number, elem.byte_offset, elem.byte_length
+                name, elem.line_number, elem.byte_offset, elem.byte_length
             )?,
         },
         ElementKind::FunctionDefinition => match verbosity {
-            Verbosity::Names => writeln!(out, "{:44} [definition]", elem.name)?,
+            Verbosity::Names => writeln!(out, "{:44} [definition]", name)?,
             Verbosity::LineNumbers => {
                 let end_line = elem.line_number + elem.line_count - 1;
                 writeln!(
                     out,
                     "{:44} [L{}-{}, @{}, definition]",
-                    elem.name, elem.line_number, end_line, elem.byte_offset
+                    name, elem.line_number, end_line, elem.byte_offset
                 )?;
             }
             Verbosity::Detailed => {
@@ -1169,7 +1191,7 @@ fn write_c_element(
                 writeln!(
                     out,
                     "{:44} [L{}-{}, @{}, {}B, {} lines, definition]",
-                    elem.name,
+                    name,
                     elem.line_number,
                     end_line,
                     elem.byte_offset,
@@ -1252,17 +1274,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn heading_detection() {
-        assert_eq!(parse_heading(b"# Title"), Some((1, "Title".to_string())));
+    fn parses_markdown_heading_levels() {
+        assert_eq!(parse_heading(b"# Title"), Some((1, b"Title".as_slice())));
         assert_eq!(
             parse_heading(b"## Level 2"),
-            Some((2, "Level 2".to_string()))
+            Some((2, b"Level 2".as_slice()))
         );
         assert_eq!(
             parse_heading(b"###### Level 6"),
-            Some((6, "Level 6".to_string()))
+            Some((6, b"Level 6".as_slice()))
         );
-        assert_eq!(parse_heading(b"# Title ##"), Some((1, "Title".to_string())));
+        assert_eq!(parse_heading(b"# Title ##"), Some((1, b"Title".as_slice())));
 
         // Invalid
         assert_eq!(parse_heading(b"####### Too many"), None);
@@ -1271,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn code_fence_detection() {
+    fn detects_code_fences_and_language() {
         assert!(is_code_fence(b"```").is_some());
         assert!(is_code_fence(b"```rust").is_some());
         assert!(is_code_fence(b"~~~").is_some());
@@ -1282,23 +1304,23 @@ mod tests {
 
         // Check language extraction
         let (_, lang) = is_code_fence(b"```rust").unwrap();
-        assert_eq!(lang, Some("rust".to_string()));
+        assert_eq!(lang, Some(Cow::Borrowed(b"rust".as_slice())));
     }
 
     #[test]
-    fn include_parsing() {
+    fn parses_c_include_directives() {
         assert_eq!(
             parse_include(b"#include <stdio.h>"),
-            Some(("stdio.h".to_string(), true))
+            Some((b"stdio.h".as_slice(), true))
         );
         assert_eq!(
             parse_include(b"#include \"myheader.h\""),
-            Some(("myheader.h".to_string(), false))
+            Some((b"myheader.h".as_slice(), false))
         );
     }
 
     #[test]
-    fn brace_counting() {
+    fn counts_braces_ignoring_strings_and_chars() {
         assert_eq!(count_braces(b"{"), 1);
         assert_eq!(count_braces(b"}"), -1);
         assert_eq!(count_braces(b"{}"), 0);
@@ -1308,30 +1330,30 @@ mod tests {
     }
 
     #[test]
-    fn extract_last_identifier_works() {
+    fn extracts_last_identifier_from_signature() {
         assert_eq!(
             extract_last_identifier(b"int main"),
-            Some("main".to_string())
+            Some(b"main".as_slice())
         );
         assert_eq!(
             extract_last_identifier(b"void *foo"),
-            Some("foo".to_string())
+            Some(b"foo".as_slice())
         );
         assert_eq!(
             extract_last_identifier(b"static int bar"),
-            Some("bar".to_string())
+            Some(b"bar".as_slice())
         );
     }
 
     #[test]
-    fn ends_with_identifier_works() {
+    fn detects_trailing_identifier() {
         assert!(ends_with_identifier(b"if", b"if"));
         assert!(ends_with_identifier(b"   if", b"if"));
         assert!(!ends_with_identifier(b"elif", b"if"));
     }
 
     #[test]
-    fn markdown_parsing() {
+    fn parses_markdown_headings_into_elements() {
         let md = b"# Title\n\nSome text.\n\n## Section\n\n```rust\ncode\n```\n";
         let elements = parse_markdown(md, Verbosity::Names);
 
@@ -1347,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn c_parsing() {
+    fn parses_c_includes_and_functions() {
         let c = b"#include <stdio.h>\n\nint main(void) {\n    return 0;\n}\n";
         let elements = parse_c(c, Verbosity::Names);
 

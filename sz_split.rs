@@ -82,7 +82,7 @@ fn split_by_lines(
     let mut current_lines = 0;
     let mut current_file: Option<BufWriter<File>> = None;
 
-    for line in LineIter::new(data, false) {
+    for line in LineIter::new(data, Newlines::Lf) {
         // Create new file if needed
         if current_lines == 0 {
             let suffix = generate_suffix(file_index, suffix_length);
@@ -156,7 +156,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn generate_suffix_works() {
+    fn generates_aa_ab_suffix_sequence() {
         assert_eq!(generate_suffix(0, 2), "aa");
         assert_eq!(generate_suffix(1, 2), "ab");
         assert_eq!(generate_suffix(25, 2), "az");
@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn split_by_lines_works() {
+    fn splits_input_into_line_chunk_files() {
         let temp_dir = TempDir::new().unwrap();
         let prefix = temp_dir.path().join("test_").to_str().unwrap().to_string();
 
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn split_single_line_per_file() {
+    fn writes_one_line_per_file() {
         let temp_dir = TempDir::new().unwrap();
         let prefix = temp_dir
             .path()
@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn split_no_trailing_newline() {
+    fn appends_newline_to_last_split_chunk() {
         let temp_dir = TempDir::new().unwrap();
         let prefix = temp_dir
             .path()

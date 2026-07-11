@@ -130,7 +130,7 @@ fn extract_cols(
     let mut line_count = 0;
     let mut fields: Vec<&[u8]> = Vec::new(); // reused across lines
 
-    for line in LineIter::new(data, false) {
+    for line in LineIter::new(data, Newlines::Lf) {
         split_fields(line, delimiter, &mut fields);
 
         // Skip lines with too few fields if min_fields is set
@@ -212,30 +212,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_fields_single() {
+    fn parses_single_field_index() {
         assert_eq!(parse_fields("2").unwrap(), vec![1]); // 0-based
         assert_eq!(parse_fields("1").unwrap(), vec![0]);
     }
 
     #[test]
-    fn parse_fields_list() {
+    fn parses_comma_separated_field_list() {
         assert_eq!(parse_fields("1,3,5").unwrap(), vec![0, 2, 4]);
         assert_eq!(parse_fields("2, 4").unwrap(), vec![1, 3]); // with spaces
     }
 
     #[test]
-    fn parse_fields_range() {
+    fn parses_field_range() {
         assert_eq!(parse_fields("2-5").unwrap(), vec![1, 2, 3, 4]);
         assert_eq!(parse_fields("1-3").unwrap(), vec![0, 1, 2]);
     }
 
     #[test]
-    fn parse_fields_mixed() {
+    fn parses_mixed_field_list_and_range() {
         assert_eq!(parse_fields("1,3-5,7").unwrap(), vec![0, 2, 3, 4, 6]);
     }
 
     #[test]
-    fn parse_fields_errors() {
+    fn rejects_invalid_field_specs() {
         assert!(parse_fields("0").is_err()); // 0 not allowed
         assert!(parse_fields("5-2").is_err()); // invalid range
         assert!(parse_fields("abc").is_err()); // not a number
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn split_fields_tab() {
+    fn splits_fields_on_tab() {
         assert_eq!(
             fields(b"a\tb\tc", b"\t"),
             vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn split_fields_comma() {
+    fn splits_fields_on_comma() {
         assert_eq!(
             fields(b"one,two,three", b","),
             vec![b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]
@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn split_fields_multi_char_delimiter() {
+    fn splits_fields_on_multi_char_delimiter() {
         assert_eq!(
             fields(b"a::b::c", b"::"),
             vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
@@ -272,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_cols_basic() {
+    fn extracts_single_column() {
         let data = b"a\tb\tc\n1\t2\t3\n";
         let mut output = Vec::new();
 
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_cols_multiple() {
+    fn extracts_and_reorders_multiple_columns() {
         let data = b"a\tb\tc\td\n";
         let mut output = Vec::new();
 
@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_cols_missing_field() {
+    fn emits_empty_field_when_missing() {
         let data = b"a\tb\n";
         let mut output = Vec::new();
 
@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_cols_min_fields() {
+    fn skips_rows_below_min_fields() {
         let data = b"a\tb\tc\na\n1\t2\t3\n";
         let mut output = Vec::new();
 

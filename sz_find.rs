@@ -239,7 +239,6 @@ struct Colors {
     column: &'static str,
     byte_offset: &'static str,
     match_highlight: &'static str,
-    context_mark: &'static str,
     reset: &'static str,
     separator: &'static str,
 }
@@ -252,7 +251,6 @@ impl Colors {
             column: "\x1b[32m",            // Green (same as line number)
             byte_offset: "\x1b[36m",       // Cyan
             match_highlight: "\x1b[1;31m", // Bold red
-            context_mark: "\x1b[2m",       // Dim
             reset: "\x1b[0m",
             separator: "\x1b[36m", // Cyan
         }
@@ -265,7 +263,6 @@ impl Colors {
             column: "",
             byte_offset: "",
             match_highlight: "",
-            context_mark: "",
             reset: "",
             separator: "",
         }
@@ -675,7 +672,7 @@ fn search_mmap(
     } else if config.utf8 {
         search_intraline(
             data,
-            LineIter::new(data, true),
+            LineIter::new(data, Newlines::Unicode),
             filename,
             config,
             output,
@@ -684,7 +681,7 @@ fn search_mmap(
     } else {
         search_intraline(
             data,
-            LineIter::new(data, false),
+            LineIter::new(data, Newlines::Lf),
             filename,
             config,
             output,
@@ -785,21 +782,20 @@ where
             // Print separator between non-contiguous match groups
             if config.before_context > 0 || config.after_context > 0 {
                 if let Some(last) = last_printed_line {
-                    if line_num_1based > last + 1 && need_separator {
-                        if config.output_format != OutputFormat::Json {
+                    if line_num_1based > last + 1 && need_separator
+                        && config.output_format != OutputFormat::Json {
                             writeln!(
                                 output,
                                 "{}--{}",
                                 config.colors.separator, config.colors.reset
                             )?;
                         }
-                    }
                 }
             }
 
             // Print buffered context_before lines (slice from original data)
             for &(ctx_line_num, ctx_start, ctx_end) in context_before.iter() {
-                if last_printed_line.map_or(true, |lp| ctx_line_num > lp) {
+                if last_printed_line.is_none_or(|lp| ctx_line_num > lp) {
                     let ctx_line = &data[ctx_start..ctx_end];
                     print_line(
                         output,
@@ -910,8 +906,7 @@ fn search_multiline(
 
         // Find next match
         let match_result = if config.ignore_case {
-            utf8_uncased_search(&data[pos..], config.pattern)
-                .map(|(off, len)| (pos + off, len))
+            utf8_uncased_search(&data[pos..], config.pattern).map(|(off, len)| (pos + off, len))
         } else {
             find(&data[pos..], config.pattern).map(|off| (pos + off, config.pattern.len()))
         };
@@ -1447,7 +1442,7 @@ fn run_replace_mode(args: &Args, replacement: &str) {
             };
 
             // Skip directories
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
 
@@ -1651,7 +1646,7 @@ fn main() {
             };
 
             // Skip directories
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
 
@@ -1769,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn match_iter_basic() {
+    fn detects_substring_matches() {
         let line = b"hello world";
         assert!(has_match(line, b"hello", false, false));
         assert!(has_match(line, b"world", false, false));
@@ -1777,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn match_iter_case_insensitive() {
+    fn matches_ignoring_case() {
         let line = b"Hello World";
         assert!(has_match(line, b"hello", true, false));
         assert!(has_match(line, b"WORLD", true, false));
@@ -1785,7 +1780,7 @@ mod tests {
     }
 
     #[test]
-    fn match_iter_word_boundary() {
+    fn matches_only_at_word_boundaries() {
         let line = b"hello world";
         assert!(has_match(line, b"hello", false, true));
         assert!(has_match(line, b"world", false, true));
@@ -1794,14 +1789,14 @@ mod tests {
     }
 
     #[test]
-    fn match_iter_word_boundary_multiple() {
+    fn finds_standalone_word_after_partial_match() {
         // Test that word boundary check finds matches after non-boundary matches
         let line = b"fn_name fn";
         assert!(has_match(line, b"fn", false, true)); // Should find standalone "fn"
     }
 
     #[test]
-    fn line_matches_invert() {
+    fn inverts_line_match_selection() {
         let line = b"hello world";
         let mut config = make_config(b"hello");
         assert!(line_matches(line, &config));
@@ -1814,14 +1809,14 @@ mod tests {
     }
 
     #[test]
-    fn detects_binary() {
+    fn detects_binary_from_null_bytes() {
         assert!(is_binary(b"hello\0world"));
         assert!(!is_binary(b"hello world"));
         assert!(!is_binary(b"hello\nworld\n"));
     }
 
     #[test]
-    fn search_basic() {
+    fn reports_matching_line() {
         let data = b"line1\nerror here\nline3\n";
         let config = make_config(b"error");
         let max_reached = AtomicBool::new(false);
@@ -1835,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn search_with_context() {
+    fn includes_surrounding_context_lines() {
         let data = b"line1\nline2\nerror here\nline4\nline5\n";
         let mut config = make_config(b"error");
         config.before_context = 1;
@@ -1852,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn search_max_count() {
+    fn stops_after_max_count() {
         let data = b"error1\nerror2\nerror3\nerror4\n";
         let mut config = make_config(b"error");
         config.max_count = Some(2);
@@ -1866,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn highlights_line() {
+    fn wraps_matches_in_color_codes() {
         let line = b"hello world hello";
         let mut config = make_config(b"hello");
         config.colors = Colors::enabled();
@@ -1881,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn multiline_search() {
+    fn matches_across_newlines_in_multiline_mode() {
         let data = b"hello\nworld\nfoo bar\n";
         let mut config = make_config(b"hello\nworld");
         config.multiline = true;

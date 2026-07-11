@@ -162,7 +162,7 @@ fn main() {
     };
     let data = input.as_bytes();
 
-    let lines: Vec<&[u8]> = LineIter::new(data, utf8_mode).collect();
+    let lines: Vec<&[u8]> = LineIter::new(data, Newlines::from_utf8(utf8_mode)).collect();
 
     if args.check {
         match check_sorted(&lines, args.ignore_case, args.reverse) {
@@ -203,7 +203,7 @@ mod tests {
     use super::*;
 
     fn lines_of(data: &[u8]) -> Vec<&[u8]> {
-        LineIter::new(data, false).collect()
+        LineIter::new(data, Newlines::Lf).collect()
     }
 
     fn sort_to_string(data: &[u8], reverse: bool, unique: bool, ignore_case: bool) -> String {
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn basic_sort() {
+    fn sorts_lines_ascending() {
         assert_eq!(
             sort_to_string(b"banana\napple\ncherry\n", false, false, false),
             "apple\nbanana\ncherry\n"
@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_sort() {
+    fn sorts_lines_descending() {
         assert_eq!(
             sort_to_string(b"apple\nbanana\ncherry\n", true, false, false),
             "cherry\nbanana\napple\n"
@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_sort() {
+    fn sorts_and_deduplicates_lines() {
         assert_eq!(
             sort_to_string(b"b\na\nb\nc\na\n", false, true, false),
             "a\nb\nc\n"
@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn ignore_case_sort() {
+    fn sorts_lines_ignoring_case() {
         // Folding orders "Apple" < "BANANA" < "cherry"; original casing preserved.
         assert_eq!(
             sort_to_string(b"cherry\nApple\nBANANA\n", false, false, true),
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn ignore_case_unique() {
+    fn deduplicates_lines_ignoring_case() {
         assert_eq!(
             sort_to_string(b"Hello\nhello\nWORLD\nworld\n", false, true, true),
             "Hello\nWORLD\n"
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn utf8_byte_order_is_codepoint_order() {
+    fn sorts_utf8_in_codepoint_order() {
         // 'a' (U+0061) < 'á' (U+00E1) < 'é' (U+00E9) in code-point and unsigned-byte
         // order; StringZilla's `sz_order` compares bytes unsigned, matching `LC_ALL=C
         // sort` and the UTF-8 guarantee that byte order reproduces code-point order.
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn check_detects_disorder() {
+    fn reports_first_unsorted_line() {
         let sorted = lines_of(b"a\nb\nc\n");
         assert_eq!(check_sorted(&sorted, false, false), None);
 
@@ -276,13 +276,13 @@ mod tests {
     }
 
     #[test]
-    fn check_reverse() {
+    fn accepts_descending_order_in_check() {
         let desc = lines_of(b"c\nb\na\n");
         assert_eq!(check_sorted(&desc, false, true), None);
     }
 
     #[test]
-    fn ignore_case_check() {
+    fn checks_sorted_order_ignoring_case() {
         // "Apple" < "BANANA" < "cherry" under folding, regardless of input casing.
         let folded = lines_of(b"Apple\nBANANA\ncherry\n");
         assert_eq!(check_sorted(&folded, true, false), None);
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_input() {
+    fn sorts_empty_input_to_empty() {
         assert_eq!(sort_to_string(b"", false, false, false), "");
     }
 }

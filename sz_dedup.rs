@@ -277,7 +277,7 @@ fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> (usize, usi
     while line_start < data.len() {
         // Next newline in the untouched tail; the final line has none (len 0).
         let (line_end, newline_len) = if utf8 {
-            // UTF-8 aware: first of all 8 Unicode newlines, CRLF as one run.
+            // UTF-8 aware: first of the 7 Unicode newline chars, CRLF as one run.
             match sz::Utf8Newlines::new(&data[line_start..]).next() {
                 Some(run) => (run.as_ptr() as usize - base, run.len()),
                 None => (data.len(), 0),
@@ -332,7 +332,7 @@ fn dedup_to_writer(
     let mut scratch = Vec::new();
     let mut unique_count = 0;
 
-    let lines = LineIter::new(data, utf8);
+    let lines = LineIter::new(data, Newlines::from_utf8(utf8));
 
     for line in lines {
         let line_offset = line.as_ptr() as usize - data.as_ptr() as usize;
@@ -461,7 +461,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flat_hash_set_basic() {
+    fn inserts_and_finds_entries_by_hash() {
         let mut set = AppendOnlyFlatHashSet::new();
         set.insert(123, 0, 10);
         set.insert(456, 20, 5);
@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_hash_set_growth() {
+    fn grows_and_rehashes_beyond_capacity() {
         let mut set = AppendOnlyFlatHashSet::new();
         // Insert more than 60% of initial capacity to trigger growth
         for i in 1..=700 {
@@ -490,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_in_place_basic() {
+    fn dedups_repeated_lines_in_place() {
         let mut data = b"line1\nline2\nline1\nline3\n".to_vec();
         let (new_len, count) = dedup_in_place(&mut data, false, false);
 
@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_in_place_case_insensitive() {
+    fn dedups_in_place_ignoring_case() {
         let mut data = b"Hello\nhello\nworld\nWORLD\n".to_vec();
         let (new_len, count) = dedup_in_place(&mut data, true, true);
 
@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_in_place_unicode() {
+    fn dedups_in_place_folding_unicode() {
         let mut data = "MÜNCHEN\nmünchen\nberlin\n".as_bytes().to_vec();
         let (new_len, count) = dedup_in_place(&mut data, true, true);
 
@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_in_place_all_duplicates() {
+    fn collapses_all_duplicate_lines_in_place() {
         let mut data = b"dup\ndup\ndup\ndup\n".to_vec();
         let (new_len, count) = dedup_in_place(&mut data, false, false);
 
@@ -532,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_in_place_no_change() {
+    fn keeps_unique_lines_in_place() {
         let mut data = b"a\nb\nc\n".to_vec();
         let original_len = data.len();
         let (new_len, count) = dedup_in_place(&mut data, false, false);
@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_to_writer_basic() {
+    fn dedups_streaming_to_writer() {
         let data = b"line1\nline2\nline1\nline3\n";
         let mut output = Vec::new();
 
@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_to_writer_case_insensitive() {
+    fn dedups_to_writer_ignoring_case() {
         let data = b"Hello\nhello\nHELLO\nworld\n";
         let mut output = Vec::new();
 
@@ -568,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_preserves_first() {
+    fn preserves_first_occurrence_casing() {
         let data = b"First\nfirst\nFIRST\n";
         let mut output = Vec::new();
 
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_empty() {
+    fn dedups_empty_input() {
         let data = b"";
         let mut output = Vec::new();
 
@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_empty_lines() {
+    fn dedups_repeated_blank_lines() {
         let data = b"\n\n\ntext\n\n";
         let mut output = Vec::new();
 
@@ -600,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn line_entry_empty() {
+    fn detects_empty_line_entries() {
         assert!(LineEntry::EMPTY.is_empty());
         assert!(LineEntry::default().is_empty());
 

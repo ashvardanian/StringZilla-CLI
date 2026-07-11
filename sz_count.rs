@@ -106,7 +106,7 @@ fn count_data(data: &[u8], utf8_mode: bool) -> io::Result<Counts> {
         // UTF-8 mode: nested iteration through lines -> words -> chars.
         // `LineIter` gives line-terminator semantics (a trailing newline is not a
         // final empty line); `.skip_empty()` yields whitespace-separated tokens.
-        for line in shared::LineIter::new(data, true) {
+        for line in shared::LineIter::new(data, shared::Newlines::Unicode) {
             lines += 1;
             for word in line.sz_utf8_split_whitespaces().skip_empty() {
                 words += 1;
@@ -123,7 +123,7 @@ fn count_data(data: &[u8], utf8_mode: bool) -> io::Result<Counts> {
         })
     } else {
         // ASCII mode: nested iteration through lines -> words
-        for line in shared::LineIter::new(data, false) {
+        for line in shared::LineIter::new(data, shared::Newlines::Lf) {
             lines += 1;
             // Split line by ASCII whitespace
             let mut in_word = false;
@@ -303,8 +303,8 @@ fn process_directory(
 
     // Collect all entries
     for result in builder.build() {
-        let entry = result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        if entry.file_type().map_or(false, |ft| ft.is_file()) {
+        let entry = result.map_err(io::Error::other)?;
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
             let entry_path = entry.path();
             match count_file(entry_path, utf8_mode) {
                 Ok(counts) => {
