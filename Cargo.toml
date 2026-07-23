@@ -11,15 +11,17 @@ repository = "https://github.com/ashvardanian/StringZilla-CLI"
 version = "0.1.0"
 
 [features]
-cuda = ["stringzilla/cuda"] # CUDA backend for sz-fuzzy-find (build with --features cuda)
+cuda = ["stringzilla/cuda"]
 default = []
 
 [dependencies]
-clap = {version = "4.5", features = ["derive"]}# CLI argument parsing 
+clap = { version = "4.5", features = ["derive"] } # CLI argument parsing 
 glob = "0.3" # Glob pattern matching
 ignore = "0.4" # .gitignore support
 memmap2 = "0.9" # Memory-mapped file I/O
-stringzilla = {version = "4", features = ["cpus"]}# SIMD string ops + szs multicore kernels 
+stringzilla = { version = "5", features = [
+    "cpus",
+] } # SIMD string ops + szs multicore kernels
 walkdir = "2.4" # Directory traversal
 
 [dev-dependencies]
@@ -27,9 +29,9 @@ tempfile = "3.10"
 
 [profile.release]
 codegen-units = 1 # Better optimization, slower compile
-lto = true # Link-time optimization
-opt-level = 3 # Maximum optimization
-strip = true # Strip symbols for smaller binary
+lto = true        # Link-time optimization
+opt-level = 3     # Maximum optimization
+strip = true      # Strip symbols for smaller binary
 
 [[bin]]
 name = "sz-count"
@@ -66,3 +68,7 @@ path = "sz_outline.rs"
 [[bin]]
 name = "sz-sort"
 path = "sz_sort.rs"
+
+[[bin]]
+name = "sz-fuzzy-find"
+path = "sz_fuzzy_find.rs"

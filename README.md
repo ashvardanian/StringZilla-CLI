@@ -21,7 +21,7 @@ It provides the following subcommands:
 - `sz-cols`: extract columns from delimited text; replaces `cut -f` and `awk '{print $N}'` with simpler syntax
 - `sz-rows`: extract rows by index or range; replaces `sed -n`, `head`, `tail`, and `awk 'NR==N'`
 - `sz-sort`: sort lines; Unicode-correct and `sort -u`-style deduplication
-- :soon: `sz-fuzzy-find`: combination of exact and Levenshtein-bounded substring search
+- `sz-fuzzy-find`: exact + fuzzy substring search (Smith-Waterman / Levenshtein) with keyboard & phonetic scoring, on CPU or GPU
 
 ## Installation
 
@@ -314,3 +314,57 @@ $ sz-sort file.txt -o sorted.txt
 # Check whether the input is already sorted; exit 1 if not (replaces: sort -c)
 $ sz-sort -c file.txt
 ```
+
+## `sz-fuzzy-find`: Fuzzy Substring Search
+
+`sz-find` matches literally; `sz-fuzzy-find` adds typo tolerance, built on StringZilla's `szs` similarity kernels (CPU multicore by default, GPU optional).
+By default a line matches when some substring of it aligns to the query within `-k` edits, found via Smith-Waterman local alignment.
+The exact substring is checked first via StringZilla's `find`, so only lines without an exact hit reach the kernel.
+
+```bash
+# Find "color" allowing up to 1 edit — also matches "colour", "colur", "kolor"
+$ sz-fuzzy-find -k 1 color file.txt
+
+# Several queries at once (a line matches if ANY query matches)
+$ sz-fuzzy-find -k 1 -e foo -e bar file.txt
+
+# Word mode: match the needle against each token (Levenshtein), not the whole line
+$ sz-fuzzy-find -w -k 1 colour file.txt
+
+# Count matching lines only
+$ sz-fuzzy-find -c -k 1 needle file.txt
+```
+
+### Scoring models (`--cost`)
+
+Beyond uniform edit distance, scoring can reflect *how* characters get confused.
+These route through Smith-Waterman with a `byte_to_class[256]` + `class_substitution_costs[32][32]` matrix, and use a normalized `--min-similarity` (0..1, where 1.0 is exact) instead of `-k`:
+
+```bash
+# Keyboard proximity: fat-finger typos (adjacent keys cost less) — "xolor" matches "color"
+$ sz-fuzzy-find --cost keyboard --min-similarity 0.8 color file.txt
+
+# Phonetic: sounds-alike (Editex-style articulatory groups) — "fonetik" matches "phonetic"
+$ sz-fuzzy-find --cost phonetic --min-similarity 0.75 phonetic file.txt
+
+# Custom 256→class map + 32×32 score matrix
+$ sz-fuzzy-find --cost-matrix my_costs.txt --min-similarity 0.8 needle file.txt
+```
+
+The keyboard matrix uses staggered-QWERTY Euclidean key distance; the phonetic matrix is seeded by voiced/unvoiced cognates (`b/p`, `d/t`, …) and Editex letter groups. Smith-Waterman fuzzy matching folds ASCII case (the 32-class budget leaves no room to distinguish case per letter).
+
+### Execution device (`--device`)
+
+```bash
+$ sz-fuzzy-find --device cpu --threads 8 -k 1 needle big.txt   # CPU, 8 threads
+$ sz-fuzzy-find --device gpu -k 1 needle big.txt               # GPU (see build note)
+```
+
+CPU multicore is the default. The GPU path requires a CUDA build:
+
+```bash
+# On systems with gcc > 14 + CUDA 12.x, point nvcc at a supported host compiler:
+$ CUDAHOSTCXX=g++-14 cargo install --git https://github.com/ashvardanian/StringZilla-CLI --features cuda
+```
+
+With `-k 0`, `sz-fuzzy-find` degrades to exact substring search, matching `sz-find`.
