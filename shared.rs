@@ -63,12 +63,8 @@ impl InputSource {
     }
 }
 
-/// Create an InputSource from either a file path or stdin (read-only).
-///
-/// Only regular files can be memory-mapped. Pipes, FIFOs, and character devices —
-/// which is what `<(cmd)` process substitution and `/dev/stdin` resolve to — are
-/// read into a buffer instead. Mapping them fails with ENODEV, so without this
-/// fallback those inputs silently look empty.
+/// Read from a file path or stdin. Only regular files are mapped; pipes and
+/// character devices, which `<(cmd)` and `/dev/stdin` resolve to, are buffered.
 #[allow(dead_code)]
 pub fn get_input(path: Option<&str>) -> io::Result<InputSource> {
     let Some(path) = path.filter(|path| *path != "-") else {
@@ -79,9 +75,7 @@ pub fn get_input(path: Option<&str>) -> io::Result<InputSource> {
     open_input(Path::new(path))
 }
 
-/// Map `path` for zero-copy access, reading it into a buffer when that is not possible.
-///
-/// See [`get_input`] for why the fallback exists.
+/// Map `path` for zero-copy access, buffering it when that is not possible.
 #[allow(dead_code)]
 pub fn open_input(path: &Path) -> io::Result<InputSource> {
     let mut file = File::open(path)?;
@@ -97,12 +91,8 @@ pub fn open_input(path: &Path) -> io::Result<InputSource> {
     Ok(InputSource::Buffer(buffer))
 }
 
-/// Whether a walked entry should be read.
-///
-/// Regular files always qualify. An explicitly named input — depth zero — also
-/// qualifies when it is not a directory, which is what lets `<(cmd)` and
-/// `/dev/stdin` through; the walker would otherwise skip them as non-regular and
-/// the run would look like a clean "no matches".
+/// Whether a walked entry should be read: any regular file, plus explicitly named
+/// non-directories, which is what lets `<(cmd)` and `/dev/stdin` through.
 #[allow(dead_code)]
 pub fn is_readable_entry(entry: &ignore::DirEntry) -> bool {
     match entry.file_type() {
@@ -124,12 +114,20 @@ pub fn get_input_mutable(path: &str) -> io::Result<InputSource> {
 #[allow(dead_code)]
 pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
     match path {
-        None | Some("-") => Ok(Box::new(BufWriter::new(io::stdout()))),
+        None | Some("-") => Ok(Box::new(stdout_writer())),
         Some(path) => {
             let file = File::create(path)?;
             Ok(Box::new(BufWriter::new(file)))
         }
     }
+}
+
+/// Buffered, locked stdout. `io::Stdout` is line-buffered, costing a syscall per record.
+///
+/// `process::exit` skips the buffer's `Drop`, so exit through [`ExitCode::exit`].
+#[allow(dead_code)]
+pub fn stdout_writer() -> BufWriter<io::StdoutLock<'static>> {
+    BufWriter::new(io::stdout().lock())
 }
 
 // endregion: Input Sources
@@ -213,13 +211,8 @@ fn drop_trailing_empty<'a, I: Iterator<Item = &'a [u8]>>(
     Some(line)
 }
 
-/// Byte offset of `segment` within `data`.
-///
-/// Every StringZilla segmenter and splitter yields borrowed subslices of its input
-/// and none expose an offsets accessor, so the pointer difference is the offset —
-/// the library itself recovers offsets this way. Prefer this over accumulating
-/// `line.len() + 1`, which assumes a one-byte terminator and is wrong by one per
-/// CR and by two per LS or PS.
+/// Byte offset of `segment` within `data`. Segmenters yield borrowed subslices and
+/// expose no offsets accessor, so the pointer difference is the offset.
 #[allow(dead_code)]
 #[inline]
 pub fn offset_within(data: &[u8], segment: &[u8]) -> usize {
@@ -267,17 +260,9 @@ impl Terminator {
     }
 }
 
-/// Trim `line` to at most `max_bytes`, never splitting a UTF-8 character.
-///
-/// Returns the kept prefix and whether anything was dropped. Truncating on a raw
-/// byte index would emit a partial character and corrupt the terminal or the
-/// consumer's decoder, which is what `grep` and `ripgrep` both do here.
-///
-/// This lands on a codepoint boundary, not a grapheme boundary, so a combining mark
-/// or an emoji sequence can still be split. StringZilla 5.0.3 exposes no reverse
-/// boundary seek — `find_nth_utf8` is forward-only — so a bounded backward walk is
-/// the available answer; `Utf8Graphemes` would be the correct one if a cut point
-/// could be sought backwards.
+/// Trim `line` to at most `max_bytes`, returning the kept prefix and whether
+/// anything was dropped. Lands on a codepoint boundary, so combining marks and
+/// emoji sequences can still be split.
 #[allow(dead_code)]
 pub fn truncate_at_character(line: &[u8], max_bytes: usize) -> (&[u8], bool) {
     if line.len() <= max_bytes {
@@ -293,10 +278,7 @@ pub fn truncate_at_character(line: &[u8], max_bytes: usize) -> (&[u8], bool) {
     (&line[..end], true)
 }
 
-/// The bytes JSON must escape: `"`, `\`, and every C0 control.
-///
-/// Built once. `Byteset` has no `const` constructor, and rebuilding 34 bits per
-/// record would cost more than the scan it enables.
+/// The bytes JSON must escape. Built once; `Byteset` has no `const` constructor.
 fn json_escape_byteset() -> sz::Byteset {
     static ESCAPES: OnceLock<sz::Byteset> = OnceLock::new();
     *ESCAPES.get_or_init(|| {
@@ -308,13 +290,8 @@ fn json_escape_byteset() -> sz::Byteset {
     })
 }
 
-/// Write JSON-escaped bytes directly to output, with no intermediate String.
-/// Bytes at or above 0x80 pass through verbatim, so the result is valid JSON
-/// only for valid UTF-8 input.
-///
-/// Scans to the next byte needing an escape and bulk-writes the run before it.
-/// A per-byte loop would pay a virtual dispatch through `dyn Write` for every
-/// byte of every record, and JSON payloads are overwhelmingly ordinary bytes.
+/// Write JSON-escaped bytes, bulk-writing the run between escapes. Bytes at or
+/// above 0x80 pass through, so the result is valid JSON only for valid UTF-8.
 #[allow(dead_code)]
 pub fn json_escape_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -353,10 +330,8 @@ pub fn json_text_field_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()>
     output.write_all(br#""}"#)
 }
 
-/// Render `value` into `buffer` with `,` between thousands groups, back to front.
-///
-/// `usize::MAX` is 20 digits plus 6 separators, which is exactly `buffer`'s length.
-/// Returning a borrowed `&str` lets callers that need padding avoid a `String`.
+/// Render `value` with `,` between thousands groups. `usize::MAX` is 20 digits
+/// plus 6 separators, exactly `buffer`'s length.
 #[allow(dead_code)]
 pub fn format_grouped_number(buffer: &mut [u8; 26], value: usize) -> &str {
     let mut written = buffer.len();

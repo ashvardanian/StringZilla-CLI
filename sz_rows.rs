@@ -254,7 +254,7 @@ fn extract_rows_by_selector(
 
 fn main() {
     let args = Args::parse();
-    let mut output = io::stdout();
+    let mut output = stdout_writer();
 
     // Determine row selector
     let selector = if let Some(ref rows) = args.rows {

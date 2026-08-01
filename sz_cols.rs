@@ -222,7 +222,7 @@ fn main() {
     let args = Args::parse();
 
     // Parse field specification
-    let mut output = io::stdout();
+    let mut output = stdout_writer();
 
     let field_indices = match parse_fields(&args.fields) {
         Ok(indices) => indices,
