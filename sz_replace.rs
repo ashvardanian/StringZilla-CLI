@@ -24,7 +24,6 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::process;
 
 use clap::Parser;
 use stringzilla::sz::{find, utf8_uncased_search};
@@ -36,6 +35,7 @@ use shared::*;
 #[derive(Parser)]
 #[command(name = "sz-replace")]
 #[command(version, about = "SIMD-accelerated substring replacement", long_about = None)]
+#[command(group(clap::ArgGroup::new("sink").multiple(true).args(["output", "in_place", "dry_run"])))]
 struct Args {
     /// Substring to search for
     pattern: String,
@@ -51,11 +51,11 @@ struct Args {
     output: Option<String>,
 
     /// Replace in-place (modifies input file)
-    #[arg(short = 'i', long = "in-place")]
+    #[arg(long = "in-place")]
     in_place: bool,
 
-    /// Case-insensitive search
-    #[arg(short = 'I', long)]
+    /// Case-insensitive search (full Unicode case folding)
+    #[arg(short = 'i', long)]
     ignore_case: bool,
 
     /// Show count of replacements made
@@ -69,6 +69,10 @@ struct Args {
     /// Enable UTF-8 mode (validate input)
     #[arg(long)]
     utf8: bool,
+
+    /// Emit a JSON Lines summary of the replacement; requires -o, --in-place, or -n
+    #[arg(long, requires = "sink", help_heading = "Output Formats")]
+    json: bool,
 }
 
 /// Replace all occurrences of `pattern` with `replacement`, streaming the output
@@ -118,27 +122,26 @@ fn replace_all_to(
 fn main() {
     let args = Args::parse();
 
+    let mut stdout = io::stdout();
+
     if args.pattern.is_empty() {
         eprintln!("Error: pattern cannot be empty");
-        process::exit(1);
+        ExitCode::Error.exit(&mut stdout);
     }
 
     if args.in_place && args.input.is_none() {
         eprintln!("Error: --in-place requires an input file (cannot use stdin)");
-        process::exit(1);
+        ExitCode::Error.exit(&mut stdout);
     }
 
     if args.in_place && args.input == Some("-".to_string()) {
         eprintln!("Error: --in-place cannot be used with stdin");
-        process::exit(1);
+        ExitCode::Error.exit(&mut stdout);
     }
 
     let input = match get_input(args.input.as_deref()) {
         Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
-        }
+        Err(error) => exit_with_error(&mut stdout, &error, "Error reading input"),
     };
 
     let data = input.as_bytes();
@@ -155,8 +158,12 @@ fn main() {
             &mut io::sink(),
         )
         .expect("writing to a sink cannot fail");
-        eprintln!("Dry run: would replace {} occurrence(s)", count);
-        process::exit(0);
+        if args.json {
+            write_summary_json(&mut stdout, &args, count, true);
+        } else {
+            eprintln!("Dry run: would replace {} occurrence(s)", count);
+        }
+        ExitCode::Success.exit(&mut stdout);
     }
 
     let count = if args.in_place {
@@ -165,41 +172,47 @@ fn main() {
         let mut buf = Vec::with_capacity(data.len());
         let count = replace_all_to(data, pattern, replacement, args.ignore_case, &mut buf)
             .expect("writing to a Vec cannot fail");
-        if let Err(e) = fs::write(input_path, &buf) {
-            eprintln!("Error writing to file: {}", e);
-            process::exit(1);
+        if let Err(error) = fs::write(input_path, &buf) {
+            exit_with_error(&mut stdout, &error, "Error writing to file");
         }
         count
     } else {
         // Stream directly to stdout / -o — no full-output buffer.
         let mut output = match get_output(args.output.as_deref()) {
             Ok(output) => output,
-            Err(e) => {
-                eprintln!("Error opening output: {}", e);
-                process::exit(1);
-            }
+            Err(error) => exit_with_error(&mut stdout, &error, "Error opening output"),
         };
         let count = match replace_all_to(data, pattern, replacement, args.ignore_case, &mut *output)
         {
             Ok(count) => count,
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => process::exit(0),
-            Err(e) => {
-                eprintln!("Error writing output: {}", e);
-                process::exit(1);
-            }
+            Err(error) => exit_on_write_error(&mut *output, &error, "Error writing output"),
         };
-        if let Err(e) = output.flush() {
-            if e.kind() != io::ErrorKind::BrokenPipe {
-                eprintln!("Error flushing output: {}", e);
-                process::exit(1);
+        if let Err(error) = output.flush() {
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                exit_with_error(&mut stdout, &error, "Error flushing output");
             }
         }
         count
     };
 
-    if args.count {
+    if args.json {
+        write_summary_json(&mut stdout, &args, count, false);
+    } else if args.count {
         eprintln!("Replaced {} occurrence(s)", count);
     }
+}
+
+/// Write the single summary record. The transformed bytes never share stdout with
+/// it, because `--json` requires `-o`, `-i`, or `-n`.
+fn write_summary_json(output: &mut dyn Write, args: &Args, replacements: usize, dry_run: bool) {
+    let path = args.input.as_deref().unwrap_or("-");
+    let _ = output.write_all(br#"{"type":"summary","data":{"path":"#);
+    let _ = json_text_field_to(output, path.as_bytes());
+    let _ = writeln!(
+        output,
+        r#","replacements":{},"dry_run":{}}}}}"#,
+        replacements, dry_run
+    );
 }
 
 #[cfg(test)]

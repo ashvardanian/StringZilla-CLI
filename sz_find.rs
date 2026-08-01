@@ -2,7 +2,7 @@
 //!
 //! A grep-like tool with simpler syntax, using StringZilla for fast searching.
 //! Unlike grep, uses literal substring matching (not regex) for maximum speed.
-//! Passing `-r/--replace` switches to in-place find-and-replace.
+//! For find-and-replace, use the dedicated `sz-replace` utility.
 //!
 //! # Examples
 //!
@@ -55,7 +55,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
 use ignore::WalkBuilder;
-use memmap2::Mmap;
 use stringzilla::sz::{find, rfind, utf8_uncased_search, StringZillableBinary};
 
 mod shared;
@@ -110,7 +109,7 @@ struct Args {
     utf8: bool,
 
     /// Allow pattern to match across line boundaries
-    #[arg(short = 'M', long)]
+    #[arg(short = 'U', long)]
     multiline: bool,
 
     /// Invert match: show non-matching lines
@@ -158,6 +157,10 @@ struct Args {
     #[arg(short = 'o', long)]
     only_matching: bool,
 
+    /// Trim printed lines to NUM bytes, on a character boundary
+    #[arg(short = 'M', long)]
+    max_columns: Option<usize>,
+
     /// Output in JSON Lines format (ripgrep-compatible)
     #[arg(long)]
     json: bool,
@@ -194,19 +197,6 @@ struct Args {
     /// Print NUL byte after filenames
     #[arg(short = '0', long)]
     null: bool,
-
-    // Replacement options
-    /// Replacement string (enables replace mode)
-    #[arg(short = 'r', long)]
-    replace: Option<String>,
-
-    /// Modify files in-place (requires -r, default for file inputs)
-    #[arg(long, requires = "replace")]
-    in_place: bool,
-
-    /// Dry run - show what would be replaced without making changes
-    #[arg(long, requires = "replace")]
-    dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -288,7 +278,7 @@ struct Stats {
     bytes_searched: AtomicUsize,
 }
 
-/// Search configuration (derived from Args for efficiency)
+/// Search configuration
 struct SearchConfig<'a> {
     pattern: &'a [u8],
     ignore_case: bool,
@@ -311,6 +301,7 @@ struct SearchConfig<'a> {
     byte_offset: bool,
     only_matching: bool,
     output_format: OutputFormat,
+    max_columns: Option<usize>,
 }
 
 /// Check if byte is a word boundary character
@@ -407,209 +398,6 @@ impl<'a> Iterator for MatchIter<'a> {
 #[inline]
 fn matches<'a>(data: &'a [u8], config: &'a SearchConfig) -> MatchIter<'a> {
     MatchIter::new(data, config.pattern, config.ignore_case, config.whole_word)
-}
-
-/// Write JSON-escaped bytes directly to output (no intermediate String allocation)
-fn json_escape_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
-    for &byte in data {
-        match byte {
-            b'"' => output.write_all(b"\\\"")?,
-            b'\\' => output.write_all(b"\\\\")?,
-            b'\n' => output.write_all(b"\\n")?,
-            b'\r' => output.write_all(b"\\r")?,
-            b'\t' => output.write_all(b"\\t")?,
-            b if b < 0x20 => write!(output, "\\u{:04x}", b)?,
-            b => output.write_all(&[b])?,
-        }
-    }
-    Ok(())
-}
-
-/// Replace all occurrences in-place using two-pointer compaction.
-///
-/// **Case-sensitive only** - for byte-level replacement where pattern.len() == match.len().
-/// Returns (new_length, replacement_count).
-///
-/// Invariant: `write_pos <= read_pos` ensures we never overwrite unread data.
-fn replace_in_place(
-    data: &mut [u8],
-    pattern: &[u8],
-    replacement: &[u8],
-    whole_word: bool,
-) -> (usize, usize) {
-    debug_assert!(
-        replacement.len() <= pattern.len(),
-        "In-place replacement requires replacement.len() <= pattern.len()"
-    );
-
-    if pattern.is_empty() {
-        return (data.len(), 0);
-    }
-
-    let mut read_pos: usize = 0;
-    let mut write_pos: usize = 0;
-    let mut count: usize = 0;
-
-    // Use raw find() to avoid borrow conflict (can't iterate and mutate simultaneously)
-    loop {
-        let remaining = &data[read_pos..];
-        let offset = match find(remaining, pattern) {
-            Some(off) => off,
-            None => break,
-        };
-
-        let abs_start = read_pos + offset;
-        let abs_end = abs_start + pattern.len();
-
-        // Check word boundary if needed
-        // Note: During compaction, data[write_pos..read_pos] is undefined ("gap").
-        // For "before" byte: if match starts at read_pos and there's a gap, use write_pos-1
-        // For "after" byte: always at abs_end which is in original region
-        if whole_word {
-            let before_ok = if abs_start == 0 {
-                true // Start of buffer
-            } else if abs_start == read_pos && write_pos < read_pos && write_pos > 0 {
-                // Match at start of remaining, gap exists - check compacted byte
-                !is_word_char(data[write_pos - 1])
-            } else {
-                !is_word_char(data[abs_start - 1])
-            };
-            let after_ok = abs_end >= data.len() || !is_word_char(data[abs_end]);
-
-            if !before_ok || !after_ok {
-                // Not a word boundary - copy up to and past this non-match
-                let skip_to = abs_start + 1;
-                let len = skip_to - read_pos;
-                if write_pos != read_pos {
-                    data.copy_within(read_pos..skip_to, write_pos);
-                }
-                write_pos += len;
-                read_pos = skip_to;
-                continue;
-            }
-        }
-
-        // Copy data between last position and this match
-        if abs_start > read_pos {
-            let len = abs_start - read_pos;
-            if write_pos != read_pos {
-                data.copy_within(read_pos..abs_start, write_pos);
-            }
-            write_pos += len;
-        }
-
-        // Write replacement
-        data[write_pos..write_pos + replacement.len()].copy_from_slice(replacement);
-        write_pos += replacement.len();
-        count += 1;
-
-        read_pos = abs_end;
-    }
-
-    // Copy remaining data after last match
-    if read_pos < data.len() {
-        let len = data.len() - read_pos;
-        if write_pos != read_pos {
-            data.copy_within(read_pos..data.len(), write_pos);
-        }
-        write_pos += len;
-    }
-
-    (write_pos, count)
-}
-
-/// Replace all occurrences, returning a new buffer.
-///
-/// **Case-sensitive only** - used when replacement is longer than pattern.
-fn replace_to_buffer(
-    data: &[u8],
-    pattern: &[u8],
-    replacement: &[u8],
-    whole_word: bool,
-) -> (Vec<u8>, usize) {
-    if pattern.is_empty() {
-        return (data.to_vec(), 0);
-    }
-
-    let mut result = Vec::with_capacity(data.len());
-    let mut last_end = 0;
-    let mut count = 0;
-
-    // Use MatchIter for case-sensitive search (no allocations)
-    for m in MatchIter::new(data, pattern, false, whole_word) {
-        // Copy data before this match
-        result.extend_from_slice(&data[last_end..m.offset]);
-        // Add replacement
-        result.extend_from_slice(replacement);
-        count += 1;
-        last_end = m.offset + m.length;
-    }
-
-    // Copy remaining data after last match
-    result.extend_from_slice(&data[last_end..]);
-
-    (result, count)
-}
-
-/// Count matches without modification (for dry-run)
-fn count_matches(data: &[u8], pattern: &[u8], whole_word: bool) -> usize {
-    MatchIter::new(data, pattern, false, whole_word).count()
-}
-
-/// Process replacement for a single file
-fn process_file_replace(
-    path: &Path,
-    pattern: &[u8],
-    replacement: &[u8],
-    whole_word: bool,
-    in_place: bool,
-    dry_run: bool,
-    skip_binary: bool,
-) -> io::Result<(usize, bool)> {
-    let file = std::fs::File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-
-    // Skip binary files
-    if skip_binary && is_binary(&mmap) {
-        return Ok((0, false));
-    }
-
-    if dry_run {
-        let count = count_matches(&mmap, pattern, whole_word);
-        return Ok((count, false));
-    }
-
-    let can_shrink_in_place = replacement.len() <= pattern.len();
-
-    if in_place && can_shrink_in_place {
-        // In-place modification using mutable mmap (shrinking or same size)
-        drop(mmap);
-        let mut input = get_input_mutable(path.to_str().unwrap())?;
-        let data = input.as_mut_bytes().unwrap();
-        let (new_len, count) = replace_in_place(data, pattern, replacement, whole_word);
-        input.truncate_and_flush(new_len as u64)?;
-        Ok((count, true))
-    } else {
-        // Buffer approach: read, replace, write back
-        let (result, count) = replace_to_buffer(&mmap, pattern, replacement, whole_word);
-        if count > 0 && in_place {
-            drop(mmap);
-            std::fs::write(path, &result)?;
-        }
-        Ok((count, count > 0))
-    }
-}
-
-/// Check if line matches (considering invert_match)
-/// TODO: Add sz_find_word_boundary() to StringZilla for SIMD-accelerated word-aware search
-#[inline]
-fn line_matches(line: &[u8], config: &SearchConfig) -> bool {
-    let has_match = matches(line, config).next().is_some();
-    if config.invert_match {
-        !has_match
-    } else {
-        has_match
-    }
 }
 
 /// Highlight matches in a line, writing to a reusable buffer.
@@ -711,7 +499,6 @@ where
 {
     let mut match_count = 0;
     let mut lines_searched = 0;
-    let mut byte_offset: usize = 0;
     let mut context_before: VecDeque<ContextLine> =
         VecDeque::with_capacity(config.before_context + 1);
     let mut pending_after: usize = 0;
@@ -724,10 +511,9 @@ where
     for (line_num, line) in iter.enumerate() {
         lines_searched += 1;
         let line_num_1based = line_num + 1;
-        let current_byte_offset = byte_offset;
-
-        // Advance byte offset past this line (including newline)
-        byte_offset += line.len() + 1;
+        // Taken from the slice itself. Accumulating `line.len() + 1` assumes a
+        // one-byte terminator and is wrong by one per CR, two per LS or PS.
+        let current_byte_offset = offset_within(data, line);
 
         // Check if we've hit max count
         if let Some(max) = config.max_count {
@@ -737,7 +523,7 @@ where
             }
         }
 
-        let is_match = line_matches(line, config);
+        let is_match = matches(line, config).next().is_some() != config.invert_match;
 
         if is_match {
             match_count += 1;
@@ -1059,14 +845,14 @@ fn print_line(
                     if config.only_matching {
                         output.write_all(&line[m.offset..m.offset + m.length])?;
                     } else {
-                        output.write_all(line)?;
+                        write_line_trimmed(output, line, config)?;
                     }
                     output.write_all(b"\n")?;
                 }
             } else if is_match {
                 // Inverted match - just print the line
                 write!(output, "{}:{}:1:", filename, line_num)?;
-                output.write_all(line)?;
+                write_line_trimmed(output, line, config)?;
                 output.write_all(b"\n")?;
             }
             Ok(())
@@ -1139,6 +925,20 @@ fn print_line(
 }
 
 /// Print line content (handles only_matching mode)
+/// Write a whole line, trimmed to `--max-columns` on a character boundary.
+/// One long minified line would otherwise flood a terminal or a context window.
+fn write_line_trimmed(output: &mut dyn Write, line: &[u8], config: &SearchConfig) -> io::Result<()> {
+    let Some(limit) = config.max_columns else {
+        return output.write_all(line);
+    };
+    let (kept, trimmed) = truncate_at_character(line, limit);
+    output.write_all(kept)?;
+    if trimmed {
+        output.write_all(b" [...]")?;
+    }
+    Ok(())
+}
+
 fn print_line_content(
     output: &mut dyn Write,
     line: &[u8],
@@ -1163,7 +963,7 @@ fn print_line_content(
         }
         Ok(())
     } else {
-        output.write_all(line)
+        write_line_trimmed(output, line, config)
     }
 }
 
@@ -1249,8 +1049,8 @@ fn process_file(
     max_reached: &AtomicBool,
     skip_binary: bool,
 ) -> io::Result<Option<FileResult>> {
-    let file = std::fs::File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let input = open_input(path)?;
+    let mmap = input.as_bytes();
 
     stats.files_searched.fetch_add(1, Ordering::Relaxed);
     stats
@@ -1384,135 +1184,6 @@ fn print_stats(stats: &Stats, elapsed: std::time::Duration) {
     }
 }
 
-/// Run replacement mode (when -r flag is provided)
-fn run_replace_mode(args: &Args, replacement: &str) {
-    // Case-insensitive replacement is not supported (UTF-8 match lengths vary)
-    if args.ignore_case {
-        eprintln!("Error: case-insensitive replacement (-i -r) is not supported");
-        eprintln!("       UTF-8 case folding can produce matches of different lengths,");
-        eprintln!("       making in-place replacement unsafe. Use case-sensitive replacement.");
-        process::exit(1);
-    }
-
-    let pattern = args.pattern.as_bytes();
-    let replacement = replacement.as_bytes();
-    let is_stdin = args.inputs.len() == 1 && args.inputs[0] == "-";
-
-    // In-place is default for file inputs (unless stdin)
-    let in_place = !is_stdin;
-
-    if is_stdin {
-        // Stdin mode: read, replace, write to stdout
-        let mut buffer = Vec::new();
-        if let Err(e) = io::stdin().read_to_end(&mut buffer) {
-            eprintln!("Error reading stdin: {}", e);
-            process::exit(1);
-        }
-
-        let (result, count) = replace_to_buffer(&buffer, pattern, replacement, args.word);
-
-        if args.dry_run {
-            eprintln!("Dry run: would replace {} occurrence(s)", count);
-            process::exit(0);
-        }
-
-        if let Err(e) = io::stdout().write_all(&result) {
-            if e.kind() != io::ErrorKind::BrokenPipe {
-                eprintln!("Error writing output: {}", e);
-                process::exit(1);
-            }
-        }
-
-        if !args.quiet {
-            eprintln!("Replaced {} occurrence(s)", count);
-        }
-    } else {
-        // File/directory mode
-        let walker = build_walker(&args.inputs, args);
-        let mut total_count = 0;
-        let mut files_modified = 0;
-
-        for result in walker {
-            let entry = match result {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("Warning: {}", e);
-                    continue;
-                }
-            };
-
-            // Skip directories
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                continue;
-            }
-
-            // Apply glob filters
-            if let Some(ref globs) = args.glob {
-                let path_str = entry.path().to_string_lossy();
-                let mut matches_glob = false;
-                for glob in globs {
-                    if let Ok(pat) = glob::Pattern::new(glob) {
-                        if pat.matches(&path_str)
-                            || pat.matches(entry.file_name().to_string_lossy().as_ref())
-                        {
-                            matches_glob = true;
-                            break;
-                        }
-                    }
-                }
-                if !matches_glob {
-                    continue;
-                }
-            }
-
-            match process_file_replace(
-                entry.path(),
-                pattern,
-                replacement,
-                args.word,
-                in_place,
-                args.dry_run,
-                !args.binary,
-            ) {
-                Ok((count, modified)) => {
-                    if count > 0 {
-                        total_count += count;
-                        if modified {
-                            files_modified += 1;
-                        }
-                        if !args.quiet {
-                            eprintln!(
-                                "{}: {} replacement(s){}",
-                                entry.path().display(),
-                                count,
-                                if args.dry_run { " (dry run)" } else { "" }
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Warning: {}: {}", entry.path().display(), e);
-                }
-            }
-        }
-
-        if !args.quiet {
-            eprintln!();
-            if args.dry_run {
-                eprintln!(
-                    "Dry run: would replace {} occurrence(s) in {} file(s)",
-                    total_count, files_modified
-                );
-            } else {
-                eprintln!(
-                    "Replaced {} occurrence(s) in {} file(s)",
-                    total_count, files_modified
-                );
-            }
-        }
-    }
-}
-
 fn main() {
     let args = Args::parse();
     let start_time = std::time::Instant::now();
@@ -1520,18 +1191,12 @@ fn main() {
     // Validate arguments
     if args.pattern.is_empty() {
         eprintln!("Error: pattern cannot be empty");
-        process::exit(1);
+        process::exit(ExitCode::Error as i32);
     }
 
     if args.files_with_matches && args.files_without_match {
         eprintln!("Error: -l and -L are mutually exclusive");
-        process::exit(1);
-    }
-
-    // Handle replace mode
-    if let Some(ref replacement) = args.replace {
-        run_replace_mode(&args, replacement);
-        return;
+        process::exit(ExitCode::Error as i32);
     }
 
     // Handle -C flag (context on both sides)
@@ -1601,6 +1266,7 @@ fn main() {
         byte_offset: args.byte_offset,
         only_matching: args.only_matching,
         output_format,
+        max_columns: args.max_columns,
     };
 
     let stats = Stats::default();
@@ -1623,7 +1289,7 @@ fn main() {
             Err(e) => {
                 if e.kind() != io::ErrorKind::BrokenPipe {
                     eprintln!("Error reading stdin: {}", e);
-                    process::exit(1);
+                    process::exit(ExitCode::Error as i32);
                 }
             }
         }
@@ -1646,7 +1312,7 @@ fn main() {
             };
 
             // Skip directories
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            if !is_readable_entry(&entry) {
                 continue;
             }
 
@@ -1688,7 +1354,9 @@ fn main() {
                         let sep = if args.null { "\0" } else { "\n" };
                         print!("{}{}", result.path, sep);
                     }
-                    if args.count {
+                    // Only files with matches are reported, as `grep -c` and `rg -c` do.
+                    // Listing every `path:0` buries the answer in a directory walk.
+                    if args.count && result.match_count > 0 {
                         file_counts.push((result.path, result.match_count));
                     }
                 }
@@ -1723,7 +1391,7 @@ fn main() {
 
     // Exit with status 1 if no matches found (like grep)
     if !any_match && !args.quiet {
-        process::exit(1);
+        process::exit(ExitCode::NoResult as i32);
     }
 }
 
@@ -1753,6 +1421,7 @@ mod tests {
             byte_offset: false,
             only_matching: false,
             output_format: OutputFormat::Standard,
+            max_columns: None,
         }
     }
 
@@ -1797,15 +1466,17 @@ mod tests {
 
     #[test]
     fn inverts_line_match_selection() {
+        let selects = |line: &[u8], config: &SearchConfig| {
+            matches(line, config).next().is_some() != config.invert_match
+        };
+
         let line = b"hello world";
         let mut config = make_config(b"hello");
-        assert!(line_matches(line, &config));
+        assert!(selects(line, &config));
 
         config.invert_match = true;
-        assert!(!line_matches(line, &config));
-
-        let line2 = b"goodbye world";
-        assert!(line_matches(line2, &config)); // Inverted: doesn't contain "hello"
+        assert!(!selects(line, &config));
+        assert!(selects(b"goodbye world", &config));
     }
 
     #[test]
