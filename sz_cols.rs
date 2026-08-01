@@ -23,7 +23,6 @@
 //! ```
 
 use std::io::{self, Write};
-use std::process;
 
 use clap::Parser;
 use stringzilla::sz::{FindSplits, MatcherType};
@@ -58,6 +57,14 @@ struct Args {
     /// Enable UTF-8 mode (validate input)
     #[arg(long)]
     utf8: bool,
+
+    /// Emit JSON Lines, one record per output line
+    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
+    json: bool,
+
+    /// NUL-terminate each output record; -D still separates fields within a record
+    #[arg(short = '0', long, help_heading = "Output Formats")]
+    null: bool,
 }
 
 /// Parse field specification into a list of 0-based field indices
@@ -118,19 +125,78 @@ fn split_fields<'a>(line: &'a [u8], delimiter: &'a [u8], out: &mut Vec<&'a [u8]>
     out.extend(FindSplits::new(line, MatcherType::Find(delimiter)));
 }
 
+/// Everything the writer needs, decided once from `Args`.
+#[derive(Clone, Copy)]
+struct OutputConfig<'a> {
+    json: bool,
+    terminator: Terminator,
+    /// Separates fields within one record; unused under `--json`, which nests them.
+    output_delimiter: &'a [u8],
+    /// Input name carried into the JSON envelope.
+    path: &'a str,
+}
+
+/// Write one extracted record as text, honoring the record terminator.
+fn write_record_text(
+    output: &mut dyn Write,
+    config: &OutputConfig,
+    fields: &[&[u8]],
+    field_indices: &[usize],
+) -> io::Result<()> {
+    let mut first = true;
+    for &index in field_indices {
+        if !first {
+            output.write_all(config.output_delimiter)?;
+        }
+        first = false;
+
+        if index < fields.len() {
+            output.write_all(fields[index])?;
+        }
+        // If field doesn't exist, output empty string (like cut)
+    }
+    output.write_all(&[config.terminator.as_byte()])
+}
+
+/// Write one extracted record as a JSON Lines object, with the fields as an array.
+fn write_record_json(
+    output: &mut dyn Write,
+    config: &OutputConfig,
+    fields: &[&[u8]],
+    field_indices: &[usize],
+    line_number: usize,
+) -> io::Result<()> {
+    output.write_all(br#"{"type":"line","data":{"path":"#)?;
+    json_text_field_to(output, config.path.as_bytes())?;
+    output.write_all(br#","fields":["#)?;
+    let mut first = true;
+    for &index in field_indices {
+        if !first {
+            output.write_all(b",")?;
+        }
+        first = false;
+        let field = fields.get(index).copied().unwrap_or(b"");
+        json_text_field_to(output, field)?;
+    }
+    write!(output, r#"],"line_number":{}}}}}"#, line_number)?;
+    output.write_all(b"\n")
+}
+
 /// Extract specified columns from data
 fn extract_cols(
     data: &[u8],
     field_indices: &[usize],
     delimiter: &[u8],
-    output_delimiter: &[u8],
     min_fields: Option<usize>,
+    config: &OutputConfig,
     output: &mut dyn Write,
 ) -> io::Result<usize> {
     let mut line_count = 0;
+    let mut line_number = 0;
     let mut fields: Vec<&[u8]> = Vec::new(); // reused across lines
 
     for line in LineIter::new(data, Newlines::Lf) {
+        line_number += 1;
         split_fields(line, delimiter, &mut fields);
 
         // Skip lines with too few fields if min_fields is set
@@ -140,19 +206,11 @@ fn extract_cols(
             }
         }
 
-        let mut first = true;
-        for &idx in field_indices {
-            if !first {
-                output.write_all(output_delimiter)?;
-            }
-            first = false;
-
-            if idx < fields.len() {
-                output.write_all(fields[idx])?;
-            }
-            // If field doesn't exist, output empty string (like cut)
+        if config.json {
+            write_record_json(output, config, &fields, field_indices, line_number)?;
+        } else {
+            write_record_text(output, config, &fields, field_indices)?;
         }
-        output.write_all(b"\n")?;
         line_count += 1;
     }
 
@@ -164,20 +222,19 @@ fn main() {
     let args = Args::parse();
 
     // Parse field specification
+    let mut output = io::stdout();
+
     let field_indices = match parse_fields(&args.fields) {
         Ok(indices) => indices,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            process::exit(1);
+        Err(message) => {
+            eprintln!("Error: {}", message);
+            ExitCode::Error.exit(&mut output);
         }
     };
 
     let input = match get_input(args.input.as_deref()) {
         Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
-        }
+        Err(error) => exit_with_error(&mut output, &error, "Error reading input"),
     };
 
     let data = input.as_bytes();
@@ -186,24 +243,25 @@ fn main() {
     let output_delimiter = args
         .output_delimiter
         .as_ref()
-        .map(|s| s.as_bytes())
+        .map(|delimiter| delimiter.as_bytes())
         .unwrap_or(delimiter);
 
-    let mut output = io::stdout();
+    let config = OutputConfig {
+        json: args.json,
+        terminator: Terminator::from_null(args.null),
+        output_delimiter,
+        path: args.input.as_deref().unwrap_or("-"),
+    };
 
-    if let Err(e) = extract_cols(
+    if let Err(error) = extract_cols(
         data,
         &field_indices,
         delimiter,
-        output_delimiter,
         args.min_fields,
+        &config,
         &mut output,
     ) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        eprintln!("Error: {}", e);
-        process::exit(1);
+        exit_on_write_error(&mut output, &error, "Error");
     }
 }
 
@@ -271,12 +329,21 @@ mod tests {
         );
     }
 
+    fn text_config(output_delimiter: &'static [u8]) -> OutputConfig<'static> {
+        OutputConfig {
+            json: false,
+            terminator: Terminator::Newline,
+            output_delimiter,
+            path: "-",
+        }
+    }
+
     #[test]
     fn extracts_single_column() {
         let data = b"a\tb\tc\n1\t2\t3\n";
         let mut output = Vec::new();
 
-        let count = extract_cols(data, &[1], b"\t", b"\t", None, &mut output).unwrap();
+        let count = extract_cols(data, &[1], b"\t", None, &text_config(b"\t"), &mut output).unwrap();
 
         assert_eq!(count, 2);
         assert_eq!(output, b"b\n2\n");
@@ -287,7 +354,7 @@ mod tests {
         let data = b"a\tb\tc\td\n";
         let mut output = Vec::new();
 
-        extract_cols(data, &[0, 2], b"\t", b",", None, &mut output).unwrap();
+        extract_cols(data, &[0, 2], b"\t", None, &text_config(b","), &mut output).unwrap();
 
         assert_eq!(output, b"a,c\n");
     }
@@ -297,7 +364,7 @@ mod tests {
         let data = b"a\tb\n";
         let mut output = Vec::new();
 
-        extract_cols(data, &[0, 2], b"\t", b"\t", None, &mut output).unwrap();
+        extract_cols(data, &[0, 2], b"\t", None, &text_config(b"\t"), &mut output).unwrap();
 
         // Field 3 (index 2) doesn't exist, should output empty
         assert_eq!(output, b"a\t\n");
@@ -308,10 +375,42 @@ mod tests {
         let data = b"a\tb\tc\na\n1\t2\t3\n";
         let mut output = Vec::new();
 
-        let count = extract_cols(data, &[1], b"\t", b"\t", Some(3), &mut output).unwrap();
+        let count =
+            extract_cols(data, &[1], b"\t", Some(3), &text_config(b"\t"), &mut output).unwrap();
 
         // Only lines with 3+ fields
         assert_eq!(count, 2);
         assert_eq!(output, b"b\n2\n");
+    }
+
+    #[test]
+    fn terminates_records_with_nul() {
+        let data = b"a\tb\n1\t2\n";
+        let mut output = Vec::new();
+        let mut config = text_config(b"\t");
+        config.terminator = Terminator::Null;
+
+        extract_cols(data, &[0], b"\t", None, &config, &mut output).unwrap();
+
+        assert_eq!(output, b"a\0\x31\0");
+    }
+
+    #[test]
+    fn emits_json_records_with_fields() {
+        let data = b"a\tb\tc\n";
+        let mut output = Vec::new();
+        let mut config = text_config(b"\t");
+        config.json = true;
+
+        extract_cols(data, &[0, 2], b"\t", None, &config, &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                r#"{"type":"line","data":{"path":{"text":"-"},"#,
+                r#""fields":[{"text":"a"},{"text":"c"}],"line_number":1}}"#,
+                "\n"
+            )
+        );
     }
 }

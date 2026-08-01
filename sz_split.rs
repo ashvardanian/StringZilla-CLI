@@ -18,7 +18,6 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::process;
 
 use clap::Parser;
 
@@ -48,6 +47,10 @@ struct Args {
     /// Suffix length (default: 2, gives aa, ab, ac...)
     #[arg(long, default_value = "2")]
     suffix_length: usize,
+
+    /// Emit a JSON Lines manifest of the files written, one record each
+    #[arg(long, help_heading = "Output Formats")]
+    json: bool,
 }
 
 /// Generate suffix for split files (aa, ab, ac, ... az, ba, bb, ...)
@@ -70,6 +73,7 @@ fn split_by_lines(
     prefix: &str,
     lines_per_file: usize,
     suffix_length: usize,
+    manifest: Option<&mut dyn Write>,
 ) -> io::Result<()> {
     if lines_per_file == 0 {
         return Err(io::Error::new(
@@ -80,7 +84,10 @@ fn split_by_lines(
 
     let mut file_index = 0;
     let mut current_lines = 0;
+    let mut current_bytes = 0;
+    let mut current_name = String::new();
     let mut current_file: Option<BufWriter<File>> = None;
+    let mut manifest = manifest;
 
     for line in LineIter::new(data, Newlines::Lf) {
         // Create new file if needed
@@ -94,6 +101,7 @@ fn split_by_lines(
                 )
             })?;
             current_file = Some(BufWriter::new(file));
+            current_name = filename;
             file_index += 1;
         }
 
@@ -102,12 +110,17 @@ fn split_by_lines(
             writer.write_all(line)?;
             writer.write_all(b"\n")?;
             current_lines += 1;
+            current_bytes += line.len() + 1;
 
             // Close file if we've reached the line limit
             if current_lines >= lines_per_file {
                 writer.flush()?;
+                if let Some(ref mut sink) = manifest {
+                    write_manifest_entry(*sink, &current_name, current_lines, current_bytes)?;
+                }
                 current_file = None;
                 current_lines = 0;
+                current_bytes = 0;
             }
         }
     }
@@ -115,37 +128,55 @@ fn split_by_lines(
     // Flush final file
     if let Some(mut writer) = current_file {
         writer.flush()?;
+        if let Some(ref mut sink) = manifest {
+            write_manifest_entry(*sink, &current_name, current_lines, current_bytes)?;
+        }
     }
 
     Ok(())
 }
 
+/// Write one manifest record naming a file that was written.
+fn write_manifest_entry(
+    output: &mut dyn Write,
+    name: &str,
+    lines: usize,
+    bytes: usize,
+) -> io::Result<()> {
+    output.write_all(br#"{"type":"file","data":{"path":"#)?;
+    json_text_field_to(output, name.as_bytes())?;
+    writeln!(output, r#","lines":{},"bytes":{}}}}}"#, lines, bytes)
+}
+
 fn main() {
     let args = Args::parse();
 
+    let mut stdout = io::stdout();
+
     if args.lines == 0 {
         eprintln!("Error: lines must be greater than 0");
-        process::exit(1);
+        ExitCode::Error.exit(&mut stdout);
     }
 
     if args.suffix_length == 0 {
         eprintln!("Error: suffix length must be greater than 0");
-        process::exit(1);
+        ExitCode::Error.exit(&mut stdout);
     }
 
     let input = match get_input(args.input.as_deref()) {
         Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
-        }
+        Err(error) => exit_with_error(&mut stdout, &error, "Error reading input"),
     };
 
     let data = input.as_bytes();
 
-    if let Err(e) = split_by_lines(data, &args.prefix, args.lines, args.suffix_length) {
-        eprintln!("Error splitting file: {}", e);
-        process::exit(1);
+    // Silent unless `--json`, so existing scripts see no new stdout output.
+    let mut manifest = io::stdout();
+    let sink: Option<&mut dyn Write> = if args.json { Some(&mut manifest) } else { None };
+
+    if let Err(error) = split_by_lines(data, &args.prefix, args.lines, args.suffix_length, sink) {
+        let mut stdout = io::stdout();
+        exit_with_error(&mut stdout, &error, "Error splitting file");
     }
 }
 
@@ -170,7 +201,7 @@ mod tests {
         let prefix = temp_dir.path().join("test_").to_str().unwrap().to_string();
 
         let data = b"line1\nline2\nline3\nline4\nline5\n";
-        split_by_lines(data, &prefix, 2, 2).unwrap();
+        split_by_lines(data, &prefix, 2, 2, None).unwrap();
 
         // Check first file
         let file1 = fs::read_to_string(format!("{}aa", prefix)).unwrap();
@@ -196,7 +227,7 @@ mod tests {
             .to_string();
 
         let data = b"a\nb\nc\n";
-        split_by_lines(data, &prefix, 1, 2).unwrap();
+        split_by_lines(data, &prefix, 1, 2, None).unwrap();
 
         assert_eq!(fs::read_to_string(format!("{}aa", prefix)).unwrap(), "a\n");
         assert_eq!(fs::read_to_string(format!("{}ab", prefix)).unwrap(), "b\n");
@@ -214,7 +245,7 @@ mod tests {
             .to_string();
 
         let data = b"line1\nline2";
-        split_by_lines(data, &prefix, 1, 2).unwrap();
+        split_by_lines(data, &prefix, 1, 2, None).unwrap();
 
         assert_eq!(
             fs::read_to_string(format!("{}aa", prefix)).unwrap(),

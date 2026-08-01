@@ -30,7 +30,6 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
-use std::process;
 
 use clap::Parser;
 
@@ -61,9 +60,17 @@ struct Args {
     #[arg(short = 'n', long = "line-numbers")]
     line_numbers: bool,
 
-    /// Enable UTF-8 mode (validate input)
+    /// Enable UTF-8 mode (split on Unicode newlines: CR, CRLF, NEL, LS, PS)
     #[arg(long)]
     utf8: bool,
+
+    /// Emit JSON Lines, one record per output line
+    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
+    json: bool,
+
+    /// NUL-terminate each output line instead of newline
+    #[arg(short = '0', long, help_heading = "Output Formats")]
+    null: bool,
 }
 
 /// Represents which rows to extract
@@ -147,11 +154,45 @@ fn parse_rows(spec: &str) -> Result<RowSelector, String> {
     Ok(RowSelector::Indices(indices))
 }
 
+/// Everything the writer needs, decided once from `Args`.
+#[derive(Clone, Copy)]
+struct OutputConfig<'a> {
+    json: bool,
+    terminator: Terminator,
+    show_line_numbers: bool,
+    /// Input name carried into the JSON envelope.
+    path: &'a str,
+}
+
+/// Write one extracted row. `index` is zero-based; records report it one-based.
+fn write_row(
+    output: &mut dyn Write,
+    config: &OutputConfig,
+    line: &[u8],
+    index: usize,
+) -> io::Result<()> {
+    if config.json {
+        output.write_all(br#"{"type":"line","data":{"path":"#)?;
+        json_text_field_to(output, config.path.as_bytes())?;
+        output.write_all(br#","lines":"#)?;
+        json_text_field_to(output, line)?;
+        write!(output, r#","line_number":{}}}}}"#, index + 1)?;
+        return output.write_all(b"\n");
+    }
+
+    if config.show_line_numbers {
+        write!(output, "{}:", index + 1)?;
+    }
+    output.write_all(line)?;
+    output.write_all(&[config.terminator.as_byte()])
+}
+
 /// Extract rows using indices or range
 fn extract_rows_by_selector(
     data: &[u8],
     selector: &RowSelector,
-    show_line_numbers: bool,
+    newlines: Newlines,
+    config: &OutputConfig,
     output: &mut dyn Write,
 ) -> io::Result<usize> {
     let mut count = 0;
@@ -159,64 +200,48 @@ fn extract_rows_by_selector(
     match selector {
         RowSelector::Indices(indices) => {
             let max_index = *indices.iter().max().unwrap_or(&0);
-            for (i, line) in LineIter::new(data, Newlines::Lf).enumerate() {
-                if i > max_index {
+            for (index, line) in LineIter::new(data, newlines).enumerate() {
+                if index > max_index {
                     break; // No need to continue past the last requested index
                 }
-                if indices.contains(&i) {
-                    if show_line_numbers {
-                        write!(output, "{}:", i + 1)?;
-                    }
-                    output.write_all(line)?;
-                    output.write_all(b"\n")?;
+                if indices.contains(&index) {
+                    write_row(output, config, line, index)?;
                     count += 1;
                 }
             }
         }
         RowSelector::Range(start, end) => {
-            for (i, line) in LineIter::new(data, Newlines::Lf).enumerate() {
-                if i > *end {
+            for (index, line) in LineIter::new(data, newlines).enumerate() {
+                if index > *end {
                     break;
                 }
-                if i >= *start {
-                    if show_line_numbers {
-                        write!(output, "{}:", i + 1)?;
-                    }
-                    output.write_all(line)?;
-                    output.write_all(b"\n")?;
+                if index >= *start {
+                    write_row(output, config, line, index)?;
                     count += 1;
                 }
             }
         }
-        RowSelector::Tail(n) => {
+        RowSelector::Tail(wanted) => {
             // Keep only the last N lines in a ring buffer — O(n) memory, not O(file).
-            let n = *n;
-            let mut ring: VecDeque<(usize, &[u8])> = VecDeque::with_capacity(n);
-            for (i, line) in LineIter::new(data, Newlines::Lf).enumerate() {
-                if n > 0 {
-                    if ring.len() == n {
+            let wanted = *wanted;
+            let mut ring: VecDeque<(usize, &[u8])> = VecDeque::with_capacity(wanted);
+            for (index, line) in LineIter::new(data, newlines).enumerate() {
+                if wanted > 0 {
+                    if ring.len() == wanted {
                         ring.pop_front();
                     }
-                    ring.push_back((i, line));
+                    ring.push_back((index, line));
                 }
             }
-            for (i, line) in ring {
-                if show_line_numbers {
-                    write!(output, "{}:", i + 1)?;
-                }
-                output.write_all(line)?;
-                output.write_all(b"\n")?;
+            for (index, line) in ring {
+                write_row(output, config, line, index)?;
                 count += 1;
             }
         }
-        RowSelector::Every(n) => {
-            for (i, line) in LineIter::new(data, Newlines::Lf).enumerate() {
-                if (i + 1) % n == 0 {
-                    if show_line_numbers {
-                        write!(output, "{}:", i + 1)?;
-                    }
-                    output.write_all(line)?;
-                    output.write_all(b"\n")?;
+        RowSelector::Every(stride) => {
+            for (index, line) in LineIter::new(data, newlines).enumerate() {
+                if (index + 1) % stride == 0 {
+                    write_row(output, config, line, index)?;
                     count += 1;
                 }
             }
@@ -229,57 +254,65 @@ fn extract_rows_by_selector(
 
 fn main() {
     let args = Args::parse();
+    let mut output = io::stdout();
 
     // Determine row selector
     let selector = if let Some(ref rows) = args.rows {
         match parse_rows(rows) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                process::exit(1);
+            Ok(selector) => selector,
+            Err(message) => {
+                eprintln!("Error: {}", message);
+                ExitCode::Error.exit(&mut output);
             }
         }
-    } else if let Some(n) = args.tail {
-        if n == 0 {
+    } else if let Some(wanted) = args.tail {
+        if wanted == 0 {
             eprintln!("Error: --tail must be at least 1");
-            process::exit(1);
+            ExitCode::Error.exit(&mut output);
         }
-        RowSelector::Tail(n)
-    } else if let Some(n) = args.every {
-        if n == 0 {
+        RowSelector::Tail(wanted)
+    } else if let Some(stride) = args.every {
+        if stride == 0 {
             eprintln!("Error: --every must be at least 1");
-            process::exit(1);
+            ExitCode::Error.exit(&mut output);
         }
-        RowSelector::Every(n)
+        RowSelector::Every(stride)
     } else {
         eprintln!("Error: must specify --rows, --tail, or --every");
-        process::exit(1);
+        ExitCode::Error.exit(&mut output);
     };
 
     let input = match get_input(args.input.as_deref()) {
         Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
-        }
+        Err(error) => exit_with_error(&mut output, &error, "Error reading input"),
     };
 
     let data = input.as_bytes();
 
-    let mut output = io::stdout();
+    let config = OutputConfig {
+        json: args.json,
+        terminator: Terminator::from_null(args.null),
+        show_line_numbers: args.line_numbers,
+        path: args.input.as_deref().unwrap_or("-"),
+    };
 
-    if let Err(e) = extract_rows_by_selector(data, &selector, args.line_numbers, &mut output) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        eprintln!("Error: {}", e);
-        process::exit(1);
+    if let Err(error) = extract_rows_by_selector(data, &selector, Newlines::from_utf8(args.utf8), &config, &mut output) {
+        exit_on_write_error(&mut output, &error, "Error");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_config() -> OutputConfig<'static> {
+        OutputConfig {
+            json: false,
+            terminator: Terminator::Newline,
+            show_line_numbers: false,
+            path: "-",
+        }
+    }
 
     #[test]
     fn parses_single_row_index() {
@@ -332,7 +365,7 @@ mod tests {
         indices.insert(1); // line2
         let selector = RowSelector::Indices(indices);
 
-        let count = extract_rows_by_selector(data, &selector, false, &mut output).unwrap();
+        let count = extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 1);
         assert_eq!(output, b"line2\n");
@@ -345,7 +378,7 @@ mod tests {
 
         let selector = RowSelector::Range(1, 3); // lines 2-4
 
-        let count = extract_rows_by_selector(data, &selector, false, &mut output).unwrap();
+        let count = extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 3);
         assert_eq!(output, b"line2\nline3\nline4\n");
@@ -358,7 +391,7 @@ mod tests {
 
         let selector = RowSelector::Tail(2);
 
-        let count = extract_rows_by_selector(data, &selector, false, &mut output).unwrap();
+        let count = extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 2);
         assert_eq!(output, b"line4\nline5\n");
@@ -371,7 +404,7 @@ mod tests {
 
         let selector = RowSelector::Every(2); // every 2nd line
 
-        let count = extract_rows_by_selector(data, &selector, false, &mut output).unwrap();
+        let count = extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 3);
         assert_eq!(output, b"line2\nline4\nline6\n");
@@ -383,10 +416,43 @@ mod tests {
         let mut output = Vec::new();
 
         let selector = RowSelector::Range(0, 1); // lines 1-2
+        let mut config = text_config();
+        config.show_line_numbers = true;
 
-        extract_rows_by_selector(data, &selector, true, &mut output).unwrap();
+        extract_rows_by_selector(data, &selector, Newlines::Lf, &config, &mut output).unwrap();
 
         assert_eq!(output, b"1:line1\n2:line2\n");
+    }
+
+    #[test]
+    fn terminates_rows_with_nul() {
+        let data = b"a\nb\n";
+        let mut output = Vec::new();
+        let mut config = text_config();
+        config.terminator = Terminator::Null;
+
+        extract_rows_by_selector(data, &RowSelector::Range(0, 1), Newlines::Lf, &config, &mut output).unwrap();
+
+        assert_eq!(output, b"a\0b\0");
+    }
+
+    #[test]
+    fn emits_json_rows_with_line_numbers() {
+        let data = b"a\nb\n";
+        let mut output = Vec::new();
+        let mut config = text_config();
+        config.json = true;
+
+        extract_rows_by_selector(data, &RowSelector::Range(1, 1), Newlines::Lf, &config, &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                r#"{"type":"line","data":{"path":{"text":"-"},"#,
+                r#""lines":{"text":"b"},"line_number":2}}"#,
+                "\n"
+            )
+        );
     }
 
     #[test]
@@ -400,7 +466,7 @@ mod tests {
         indices.insert(4); // e
         let selector = RowSelector::Indices(indices);
 
-        let count = extract_rows_by_selector(data, &selector, false, &mut output).unwrap();
+        let count = extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 3);
         assert_eq!(output, b"a\nc\ne\n");
@@ -413,7 +479,7 @@ mod tests {
 
         let selector = RowSelector::Range(0, 100); // Request more than exists
 
-        let count = extract_rows_by_selector(data, &selector, false, &mut output).unwrap();
+        let count = extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 2); // Only 2 lines exist
     }
@@ -425,7 +491,7 @@ mod tests {
 
         let selector = RowSelector::Tail(100);
 
-        let count = extract_rows_by_selector(data, &selector, false, &mut output).unwrap();
+        let count = extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 2); // Return all lines
         assert_eq!(output, b"line1\nline2\n");
