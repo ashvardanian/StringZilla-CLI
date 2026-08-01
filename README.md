@@ -292,8 +292,8 @@ $ sz-rows -n -r 5-10 file.txt
 
 ## `sz-sort`: Sort Lines
 
-A faster, Unicode-correct `sort` built on StringZilla's `argsort`.
-Comparison is unsigned byte-wise, which for valid UTF-8 is exactly Unicode code-point order (UTF-8 preserves code-point ordering under unsigned byte comparison), so `--utf8` only governs newline handling and output matches `LC_ALL=C sort`.
+A memory-lean, Unicode-correct `sort` built on StringZilla's `argsort`.
+Comparison is unsigned byte-wise, which for valid UTF-8 is exactly Unicode code-point order, so `--utf8` only governs newline handling and output is byte-identical to `LC_ALL=C sort`.
 
 ```bash
 # Sort to stdout (replaces: sort file.txt)
@@ -314,6 +314,19 @@ $ sz-sort file.txt -o sorted.txt
 # Check whether the input is already sorted; exit 1 if not (replaces: sort -c)
 $ sz-sort -c file.txt
 ```
+
+Lines are held as packed offset and length pairs borrowing the input, about a third the footprint of a fat pointer each.
+
+```bash
+# Build a vocabulary from a multilingual news corpus: 26.8 M words, 256 MB
+$ sz-segment --split-whitespaces xlsum.csv | sz-sort -u > /dev/null
+```
+
+| Operation                     | GNU `sort --parallel=1` |           `sz-sort` |
+| ----------------------------- | ----------------------: | ------------------: |
+| Sort                          |         9.45 s, 1509 MB | __5.44 s, 1248 MB__ |
+| Case-insensitive, `-f` / `-i` |        13.38 s, 1509 MB | __8.95 s, 1248 MB__ |
+| Deduplicating, `-u`           |         9.26 s, 1509 MB | __4.99 s, 1248 MB__ |
 
 ## `sz-fuzzy-find`: Fuzzy Substring Search
 

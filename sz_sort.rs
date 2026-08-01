@@ -1,10 +1,16 @@
 //! SIMD-accelerated line sorting utility
 //!
 //! A faster, Unicode-correct replacement for `sort`, built on StringZilla's
-//! `argsort` (case-insensitive folding and reversal happen inside the kernel).
+//! `argsort` — case-insensitive folding and reversal happen inside the kernel.
 //! Comparison is unsigned byte-wise, which for valid UTF-8 is identical to Unicode
-//! code-point order (UTF-8 preserves code-point ordering under unsigned byte
-//! comparison), so `--utf8` only affects newline handling.
+//! code-point order, so `--utf8` only affects newline handling.
+//!
+//! Lines are held in a `BytesCowsAuto` borrowing the input buffer, which stores a
+//! packed offset and length per line and picks their widths from the data size and
+//! the longest line. A `Vec<&[u8]>` would spend 16 bytes per line on fat pointers
+//! against 5 or 6 for the packed entry, which on a large file dominates the input
+//! itself. `argsort_by` reaches the lines through a callback, so the kernel never
+//! needs a materialized slice array either way.
 //!
 //! # Examples
 //!
@@ -28,11 +34,13 @@
 //! sz-sort -c file.txt
 //! ```
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::process;
 
 use clap::Parser;
+use stringtape::BytesCowsAuto;
 use stringzilla::sz;
 
 mod shared;
@@ -51,10 +59,50 @@ fn line_order(a: &[u8], b: &[u8], ignore_case: bool) -> Ordering {
     }
 }
 
-/// Compute the sorted permutation of `lines` directly via StringZilla's `argsort`,
-/// which folds case and reverses inside the kernel — so the case-insensitive path
-/// no longer materializes a folded key per line.
-fn sorted_order(lines: &[&[u8]], ignore_case: bool, reverse: bool) -> Vec<sz::SortedIdx> {
+/// A re-runnable view of one buffer's lines.
+///
+/// `BytesCowsAuto::from_iter_and_data` walks its input twice — once to size the
+/// offset and length types, once to record them — so it takes a `Clone` iterable
+/// rather than a one-shot iterator. Splitting twice costs one extra SIMD pass and
+/// avoids materializing the slices at all.
+#[derive(Clone, Copy)]
+struct Lines<'a> {
+    data: &'a [u8],
+    newlines: Newlines,
+}
+
+impl<'a> IntoIterator for Lines<'a> {
+    type Item = &'a [u8];
+    type IntoIter = LineIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        LineIter::new(self.data, self.newlines)
+    }
+}
+
+/// Collect the input's lines into packed (offset, length) entries borrowing `data`.
+fn collect_lines(data: &[u8], newlines: Newlines) -> BytesCowsAuto<'_> {
+    let lines = Lines { data, newlines };
+    match BytesCowsAuto::from_iter_and_data(lines, Cow::Borrowed(data)) {
+        Ok(lines) => lines,
+        Err(error) => {
+            eprintln!("Error: could not index lines ({:?})", error);
+            process::exit(ExitCode::Error as i32);
+        }
+    }
+}
+
+/// The line at `index`, or empty when the index is out of range.
+/// Every caller derives its index from the collection's own length.
+#[inline]
+fn line_at<'a>(lines: &'a BytesCowsAuto<'a>, index: usize) -> &'a [u8] {
+    lines.get(index).unwrap_or(b"")
+}
+
+/// Compute the sorted permutation directly via StringZilla's `argsort`, which folds
+/// case and reverses inside the kernel — so the case-insensitive path never
+/// materializes a folded key per line.
+fn sorted_order(lines: &BytesCowsAuto<'_>, ignore_case: bool, reverse: bool) -> Vec<sz::SortedIdx> {
     let mut order = vec![0usize; lines.len()];
     let mut options = sz::ArgsortOptions::default();
     if ignore_case {
@@ -63,48 +111,82 @@ fn sorted_order(lines: &[&[u8]], ignore_case: bool, reverse: bool) -> Vec<sz::So
     if reverse {
         options = options.reversed();
     }
-    if let Err(status) = sz::argsort_by(|i| lines[i], &mut order, options) {
+    if let Err(status) = sz::argsort_by(|index| line_at(lines, index), &mut order, options) {
         eprintln!("Error: sort failed ({:?})", status);
-        process::exit(1);
+        process::exit(ExitCode::Error as i32);
     }
     order
 }
 
+/// Everything the writer needs, decided once from `Args`.
+#[derive(Clone, Copy)]
+struct OutputConfig<'a> {
+    json: bool,
+    terminator: Terminator,
+    /// Input name carried into the JSON envelope.
+    path: &'a str,
+}
+
+/// Write one sorted line. `position` is zero-based; records report it one-based.
+fn write_line(
+    output: &mut dyn Write,
+    config: &OutputConfig,
+    line: &[u8],
+    position: usize,
+) -> io::Result<()> {
+    if config.json {
+        output.write_all(br#"{"type":"line","data":{"path":"#)?;
+        json_text_field_to(output, config.path.as_bytes())?;
+        output.write_all(br#","lines":"#)?;
+        json_text_field_to(output, line)?;
+        write!(output, r#","line_number":{}}}}}"#, position + 1)?;
+        return output.write_all(b"\n");
+    }
+    output.write_all(line)?;
+    output.write_all(&[config.terminator.as_byte()])
+}
+
 /// Write the sorted lines, skipping adjacent fold-equal lines when `unique` is set.
 fn write_sorted(
-    lines: &[&[u8]],
+    lines: &BytesCowsAuto<'_>,
     order: &[sz::SortedIdx],
     unique: bool,
     ignore_case: bool,
+    config: &OutputConfig,
     output: &mut dyn Write,
 ) -> io::Result<()> {
-    let mut prev: Option<&[u8]> = None;
-    for &i in order {
-        let line = lines[i];
+    let mut previous: Option<&[u8]> = None;
+    let mut position = 0;
+    for &index in order {
+        let line = line_at(lines, index);
         if unique {
-            if prev.is_some_and(|p| line_order(p, line, ignore_case) == Ordering::Equal) {
+            if previous.is_some_and(|kept| line_order(kept, line, ignore_case) == Ordering::Equal) {
                 continue;
             }
-            prev = Some(line);
+            previous = Some(line);
         }
-        output.write_all(line)?;
-        output.write_all(b"\n")?;
+        write_line(output, config, line, position)?;
+        position += 1;
     }
     output.flush()
 }
 
 /// Check whether `lines` are already in sorted order. Returns the 1-based index
 /// of the first line that breaks the order, or `None` if fully sorted.
-fn check_sorted(lines: &[&[u8]], ignore_case: bool, reverse: bool) -> Option<usize> {
-    for i in 1..lines.len() {
-        let ord = line_order(lines[i - 1], lines[i], ignore_case);
+fn check_sorted(lines: &BytesCowsAuto<'_>, ignore_case: bool, reverse: bool) -> Option<usize> {
+    for index in 1..lines.len() {
+        let ordering = line_order(
+            line_at(lines, index - 1),
+            line_at(lines, index),
+            ignore_case,
+        );
         let in_order = if reverse {
-            ord != Ordering::Less
+            ordering != Ordering::Less
         } else {
-            ord != Ordering::Greater
+            ordering != Ordering::Greater
         };
         if !in_order {
-            return Some(i + 1);
+            return Some(index + 1);
         }
     }
     None
@@ -145,32 +227,44 @@ struct Args {
     /// Enable UTF-8 mode (handle Unicode newlines: CR, CRLF, NEL, LS, PS)
     #[arg(long)]
     utf8: bool,
+
+    /// Emit JSON Lines, one record per emitted line
+    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
+    json: bool,
+
+    /// NUL-terminate each output line instead of newline
+    #[arg(short = '0', long, help_heading = "Output Formats")]
+    null: bool,
+
+    /// Suppress output; with --check, report order through the exit code only
+    #[arg(short = 'q', long, requires = "check", conflicts_with = "output", help_heading = "Output Formats")]
+    quiet: bool,
 }
 
 fn main() {
     let args = Args::parse();
+    let mut stdout = io::stdout();
 
     // UTF-8 mode is implicit when case-insensitive (case folding requires UTF-8).
     let utf8_mode = args.utf8 || args.ignore_case;
 
     let input = match get_input(args.input.as_deref()) {
         Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
-        }
+        Err(error) => exit_with_error(&mut stdout, &error, "Error reading input"),
     };
     let data = input.as_bytes();
 
-    let lines: Vec<&[u8]> = LineIter::new(data, Newlines::from_utf8(utf8_mode)).collect();
+    let lines = collect_lines(data, Newlines::from_utf8(utf8_mode));
+    let name = args.input.as_deref().unwrap_or("-");
 
     if args.check {
         match check_sorted(&lines, args.ignore_case, args.reverse) {
-            None => process::exit(0),
-            Some(line_no) => {
-                let name = args.input.as_deref().unwrap_or("-");
-                eprintln!("sz-sort: {}:{}: disorder", name, line_no);
-                process::exit(1);
+            None => ExitCode::Success.exit(&mut stdout),
+            Some(line_number) => {
+                if !args.quiet {
+                    eprintln!("sz-sort: {}:{}: disorder", name, line_number);
+                }
+                ExitCode::NoResult.exit(&mut stdout);
             }
         }
     }
@@ -179,18 +273,18 @@ fn main() {
 
     let mut output = match get_output(args.output.as_deref()) {
         Ok(output) => output,
-        Err(e) => {
-            eprintln!("Error opening output: {}", e);
-            process::exit(1);
-        }
+        Err(error) => exit_with_error(&mut stdout, &error, "Error opening output"),
     };
 
-    if let Err(e) = write_sorted(&lines, &order, args.unique, args.ignore_case, &mut output) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        eprintln!("Error writing output: {}", e);
-        process::exit(1);
+    let config = OutputConfig {
+        json: args.json,
+        terminator: Terminator::from_null(args.null),
+        path: name,
+    };
+
+    if let Err(error) = write_sorted(&lines, &order, args.unique, args.ignore_case, &config, &mut output)
+    {
+        exit_on_write_error(&mut output, &error, "Error writing output");
     }
 }
 
@@ -202,15 +296,23 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn lines_of(data: &[u8]) -> Vec<&[u8]> {
-        LineIter::new(data, Newlines::Lf).collect()
+    fn text_config() -> OutputConfig<'static> {
+        OutputConfig {
+            json: false,
+            terminator: Terminator::Newline,
+            path: "-",
+        }
+    }
+
+    fn lines_of(data: &[u8]) -> BytesCowsAuto<'_> {
+        collect_lines(data, Newlines::Lf)
     }
 
     fn sort_to_string(data: &[u8], reverse: bool, unique: bool, ignore_case: bool) -> String {
         let lines = lines_of(data);
         let order = sorted_order(&lines, ignore_case, reverse);
         let mut out = Vec::new();
-        write_sorted(&lines, &order, unique, ignore_case, &mut out).unwrap();
+        write_sorted(&lines, &order, unique, ignore_case, &text_config(), &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 
