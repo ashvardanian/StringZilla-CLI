@@ -328,6 +328,39 @@ $ sz-segment --split-whitespaces xlsum.csv | sz-sort -u > /dev/null
 | Case-insensitive, `-f` / `-i` |        13.38 s, 1509 MB | __8.95 s, 1248 MB__ |
 | Deduplicating, `-u`           |         9.26 s, 1509 MB | __4.99 s, 1248 MB__ |
 
+## `sz-dedup`: Deduplicate Lines
+
+Drop repeated lines, keeping the first of each, __without sorting__.
+`uniq` collapses only adjacent duplicates and so needs sorted input, and `sort -u` gets there by discarding the original order; the idiom that actually preserves order is `awk '!seen[$0]++'`.
+
+```bash
+# Unique lines to stdout, first occurrence kept, input order preserved
+$ sz-dedup file.txt
+
+# Rewrite the file in place instead
+$ sz-dedup --in-place file.txt
+
+# Case-insensitive, with full Unicode case folding
+$ sz-dedup -i file.txt
+
+# Report whether anything was dropped, through the exit code alone
+$ sz-dedup -q file.txt
+```
+
+Lines are hashed with StringZilla's SIMD hash into an open-addressed table that holds one entry per __distinct__ line, so memory follows the number of unique lines rather than the length of the input.
+
+```bash
+$ sz-segment --split-whitespaces xlsum.csv | sz-dedup > /dev/null
+```
+
+| Tool                   |     Order |  Time and peak RSS |
+| ---------------------- | --------: | -----------------: |
+| `awk '!seen[$0]++'`    | preserved |    14.05 s, 742 MB |
+| `sort -u --parallel=1` |      lost |    9.37 s, 1509 MB |
+| `sz-dedup`             | preserved | __1.62 s, 351 MB__ |
+
+`uniq` is absent from the table because on unsorted input it returns almost every line.
+
 ## `sz-fuzzy-find`: Fuzzy Substring Search
 
 `sz-find` matches literally; `sz-fuzzy-find` adds typo tolerance, built on StringZilla's `szs` similarity kernels (CPU multicore by default, GPU optional).
