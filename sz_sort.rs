@@ -37,10 +37,9 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::io::{self, Write};
-use std::process;
 
 use clap::Parser;
-use stringtape::BytesCowsAuto;
+use stringtape::{BytesCowsAuto, StringTapeError};
 use stringzilla::sz;
 
 mod shared;
@@ -48,14 +47,47 @@ use shared::*;
 
 // region: Sorting
 
-/// Compare two lines under the active ordering. Case-insensitive comparison uses
-/// StringZilla's on-the-fly Unicode folding — no materialized keys.
-#[inline]
-fn line_order(a: &[u8], b: &[u8], ignore_case: bool) -> Ordering {
-    if ignore_case {
-        sz::utf8_uncased_order(a, b)
-    } else {
-        a.cmp(b)
+/// How lines are ordered: which comparison, and in which direction.
+#[derive(Clone, Copy)]
+struct SortOrder {
+    ignore_case: bool,
+    reverse: bool,
+}
+
+impl SortOrder {
+    /// Compare two lines. Case-insensitive comparison uses StringZilla's on-the-fly
+    /// Unicode folding — no materialized keys.
+    #[inline]
+    fn compare(self, left: &[u8], right: &[u8]) -> Ordering {
+        if self.ignore_case {
+            sz::utf8_uncased_order(left, right)
+        } else {
+            left.cmp(right)
+        }
+    }
+
+    /// Whether `left` is allowed to precede `right`, honoring the direction.
+    #[inline]
+    fn holds(self, left: &[u8], right: &[u8]) -> bool {
+        let ordering = self.compare(left, right);
+        if self.reverse {
+            ordering != Ordering::Less
+        } else {
+            ordering != Ordering::Greater
+        }
+    }
+
+    /// The same order stated for `argsort`, which folds and reverses inside the
+    /// kernel rather than through a comparator.
+    fn argsort_options(self) -> sz::ArgsortOptions {
+        let mut options = sz::ArgsortOptions::default();
+        if self.ignore_case {
+            options = options.uncased();
+        }
+        if self.reverse {
+            options = options.reversed();
+        }
+        options
     }
 }
 
@@ -81,47 +113,39 @@ impl<'a> IntoIterator for Lines<'a> {
 }
 
 /// Collect the input's lines into packed (offset, length) entries borrowing `data`.
-fn collect_lines(data: &[u8], newlines: Newlines) -> BytesCowsAuto<'_> {
-    let lines = Lines { data, newlines };
-    match BytesCowsAuto::from_iter_and_data(lines, Cow::Borrowed(data)) {
-        Ok(lines) => lines,
-        Err(error) => {
-            eprintln!("Error: could not index lines ({:?})", error);
-            process::exit(ExitCode::Error as i32);
-        }
-    }
+fn collect_lines(data: &[u8], newlines: Newlines) -> Result<BytesCowsAuto<'_>, StringTapeError> {
+    BytesCowsAuto::from_iter_and_data(Lines { data, newlines }, Cow::Borrowed(data))
 }
 
-/// The line at `index`, or empty when the index is out of range.
-/// Every caller derives its index from the collection's own length.
+/// The line at `index`. Indices come from a permutation as long as `lines`, so an
+/// index outside it is a bug here rather than a bad input.
 #[inline]
 fn line_at<'a>(lines: &'a BytesCowsAuto<'a>, index: usize) -> &'a [u8] {
-    lines.get(index).unwrap_or(b"")
+    lines.get(index).expect("permutation index within lines")
 }
 
 /// Compute the sorted permutation directly via StringZilla's `argsort`, which folds
 /// case and reverses inside the kernel — so the case-insensitive path never
 /// materializes a folded key per line.
-fn sorted_order(lines: &BytesCowsAuto<'_>, ignore_case: bool, reverse: bool) -> Vec<sz::SortedIdx> {
-    let mut order = vec![0usize; lines.len()];
-    let mut options = sz::ArgsortOptions::default();
-    if ignore_case {
-        options = options.uncased();
-    }
-    if reverse {
-        options = options.reversed();
-    }
-    if let Err(status) = sz::argsort_by(|index| line_at(lines, index), &mut order, options) {
-        eprintln!("Error: sort failed ({:?})", status);
-        process::exit(ExitCode::Error as i32);
-    }
-    order
+fn sorted_order(
+    lines: &BytesCowsAuto<'_>,
+    order: SortOrder,
+) -> Result<Vec<sz::SortedIdx>, sz::Status> {
+    let mut permutation = vec![0usize; lines.len()];
+    sz::argsort_by(
+        |index| line_at(lines, index),
+        &mut permutation,
+        order.argsort_options(),
+    )?;
+    Ok(permutation)
 }
 
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig<'a> {
     json: bool,
+    /// Drop lines equal to the one before them, which sorting made adjacent.
+    unique: bool,
     terminator: Terminator,
     /// Input name carried into the JSON envelope.
     path: &'a str,
@@ -146,50 +170,35 @@ fn write_line(
     output.write_all(&[config.terminator.as_byte()])
 }
 
-/// Write the sorted lines, skipping adjacent fold-equal lines when `unique` is set.
+/// Write the lines in permutation order, dropping adjacent equals under `--unique`.
 fn write_sorted(
     lines: &BytesCowsAuto<'_>,
-    order: &[sz::SortedIdx],
-    unique: bool,
-    ignore_case: bool,
+    permutation: &[sz::SortedIdx],
+    order: SortOrder,
     config: &OutputConfig,
     output: &mut dyn Write,
 ) -> io::Result<()> {
     let mut previous: Option<&[u8]> = None;
-    let mut position = 0;
-    for &index in order {
+    let mut written = 0;
+    for &index in permutation {
         let line = line_at(lines, index);
-        if unique {
-            if previous.is_some_and(|kept| line_order(kept, line, ignore_case) == Ordering::Equal) {
-                continue;
-            }
-            previous = Some(line);
+        if config.unique && previous.is_some_and(|kept| order.compare(kept, line) == Ordering::Equal)
+        {
+            continue;
         }
-        write_line(output, config, line, position)?;
-        position += 1;
+        previous = Some(line);
+        write_line(output, config, line, written)?;
+        written += 1;
     }
     output.flush()
 }
 
 /// Check whether `lines` are already in sorted order. Returns the 1-based index
 /// of the first line that breaks the order, or `None` if fully sorted.
-fn check_sorted(lines: &BytesCowsAuto<'_>, ignore_case: bool, reverse: bool) -> Option<usize> {
-    for index in 1..lines.len() {
-        let ordering = line_order(
-            line_at(lines, index - 1),
-            line_at(lines, index),
-            ignore_case,
-        );
-        let in_order = if reverse {
-            ordering != Ordering::Less
-        } else {
-            ordering != Ordering::Greater
-        };
-        if !in_order {
-            return Some(index + 1);
-        }
-    }
-    None
+fn check_sorted(lines: &BytesCowsAuto<'_>, order: SortOrder) -> Option<usize> {
+    (1..lines.len())
+        .find(|&index| !order.holds(line_at(lines, index - 1), line_at(lines, index)))
+        .map(|index| index + 1)
 }
 
 // endregion: Sorting
@@ -254,11 +263,21 @@ fn main() {
     };
     let data = input.as_bytes();
 
-    let lines = collect_lines(data, Newlines::from_utf8(utf8_mode));
+    let order = SortOrder {
+        ignore_case: args.ignore_case,
+        reverse: args.reverse,
+    };
+    let lines = match collect_lines(data, Newlines::from_utf8(utf8_mode)) {
+        Ok(lines) => lines,
+        Err(error) => {
+            eprintln!("Error indexing lines: {:?}", error);
+            ExitCode::Error.exit(&mut stdout);
+        }
+    };
     let name = args.input.as_deref().unwrap_or("-");
 
     if args.check {
-        match check_sorted(&lines, args.ignore_case, args.reverse) {
+        match check_sorted(&lines, order) {
             None => ExitCode::Success.exit(&mut stdout),
             Some(line_number) => {
                 if !args.quiet {
@@ -269,7 +288,13 @@ fn main() {
         }
     }
 
-    let order = sorted_order(&lines, args.ignore_case, args.reverse);
+    let permutation = match sorted_order(&lines, order) {
+        Ok(permutation) => permutation,
+        Err(status) => {
+            eprintln!("Error sorting: {:?}", status);
+            ExitCode::Error.exit(&mut stdout);
+        }
+    };
 
     let mut output = match get_output(args.output.as_deref()) {
         Ok(output) => output,
@@ -278,12 +303,12 @@ fn main() {
 
     let config = OutputConfig {
         json: args.json,
+        unique: args.unique,
         terminator: Terminator::from_null(args.null),
         path: name,
     };
 
-    if let Err(error) = write_sorted(&lines, &order, args.unique, args.ignore_case, &config, &mut output)
-    {
+    if let Err(error) = write_sorted(&lines, &permutation, order, &config, &mut output) {
         exit_on_write_error(&mut output, &error, "Error writing output");
     }
 }
@@ -296,23 +321,28 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn text_config() -> OutputConfig<'static> {
+    fn text_config(unique: bool) -> OutputConfig<'static> {
         OutputConfig {
             json: false,
+            unique,
             terminator: Terminator::Newline,
             path: "-",
         }
     }
 
     fn lines_of(data: &[u8]) -> BytesCowsAuto<'_> {
-        collect_lines(data, Newlines::Lf)
+        collect_lines(data, Newlines::Lf).unwrap()
     }
 
     fn sort_to_string(data: &[u8], reverse: bool, unique: bool, ignore_case: bool) -> String {
         let lines = lines_of(data);
-        let order = sorted_order(&lines, ignore_case, reverse);
+        let order = SortOrder {
+            ignore_case,
+            reverse,
+        };
+        let permutation = sorted_order(&lines, order).unwrap();
         let mut out = Vec::new();
-        write_sorted(&lines, &order, unique, ignore_case, &text_config(), &mut out).unwrap();
+        write_sorted(&lines, &permutation, order, &text_config(unique), &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -371,25 +401,25 @@ mod tests {
     #[test]
     fn reports_first_unsorted_line() {
         let sorted = lines_of(b"a\nb\nc\n");
-        assert_eq!(check_sorted(&sorted, false, false), None);
+        assert_eq!(check_sorted(&sorted, SortOrder { ignore_case: false, reverse: false }), None);
 
         let unsorted = lines_of(b"a\nc\nb\n");
-        assert_eq!(check_sorted(&unsorted, false, false), Some(3));
+        assert_eq!(check_sorted(&unsorted, SortOrder { ignore_case: false, reverse: false }), Some(3));
     }
 
     #[test]
     fn accepts_descending_order_in_check() {
         let desc = lines_of(b"c\nb\na\n");
-        assert_eq!(check_sorted(&desc, false, true), None);
+        assert_eq!(check_sorted(&desc, SortOrder { ignore_case: false, reverse: true }), None);
     }
 
     #[test]
     fn checks_sorted_order_ignoring_case() {
         // "Apple" < "BANANA" < "cherry" under folding, regardless of input casing.
         let folded = lines_of(b"Apple\nBANANA\ncherry\n");
-        assert_eq!(check_sorted(&folded, true, false), None);
+        assert_eq!(check_sorted(&folded, SortOrder { ignore_case: true, reverse: false }), None);
         let not_folded = lines_of(b"BANANA\nApple\n");
-        assert_eq!(check_sorted(&not_folded, true, false), Some(2));
+        assert_eq!(check_sorted(&not_folded, SortOrder { ignore_case: true, reverse: false }), Some(2));
     }
 
     #[test]
