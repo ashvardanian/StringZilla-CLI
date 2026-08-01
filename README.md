@@ -174,25 +174,42 @@ Function signatures are normalized (whitespace collapsed) and categorized as dec
 
 ## `sz-count`: Word Count
 
-The `wc` utility on Linux can be used to count the number of lines, words, and bytes in a file.
-Using SIMD-accelerated character and character-set search, StringZilla can be noticeably faster, even with slow SSDs.
+The `wc` utility on Linux counts lines, words, and bytes.
+A word is a maximal run of non-whitespace, exactly as in `wc -w`; `sz-count` uses the same rule, so it is a drop-in replacement rather than a different measurement.
 Output is a labelled, aligned table; pass `--utf8` to also count Unicode code points, or `-H` for human-readable suffixes.
 
+The comparison worth making is against `wc` in a __UTF-8 locale__, because that is the only configuration computing the same thing.
+GNU `wc` switches behavior on `LC_CTYPE`: in the C locale it walks bytes and gates word starts on `isprint`, so an entire run of non-ASCII text opens no word at all.
+
 ```bash
-$ time wc enwik9.txt
-  13147025 129348346 1000000000 enwik9.txt
+$ time LC_ALL=C.UTF-8 wc -lwmc xlsum.csv   # ✅ correct under a UTF-8 locale
+    51627  26804246 167899744 256000000 xlsum.csv
+real    0m2.037s
 
-real    0m3.562s
-user    0m3.470s
-sys     0m0.092s
+$ time sz-count --utf8 xlsum.csv           # ✅ same words and characters
+                                          lines      words       bytes       chars
+xlsum.csv                                51,629 26,804,246 256,000,000 167,899,744
+real    0m0.337s
 
-$ time sz-count enwik9.txt
-                                  lines   words   bytes
-enwik9.txt                     13147025 139132610 1000000000 # word count differs due to stricter ASCII whitespace handling
+$ time LC_ALL=C wc -lwc xlsum.csv          # ❌ non-ASCII runs open no word at all
+    51627  16806679 256000000 xlsum.csv
+real    0m2.058s
+```
 
-real    0m1.165s
-user    0m1.121s
-sys     0m0.044s
+Unlike `wc`, enabling Unicode costs nothing here — `--utf8` runs at the same speed as the default.
+Line counts diverge too, because `wc` counts terminators where `sz-count` counts lines, and `--posix` restores `wc`'s reading exactly:
+
+| Lines counted in                           | `wc` | `sz-count` | `--utf8` | `--posix` |
+| ------------------------------------------ | ---: | ---------: | -------: | --------: |
+| `a\nb`, no final newline                   |    1 |          2 |        2 |         1 |
+| Text broken by CR, VT, FF, NEL, LS, and PS |    1 |          1 |        7 |         1 |
+
+What `--posix` deliberately does not restore is the C-locale word gate above, since dropping non-ASCII words is a bug rather than a convention.
+For scripting, `-l`, `-w`, `-c`, `-m`, and `-L` select individual fields with `wc`'s own meanings, and a single selector over a single input prints a bare integer:
+
+```bash
+$ lines=$(sz-count -l xlsum.csv)   # 51628 — no header, no commas, no padding
+$ sz-count --json xlsum.csv        # JSON Lines, bare integers, untruncated paths
 ```
 
 ## `sz-split`: Split File into Smaller Ones
