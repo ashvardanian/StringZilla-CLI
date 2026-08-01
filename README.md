@@ -22,6 +22,7 @@ It provides the following subcommands:
 - `sz-rows`: extract rows by index or range; replaces `sed -n`, `head`, `tail`, and `awk 'NR==N'`
 - `sz-sort`: sort lines; Unicode-correct and `sort -u`-style deduplication
 - `sz-fuzzy-find`: exact + fuzzy substring search (Smith-Waterman / Levenshtein) with keyboard & phonetic scoring, on CPU or GPU
+- `sz-segment`: split text into Unicode grapheme clusters, words, or sentences — UAX-29 and UAX-14, with no ICU dependency
 
 ## Installation
 
@@ -431,3 +432,56 @@ $ CUDAHOSTCXX=g++-14 cargo install --git https://github.com/ashvardanian/StringZ
 ```
 
 With `-k 0`, `sz-fuzzy-find` degrades to exact substring search, matching `sz-find`.
+
+## `sz-segment`: Unicode Text Segmentation
+
+Splitting text into characters, words, or sentences the way Unicode defines them is something no standard command-line tool does.
+Coreutils has nothing, ICU ships `genbrk` and `uconv` but neither segments text, and the NLP libraries that do are abbreviation heuristics rather than the standard.
+`sz-segment` exposes StringZilla's UAX-29 and UAX-14 kernels directly.
+
+```bash
+# One sentence per line
+$ sz-segment --sentences book.txt
+
+# Count user-perceived characters, emoji sequences included
+$ sz-segment --graphemes -c emoji.txt
+
+# Byte offsets alongside each segment, for citing back into the source
+$ sz-segment --sentences --offsets doc.txt
+
+# Pack sentences into 2 KB records for an embedding pipeline
+$ sz-segment --sentences --chunk-bytes 2000 --json corpus.txt
+```
+
+Seven modes, each named for the iterator behind it, over 256 MB of multilingual news.
+Single-threaded, warm cache, and CPU-bound — user time equals wall time in every row, against a 0.04 s floor to read the file at all:
+
+| Mode                  | Yields                                        |    Segments | Throughput |
+| --------------------- | --------------------------------------------- | ----------: | ---------: |
+| `--graphemes`         | UAX-29 user-perceived characters              | 158,925,696 |   197 MB/s |
+| `--wordbreaks`        | UAX-29 word boundaries, __tiling__            |  62,657,050 |   308 MB/s |
+| `--sentences`         | UAX-29 sentences                              |   1,399,562 |   522 MB/s |
+| `--linebreaks`        | UAX-14 wrap opportunities, __not lines__      |  29,870,335 |   221 MB/s |
+| `--split-whitespaces` | Runs between the 25 Unicode spaces            |  26,804,246 |  1280 MB/s |
+| `--split-delimiters`  | Runs between punctuation, symbols, separators |  27,445,127 |   465 MB/s |
+| `--split-newlines`    | Runs between hard line terminators            |      51,629 |   at floor |
+
+Cost tracks the number of boundaries, not the byte count: splitting on newlines finds so few that it finishes within the read floor and no throughput can be attributed to it.
+
+The tiling modes assign every byte to exactly one segment, so `--wordbreaks` returns whitespace and punctuation as segments of their own — a word count has to filter for segments containing a letter or digit.
+`--linebreaks` reports where a renderer *may* wrap, so use `--split-newlines` to split on actual terminators.
+
+Splitting on whitespace is the one job the shell already has tools for, and they get it wrong on anything but ASCII:
+
+```bash
+$ printf 'a\u3000b\u00a0c d\n' | tr -s '[:space:]' '\n'             # ❌ 2 tokens
+$ printf 'a\u3000b\u00a0c d\n' | awk '{print NF}'                   # ❌ 2 tokens
+$ printf 'a\u3000b\u00a0c d\n' | sz-segment --split-whitespaces -c  # ✅ 4 tokens
+```
+
+Segments frequently contain newlines, so the default one-per-line output is lossy — pass `-0` for NUL-delimited records, or `--json` for JSON Lines carrying offsets.
+`--chunk-bytes N` packs consecutive segments into records of at most N bytes without splitting one, and is defined only over the tiling modes, since the `--split-*` modes discard separators that a packed span would reinsert.
+A segment larger than the budget is emitted whole.
+
+UAX-29 sentences are the standard applied deterministically, with no dictionary: `"Dr. Smith went to Washington."` breaks after `"Dr. "`, and rule SB4 breaks at a hard wrap.
+Both match ICU exactly, and both are places `punkt` or `pysbd` read more naturally on English prose — the trade is spec-correct segmentation across every script, not better English.

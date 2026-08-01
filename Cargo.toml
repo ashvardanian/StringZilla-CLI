@@ -72,3 +72,7 @@ path = "sz_sort.rs"
 [[bin]]
 name = "sz-fuzzy-find"
 path = "sz_fuzzy_find.rs"
+
+[[bin]]
+name = "sz-segment"
+path = "sz_segment.rs"
