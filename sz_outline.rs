@@ -184,10 +184,6 @@ struct Args {
     #[arg(short = 't', long = "type")]
     file_type: Option<String>,
 
-    /// Enable UTF-8 validation
-    #[arg(long)]
-    utf8: bool,
-
     /// Emit JSON Lines, flat records linked by parent_line
     #[arg(long, help_heading = "Output Formats")]
     json: bool,
@@ -1103,6 +1099,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn takes_no_utf8_flag() {
+        // Both parsers break on LF, so there is no Unicode newline set to ask for: a
+        // `--utf8` that changed line numbering on U+2028 would be a hazard, not a feature.
+        let Err(error) = Args::try_parse_from(["sz-outline", "--utf8", "README.md"]) else {
+            panic!("--utf8 must be rejected");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
 
     #[test]
     fn parses_markdown_heading_levels() {

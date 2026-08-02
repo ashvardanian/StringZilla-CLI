@@ -8,6 +8,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
+use std::num::{NonZeroUsize, ParseIntError};
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::process;
@@ -716,6 +717,21 @@ pub fn write_grouped_number(output: &mut dyn Write, value: usize) -> io::Result<
 }
 
 // endregion: Machine-Readable Output
+
+// region: Argument Parsing
+
+/// Parse a count that has to be at least 1. Clap's stock [`NonZeroUsize`] parser answers
+/// "number would be zero for non-zero type", naming a Rust type where the bound belongs.
+/// Every other input keeps the stock wording, so only the zero case reads differently.
+#[allow(dead_code)]
+pub fn parse_at_least_one(value: &str) -> Result<NonZeroUsize, String> {
+    let count: usize = value
+        .parse()
+        .map_err(|error: ParseIntError| error.to_string())?;
+    NonZeroUsize::new(count).ok_or_else(|| "must be at least 1".to_string())
+}
+
+// endregion: Argument Parsing
 
 // region: Process Exit Conventions
 

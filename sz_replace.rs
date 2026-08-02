@@ -66,10 +66,6 @@ struct Args {
     #[arg(short = 'n', long = "dry-run")]
     dry_run: bool,
 
-    /// Enable UTF-8 mode (validate input)
-    #[arg(long)]
-    utf8: bool,
-
     /// Emit a JSON Lines summary of the replacement; requires -o, --in-place, or -n
     #[arg(long, requires = "sink", help_heading = "Output Formats")]
     json: bool,
@@ -192,10 +188,11 @@ fn main() {
                 .unwrap_or_else(|error| {
                     exit_on_write_error(&mut *output, &error, "Error writing output")
                 });
+            // A pipe closing during the flush ends the run where one closing during the
+            // write does, and just as quietly: `-c` reports the whole input's count, and
+            // a run a departed reader cut short has none to give.
             if let Err(error) = output.flush() {
-                if error.kind() != io::ErrorKind::BrokenPipe {
-                    exit_with_error(&mut stdout, &error, "Error flushing output");
-                }
+                exit_on_write_error(&mut *output, &error, "Error flushing output");
             }
             count
         }
@@ -301,6 +298,17 @@ mod tests {
         // Should replace first match, then continue after it (non-overlapping)
         assert_eq!(count, 1);
         assert_eq!(result, b"ba");
+    }
+
+    #[test]
+    fn takes_no_utf8_flag() {
+        // Replacement is a byte-level substitution with no line or codepoint semantics to switch,
+        // and `-i` already folds the full Unicode range, so there is no UTF-8 mode left to ask for.
+        let Err(error) = Args::try_parse_from(["sz-replace", "--utf8", "a", "b", "file.txt"])
+        else {
+            panic!("--utf8 must be rejected");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

@@ -611,7 +611,6 @@ struct ContextState {
     behind: VecDeque<ContextLine>,
     pending_after: usize,
     last_printed_line: Option<usize>,
-    need_separator: bool,
 }
 
 impl ContextState {
@@ -622,8 +621,22 @@ impl ContextState {
             behind: VecDeque::with_capacity(lines.before),
             pending_after: 0,
             last_printed_line: None,
-            need_separator: false,
         }
+    }
+
+    /// Whether the line still has to be printed, given how far the output has reached.
+    #[inline]
+    fn is_unprinted(&self, line_number: usize) -> bool {
+        self.last_printed_line.is_none_or(|last| line_number > last)
+    }
+
+    /// The first look-behind line a group opening here would print, absent when the ring
+    /// holds none still unprinted. Entries run forward, so the first is the oldest.
+    fn first_unprinted_behind(&self) -> Option<usize> {
+        self.behind
+            .iter()
+            .map(|buffered| buffered.line_number)
+            .find(|line_number| self.is_unprinted(*line_number))
     }
 }
 
@@ -842,23 +855,25 @@ fn print_context_window(
             progress.match_count += 1;
             emitter.file_heading(&mut progress.printed_heading)?;
 
-            // A gap since the last line printed opens a group, and `grep -C` divides
-            // groups with `--`.
+            // The group opens at its own first line — the oldest look-behind line still
+            // unprinted, or the matching line when the ring holds none — and a gap
+            // between that line and the last printed one divides the two with `--`,
+            // which is where `grep -C` writes its divider.
+            let group_start = progress
+                .context
+                .first_unprinted_behind()
+                .unwrap_or(line_number);
             let follows_a_gap = progress
                 .context
                 .last_printed_line
-                .is_some_and(|last| line_number > last + 1);
-            if follows_a_gap && progress.context.need_separator {
+                .is_some_and(|last| group_start > last + 1);
+            if follows_a_gap {
                 emitter.group_separator()?;
             }
 
             // Print the buffered look-behind lines, sliced from the current window.
             for buffered in progress.context.behind.iter() {
-                if progress
-                    .context
-                    .last_printed_line
-                    .is_none_or(|last| buffered.line_number > last)
-                {
+                if progress.context.is_unprinted(buffered.line_number) {
                     emitter.line(LineRecord {
                         line: &window[buffered.span.start..buffered.span.end],
                         line_number: buffered.line_number,
@@ -880,7 +895,6 @@ fn print_context_window(
             )?;
             progress.context.last_printed_line = Some(line_number);
             progress.context.pending_after = progress.context.lines.after;
-            progress.context.need_separator = true;
         } else if progress.context.pending_after > 0 {
             emitter.line(LineRecord {
                 line,
@@ -950,8 +964,10 @@ fn search_multiline(
     let context = path.context();
     // Groups are divided only where surrounding lines are printed, as in line mode.
     let separates_groups = context.before > 0 || context.after > 0;
+    // Reborrowed rather than moved, so the sink is still reachable for the closing
+    // JSON record once every region is printed.
     let mut emitter = path.printer().map(|printer| Emitter {
-        output,
+        output: &mut *output,
         filename,
         search,
         printer,
@@ -981,6 +997,9 @@ fn search_multiline(
             }
             continue;
         };
+        // The same once-per-file header line mode writes, so `--heading` names the file
+        // and `--json` opens the record a `{"type":"end"}` will close.
+        emitter.file_heading(&mut progress.printed_heading)?;
 
         // Find line boundaries around the match
         let line_start = rfind(&data[..found.offset], b"\n").map_or(0, |offset| offset + 1);
@@ -1056,6 +1075,8 @@ fn search_multiline(
             last_printed_end = Some(region_end);
         }
     }
+
+    print_json_end(output, filename, path, &progress)?;
 
     // `-m` caps this file, and reaching the cap ends the walk over the remaining files —
     // but only with input still unread, which is where the line paths stop as well.
@@ -1192,14 +1213,20 @@ impl Emitter<'_, '_> {
             .highlight
             .then(|| highlight_line(record.line, search, printer, highlight_buffer))
             .flatten();
-        self.line(LineRecord {
-            line: highlighted.unwrap_or(record.line),
-            ..record
-        })
+        // The colored bytes travel beside the record rather than inside it: `--column`
+        // resolves against the line as it was found, and an escape code spliced in ahead
+        // of a match would shift that column by its own length.
+        self.write_line(record, highlighted.unwrap_or(record.line))
     }
 
     /// Print one line with the prefixes its format asks for.
     fn line(&mut self, record: LineRecord) -> io::Result<()> {
+        self.write_line(record, record.line)
+    }
+
+    /// Print `body` — the line itself, or its highlighted form — behind the prefixes the
+    /// format asks for, resolving every position against `record.line`.
+    fn write_line(&mut self, record: LineRecord, body: &[u8]) -> io::Result<()> {
         let (filename, search, printer) = (self.filename, self.search, self.printer);
         let colors = printer.colors;
         // A context line is set off by `-` where a matching line uses `:`.
@@ -1222,14 +1249,14 @@ impl Emitter<'_, '_> {
                         if printer.only_matching {
                             self.output.write_all(found.text(record.line))?;
                         } else {
-                            self.write_trimmed(record.line)?;
+                            self.write_trimmed(body)?;
                         }
                         self.output.write_all(b"\n")?;
                     }
                 } else if record.is_match {
                     // An inverted match holds no position, so the line prints at column one.
                     write!(self.output, "{}:{}:1:", filename, record.line_number)?;
-                    self.write_trimmed(record.line)?;
+                    self.write_trimmed(body)?;
                     self.output.write_all(b"\n")?;
                 }
                 Ok(())
@@ -1270,7 +1297,7 @@ impl Emitter<'_, '_> {
                         colors.byte_offset, record.byte_offset, colors.reset, separator
                     )?;
                 }
-                self.write_content(record)?;
+                self.write_content(record, body)?;
                 self.output.write_all(b"\n")
             }
         }
@@ -1336,10 +1363,10 @@ impl Emitter<'_, '_> {
     }
 
     /// Write a line's content, reduced to the matches themselves under `-o`.
-    fn write_content(&mut self, record: LineRecord) -> io::Result<()> {
+    fn write_content(&mut self, record: LineRecord, body: &[u8]) -> io::Result<()> {
         let (search, printer) = (self.search, self.printer);
         if !(printer.only_matching && record.is_match && printer.locates_matches) {
-            return self.write_trimmed(record.line);
+            return self.write_trimmed(body);
         }
         for (index, found) in search.matcher.matches(record.line).enumerate() {
             if index > 0 {
@@ -2136,6 +2163,29 @@ mod tests {
     }
 
     #[test]
+    fn reports_the_same_column_with_and_without_color() {
+        // Two matches on one line, so the colored form carries an escape code ahead of
+        // each. `grep -bo` puts the first at byte 5, which is column 6.
+        let data = b"lead error one error two\n";
+        let search = make_search(b"error");
+        let mut printer = make_printer();
+        printer.column = true;
+
+        let (plain, ..) = search_whole(data, &search, &SearchPath::Print(printer));
+        assert_eq!(plain, b"6:lead error one error two\n");
+
+        printer.colors = Colors::enabled();
+        printer.highlight = true;
+        let (colored, ..) = search_whole(data, &search, &SearchPath::Print(printer));
+        let colored = String::from_utf8(colored).unwrap();
+        assert!(
+            colored.starts_with("\x1b[32m6\x1b[0m:"),
+            "column resolved against the highlighted line: {:?}",
+            colored
+        );
+    }
+
+    #[test]
     fn matches_across_newlines_in_multiline_mode() {
         let data = b"hello\nworld\nfoo bar\n";
         let mut search = make_search(b"hello\nworld");
@@ -2232,22 +2282,97 @@ mod tests {
     }
 
     #[test]
-    fn joins_multiline_groups_that_adjoin() {
+    fn joins_groups_that_adjoin() {
         // The after-context of the first match and the before-context of the second are
         // consecutive lines, so the whole file prints as one group, as `grep -C 1` does.
-        // Line mode measures the gap from the matching line rather than from the group's
-        // first line, and divides here where `grep` does not.
+        // Line mode and multiline mode answer alike.
         let data = b"alpha\nbeta MATCH one\ngamma\ndelta\nepsilon MATCH two\nzeta\n";
         let mut search = make_search(b"MATCH");
-        search.multiline = true;
         let context = Context {
             before: 1,
             after: 1,
         };
         let path = SearchPath::PrintContext(make_printer(), context);
 
+        let (by_line, ..) = search_whole(data, &search, &path);
+        search.multiline = true;
         let (by_region, ..) = search_whole(data, &search, &path);
         assert_eq!(by_region, data);
+        assert_eq!(by_line, by_region);
+    }
+
+    #[test]
+    fn divides_line_groups_exactly_where_grep_does() {
+        // Every expectation below is GNU grep 3.11's own output for the same input and
+        // the same `-B`/`-A` widths. A group opens at the first line it will print, not
+        // at its matching line, so groups whose surrounding lines adjoin take no divider.
+        let two_apart: &[u8] = b"one\ntwo MATCH\nthree\nfour MATCH\nfive\n";
+        let three_apart: &[u8] = b"one\ntwo MATCH\nthree\nfour\nfive MATCH\nsix\n";
+        let four_apart: &[u8] = b"one\ntwo MATCH\nthree\nfour\nfive\nsix MATCH\nseven\n";
+        let at_both_ends: &[u8] = b"one MATCH\ntwo\nthree\nfour MATCH\nfive\n";
+        let adjacent: &[u8] = b"one\ntwo MATCH\nthree MATCH\nfour\n";
+        let far_apart: &[u8] =
+            b"one\ntwo\nthree MATCH\nfour\nfive\nsix\nseven MATCH\neight\nnine\n";
+
+        let cases: [(&[u8], usize, usize, &[u8]); 11] = [
+            // Adjoining contexts print as one block.
+            (two_apart, 1, 0, b"one\ntwo MATCH\nthree\nfour MATCH\n"),
+            (two_apart, 0, 1, b"two MATCH\nthree\nfour MATCH\nfive\n"),
+            (
+                three_apart,
+                1,
+                1,
+                b"one\ntwo MATCH\nthree\nfour\nfive MATCH\nsix\n",
+            ),
+            (
+                at_both_ends,
+                1,
+                1,
+                b"one MATCH\ntwo\nthree\nfour MATCH\nfive\n",
+            ),
+            // Overlapping contexts print each line once.
+            (adjacent, 2, 2, b"one\ntwo MATCH\nthree MATCH\nfour\n"),
+            (
+                far_apart,
+                2,
+                2,
+                b"one\ntwo\nthree MATCH\nfour\nfive\nsix\nseven MATCH\neight\nnine\n",
+            ),
+            // A line falling between the groups divides them.
+            (three_apart, 1, 0, b"one\ntwo MATCH\n--\nfour\nfive MATCH\n"),
+            (
+                four_apart,
+                1,
+                1,
+                b"one\ntwo MATCH\nthree\n--\nfive\nsix MATCH\nseven\n",
+            ),
+            (at_both_ends, 1, 0, b"one MATCH\n--\nthree\nfour MATCH\n"),
+            (
+                at_both_ends,
+                0,
+                1,
+                b"one MATCH\ntwo\n--\nfour MATCH\nfive\n",
+            ),
+            (
+                far_apart,
+                1,
+                1,
+                b"two\nthree MATCH\nfour\n--\nsix\nseven MATCH\neight\n",
+            ),
+        ];
+
+        for (data, before, after, expected) in cases {
+            let search = make_search(b"MATCH");
+            let path = SearchPath::PrintContext(make_printer(), Context { before, after });
+            let (printed, ..) = search_whole(data, &search, &path);
+            assert_eq!(
+                String::from_utf8_lossy(&printed),
+                String::from_utf8_lossy(expected),
+                "-B {} -A {}",
+                before,
+                after
+            );
+        }
     }
 
     #[test]
@@ -2379,6 +2504,45 @@ mod tests {
         let text = String::from_utf8(streamed).unwrap();
         assert_eq!(text.matches(r#""type":"begin""#).count(), 1);
         assert_eq!(text.matches(r#""type":"end""#).count(), 1);
+    }
+
+    #[test]
+    fn opens_and_closes_one_json_record_per_multiline_file() {
+        // A `--json` consumer reads one record shape, whether or not `-U` was given.
+        let data = b"alpha\nbeta MATCH one\ngamma\ndelta MATCH two\n";
+        let mut printer = make_printer();
+        printer.output_format = OutputFormat::Json;
+        let path = SearchPath::Print(printer);
+        let mut search = make_search(b"MATCH");
+
+        let record_types = |printed: Vec<u8>| -> Vec<String> {
+            String::from_utf8(printed)
+                .unwrap()
+                .lines()
+                .map(|record| record.split('"').nth(3).unwrap().to_string())
+                .collect()
+        };
+        let by_line = record_types(search_whole(data, &search, &path).0);
+        search.multiline = true;
+        let by_region = record_types(search_whole(data, &search, &path).0);
+
+        assert_eq!(by_region, ["begin", "match", "match", "end"]);
+        assert_eq!(by_region, by_line);
+    }
+
+    #[test]
+    fn names_the_file_once_per_multiline_run() {
+        // `--heading` prints the name as a header rather than as a per-line prefix, and
+        // multiline mode reads the same writer, so the header appears there too.
+        let data = b"alpha\nbeta MATCH one\ngamma\ndelta MATCH two\n";
+        let mut printer = make_printer();
+        printer.output_format = OutputFormat::Heading;
+        let path = SearchPath::Print(printer);
+        let mut search = make_search(b"MATCH");
+        search.multiline = true;
+
+        let (printed, ..) = search_whole(data, &search, &path);
+        assert_eq!(printed, b"test.txt\nbeta MATCH one\ndelta MATCH two\n");
     }
 
     #[test]

@@ -52,11 +52,11 @@ struct Args {
     rows: Option<String>,
 
     /// Extract last N lines (like tail -n)
-    #[arg(long = "tail", conflicts_with_all = ["rows", "every"])]
+    #[arg(long = "tail", value_parser = parse_at_least_one, conflicts_with_all = ["rows", "every"])]
     tail: Option<NonZeroUsize>,
 
     /// Extract every Nth line
-    #[arg(long = "every", conflicts_with_all = ["rows", "tail"])]
+    #[arg(long = "every", value_parser = parse_at_least_one, conflicts_with_all = ["rows", "tail"])]
     every: Option<NonZeroUsize>,
 
     /// Show line numbers in output
@@ -597,6 +597,30 @@ mod tests {
             destination[..taken].copy_from_slice(&self.data[self.position..self.position + taken]);
             self.position += taken;
             Ok(taken)
+        }
+    }
+
+    #[test]
+    fn rejects_a_zero_count_without_naming_a_rust_type() {
+        for flag in ["--tail", "--every"] {
+            let Err(error) = Args::try_parse_from(["sz-rows", flag, "0"]) else {
+                panic!("{} 0 must be rejected", flag);
+            };
+            let rendered = error.to_string();
+            assert!(rendered.contains("must be at least 1"), "{}", rendered);
+            assert!(!rendered.contains("non-zero type"), "{}", rendered);
+            assert_eq!(error.exit_code(), 2, "{}", rendered);
+
+            // Only zero reads differently; every other rejection keeps clap's wording.
+            let Err(error) = Args::try_parse_from(["sz-rows", flag, "abc"]) else {
+                panic!("{} abc must be rejected", flag);
+            };
+            assert!(
+                error.to_string().contains("invalid digit found in string"),
+                "{}",
+                error
+            );
+            assert!(Args::try_parse_from(["sz-rows", flag, "1"]).is_ok());
         }
     }
 

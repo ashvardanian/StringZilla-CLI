@@ -38,7 +38,7 @@ struct Args {
     prefix: String,
 
     /// Number of lines per output file
-    #[arg(short = 'l', long, required = true)]
+    #[arg(short = 'l', long, value_parser = parse_at_least_one, required = true)]
     lines: NonZeroUsize,
 
     /// Enable UTF-8 mode (split on Unicode newlines: CR, CRLF, NEL, LS, PS; chunk lines end with LF)
@@ -46,7 +46,7 @@ struct Args {
     utf8: bool,
 
     /// Suffix length (default: 2, gives aa, ab, ac...)
-    #[arg(long, default_value = "2")]
+    #[arg(long, value_parser = parse_at_least_one, default_value = "2")]
     suffix_length: NonZeroUsize,
 
     /// Emit a JSON Lines manifest of the files written, one record each
@@ -267,6 +267,32 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn rejects_a_zero_count_without_naming_a_rust_type() {
+        let zero_lines = vec!["sz-split", "-l", "0"];
+        let zero_suffix = vec!["sz-split", "-l", "1", "--suffix-length", "0"];
+        for arguments in [zero_lines, zero_suffix] {
+            let Err(error) = Args::try_parse_from(&arguments) else {
+                panic!("{:?} must be rejected", arguments);
+            };
+            let rendered = error.to_string();
+            assert!(rendered.contains("must be at least 1"), "{}", rendered);
+            assert!(!rendered.contains("non-zero type"), "{}", rendered);
+            assert_eq!(error.exit_code(), 2, "{}", rendered);
+        }
+
+        // Only zero reads differently; every other rejection keeps clap's wording.
+        let Err(error) = Args::try_parse_from(["sz-split", "-l", "abc"]) else {
+            panic!("-l abc must be rejected");
+        };
+        assert!(
+            error.to_string().contains("invalid digit found in string"),
+            "{}",
+            error
+        );
+        assert!(Args::try_parse_from(["sz-split", "-l", "1"]).is_ok());
+    }
 
     #[test]
     fn generates_aa_ab_suffix_sequence() {
