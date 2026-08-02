@@ -21,6 +21,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::num::NonZeroUsize;
 
 use clap::Parser;
+use stringzilla::sz::StringZillableBinary;
 
 mod shared;
 use shared::*;
@@ -69,6 +70,13 @@ fn generate_suffix(index: usize, length: usize) -> Option<String> {
     (remaining == 0).then_some(suffix)
 }
 
+/// Largest slice handed to one `write`. A whole chunk in one call is the slowest option
+/// measured on 2026-08-02 over a 5 GB input — 2.96 s of write time against 2.44 s for 1 MB
+/// pieces — because the kernel faults the mapped source in and dirties the page cache in
+/// one indivisible span. Below 64 KB the syscalls start to tell, and above 1 MB nothing
+/// further is gained.
+const WRITE_PIECE_BYTES: usize = 1 << 20;
+
 /// How the input is cut into chunk files, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct SplitConfig<'a> {
@@ -89,6 +97,10 @@ struct OpenChunk {
     lines: usize,
     /// Bytes written into it.
     bytes: usize,
+    /// Whether the bytes written so far end with a newline. The range path copies the
+    /// input verbatim, so an unterminated final line reaches the chunk unterminated, and
+    /// [`close_chunk`] is where the output's trailing newline is restored.
+    ends_with_newline: bool,
     /// The chunk file itself.
     file: BufWriter<File>,
 }
@@ -132,12 +144,46 @@ fn close_chunk(state: &mut SplitState, manifest: &mut dyn Write) -> io::Result<(
     let Some(mut chunk) = state.open.take() else {
         return Ok(());
     };
+    // Output is normalized to end with a newline, whatever the input's last line did.
+    if !chunk.ends_with_newline {
+        chunk.file.write_all(b"\n")?;
+        chunk.bytes += 1;
+        chunk.ends_with_newline = true;
+    }
     chunk.file.flush()?;
     write_manifest_entry(manifest, &chunk.name, chunk.lines, chunk.bytes)
 }
 
+/// The chunk being filled, opening the next one when none is. GNU `split` stops rather
+/// than wrapping onto a name it already wrote, and an exhausted suffix says so here.
+fn open_chunk<'a>(
+    state: &'a mut SplitState,
+    config: &SplitConfig,
+) -> io::Result<&'a mut OpenChunk> {
+    if state.open.is_none() {
+        let width = config.suffix_length.get();
+        let suffix = generate_suffix(state.file_index, width)
+            .ok_or_else(|| suffix_exhausted(state.file_index + 1, width))?;
+        let name = format!("{}{}", config.prefix, suffix);
+        let file = create_chunk(&name)?;
+        state.file_index += 1;
+        state.open = Some(OpenChunk {
+            name,
+            lines: 0,
+            bytes: 0,
+            ends_with_newline: true,
+            file,
+        });
+    }
+    Ok(state.open.as_mut().expect("just opened"))
+}
+
 /// Write every complete line in `data` into chunk files, resuming from `state`. The chunk
 /// left open at the end is the caller's to [`close_chunk`].
+///
+/// A chunk is a contiguous range of the input, so LF mode copies that range whole. Under
+/// `--utf8` it is not: every Unicode terminator is rewritten to LF, which only a pass that
+/// sees each line can do.
 fn split_by_lines(
     data: &[u8],
     state: &mut SplitState,
@@ -145,34 +191,84 @@ fn split_by_lines(
     config: &SplitConfig,
     manifest: &mut dyn Write,
 ) -> io::Result<()> {
-    for line in LineIter::new(data, newlines) {
-        let chunk = match state.open {
-            Some(ref mut chunk) => chunk,
-            // Between chunks: open the next one into the empty slot. GNU `split` stops
-            // here rather than wrapping onto a name it already wrote.
-            ref mut slot => {
-                let width = config.suffix_length.get();
-                let suffix = generate_suffix(state.file_index, width)
-                    .ok_or_else(|| suffix_exhausted(state.file_index + 1, width))?;
-                let name = format!("{}{}", config.prefix, suffix);
-                let file = create_chunk(&name)?;
-                state.file_index += 1;
-                slot.insert(OpenChunk {
-                    name,
-                    lines: 0,
-                    bytes: 0,
-                    file,
-                })
+    match newlines {
+        Newlines::Lf => split_by_ranges(data, state, config, manifest),
+        Newlines::Unicode => split_line_by_line(data, state, newlines, config, manifest),
+    }
+}
+
+/// The prefix of `data` that fills the open chunk: everything through its `wanted`-th
+/// newline, or all of `data` when it holds fewer. `wanted` is at least 1, since a chunk
+/// closes the moment it fills. Also reports how many lines that prefix carries.
+fn span_filling_chunk(data: &[u8], wanted: usize) -> (&[u8], usize) {
+    debug_assert!(wanted >= 1, "a full chunk should have been closed already");
+    let mut seen = 0;
+    for newline in data.sz_matches(b"\n") {
+        seen += 1;
+        if seen == wanted {
+            return (&data[..offset_within(data, newline) + newline.len()], seen);
+        }
+    }
+    // The input ran out first: the tail is the chunk, and an unterminated last line still
+    // counts as a line, as it does for the line-at-a-time path below. Counting as we go
+    // rather than asking twice keeps this to one pass over the tail.
+    (data, seen + usize::from(!data.ends_with(b"\n")))
+}
+
+/// Copy each chunk's byte range out of `data` in one write, which is what splitting on LF
+/// is: the bytes reach the chunk exactly as they arrived.
+fn split_by_ranges(
+    data: &[u8],
+    state: &mut SplitState,
+    config: &SplitConfig,
+    manifest: &mut dyn Write,
+) -> io::Result<()> {
+    let mut rest = data;
+    while !rest.is_empty() {
+        // The borrow of the open chunk ends with this block, so `close_chunk` can take
+        // `state` again below.
+        let filled = {
+            let chunk = open_chunk(state, config)?;
+            let wanted = config.lines_per_file.get() - chunk.lines;
+            let (span, lines) = span_filling_chunk(rest, wanted);
+            // Handing the kernel one multi-hundred-megabyte write costs ~20% over feeding
+            // it pieces, which fault the source in and dirty the page cache in step.
+            for piece in span.chunks(WRITE_PIECE_BYTES) {
+                chunk.file.write_all(piece)?;
             }
+            chunk.lines += lines;
+            chunk.bytes += span.len();
+            chunk.ends_with_newline = span.ends_with(b"\n");
+            rest = &rest[span.len()..];
+            chunk.lines >= config.lines_per_file.get()
         };
+        if filled {
+            close_chunk(state, manifest)?;
+        }
+    }
 
-        // Output is normalized to end with a newline, whatever the input's last line did.
-        chunk.file.write_all(line)?;
-        chunk.file.write_all(b"\n")?;
-        chunk.lines += 1;
-        chunk.bytes += line.len() + 1;
+    Ok(())
+}
 
-        if chunk.lines >= config.lines_per_file.get() {
+/// Write one line at a time, re-terminating each with LF. Only `--utf8` needs this, where
+/// the seven Unicode terminators are normalized away and no range of the input would do.
+fn split_line_by_line(
+    data: &[u8],
+    state: &mut SplitState,
+    newlines: Newlines,
+    config: &SplitConfig,
+    manifest: &mut dyn Write,
+) -> io::Result<()> {
+    for line in LineIter::new(data, newlines) {
+        let filled = {
+            let chunk = open_chunk(state, config)?;
+            chunk.file.write_all(line)?;
+            chunk.file.write_all(b"\n")?;
+            chunk.lines += 1;
+            chunk.bytes += line.len() + 1;
+            chunk.lines >= config.lines_per_file.get()
+        };
+        if filled {
             close_chunk(state, manifest)?;
         }
     }
