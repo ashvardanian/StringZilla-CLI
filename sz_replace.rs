@@ -88,35 +88,41 @@ fn replace_all_to(
     ignore_case: bool,
     out: &mut dyn Write,
 ) -> io::Result<usize> {
+    // An empty pattern matches at every position without consuming anything, so it
+    // has no replacement to make.
     if pattern.is_empty() {
         out.write_all(data)?;
         return Ok(0);
     }
 
-    let mut pos = 0;
-    let mut count = 0;
-    while pos < data.len() {
-        let matched = if ignore_case {
-            utf8_uncased_search(&data[pos..], pattern)
+    let next_match = |rest: &[u8]| {
+        if ignore_case {
+            utf8_uncased_search(rest, pattern)
         } else {
-            find(&data[pos..], pattern).map(|off| (off, pattern.len()))
-        };
-
-        match matched {
-            Some((offset, match_len)) => {
-                let match_pos = pos + offset;
-                out.write_all(&data[pos..match_pos])?;
-                out.write_all(replacement)?;
-                count += 1;
-                pos = match_pos + match_len;
-            }
-            None => {
-                out.write_all(&data[pos..])?;
-                break;
-            }
+            find(rest, pattern).map(|offset| (offset, pattern.len()))
         }
+    };
+
+    let mut rest = data;
+    let mut count = 0;
+    while let Some((offset, matched_len)) = next_match(rest) {
+        out.write_all(&rest[..offset])?;
+        out.write_all(replacement)?;
+        count += 1;
+        rest = &rest[offset + matched_len..];
     }
+    out.write_all(rest)?;
     Ok(count)
+}
+
+/// Where the transformed bytes go, decided once from the flags.
+enum Sink<'a> {
+    /// `-n`: count the replacements and write nothing.
+    Discard,
+    /// `--in-place`: rewrite this path once the whole buffer is transformed.
+    File(&'a str),
+    /// Stream to stdout, or to `-o` when given.
+    Stream(Option<&'a str>),
 }
 
 fn main() {
@@ -129,74 +135,76 @@ fn main() {
         ExitCode::Error.exit(&mut stdout);
     }
 
-    if args.in_place && args.input.is_none() {
-        eprintln!("Error: --in-place requires an input file (cannot use stdin)");
-        ExitCode::Error.exit(&mut stdout);
-    }
-
-    if args.in_place && args.input == Some("-".to_string()) {
-        eprintln!("Error: --in-place cannot be used with stdin");
-        ExitCode::Error.exit(&mut stdout);
-    }
-
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(error) => exit_with_error(&mut stdout, &error, "Error reading input"),
+    // `--in-place` needs a real path whether or not `-n` suppresses the rewrite.
+    let destination = if args.in_place {
+        let Some(path) = args.input.as_deref() else {
+            eprintln!("Error: --in-place requires an input file (cannot use stdin)");
+            ExitCode::Error.exit(&mut stdout);
+        };
+        if path == "-" {
+            eprintln!("Error: --in-place cannot be used with stdin");
+            ExitCode::Error.exit(&mut stdout);
+        }
+        if args.dry_run {
+            Sink::Discard
+        } else {
+            Sink::File(path)
+        }
+    } else if args.dry_run {
+        Sink::Discard
+    } else {
+        Sink::Stream(args.output.as_deref())
     };
+
+    let input = get_input(args.input.as_deref())
+        .unwrap_or_else(|error| exit_with_error(&mut stdout, &error, "Error reading input"));
 
     let data = input.as_bytes();
     let pattern = args.pattern.as_bytes();
     let replacement = args.replacement.as_bytes();
 
-    // Dry run: count via a sink — no output buffer materialized.
-    if args.dry_run {
-        let count = replace_all_to(
+    let count = match destination {
+        // Counting only: a sink materializes no output buffer.
+        Sink::Discard => replace_all_to(
             data,
             pattern,
             replacement,
             args.ignore_case,
             &mut io::sink(),
         )
-        .expect("writing to a sink cannot fail");
-        if args.json {
-            write_summary_json(&mut stdout, &args, count, true);
-        } else {
-            eprintln!("Dry run: would replace {} occurrence(s)", count);
-        }
-        ExitCode::Success.exit(&mut stdout);
-    }
-
-    let count = if args.in_place {
+        .expect("writing to a sink cannot fail"),
         // In-place needs the whole transformed buffer before rewriting the file.
-        let input_path = args.input.as_ref().unwrap();
-        let mut buf = Vec::with_capacity(data.len());
-        let count = replace_all_to(data, pattern, replacement, args.ignore_case, &mut buf)
-            .expect("writing to a Vec cannot fail");
-        if let Err(error) = fs::write(input_path, &buf) {
-            exit_with_error(&mut stdout, &error, "Error writing to file");
-        }
-        count
-    } else {
-        // Stream directly to stdout / -o — no full-output buffer.
-        let mut output = match get_output(args.output.as_deref()) {
-            Ok(output) => output,
-            Err(error) => exit_with_error(&mut stdout, &error, "Error opening output"),
-        };
-        let count = match replace_all_to(data, pattern, replacement, args.ignore_case, &mut *output)
-        {
-            Ok(count) => count,
-            Err(error) => exit_on_write_error(&mut *output, &error, "Error writing output"),
-        };
-        if let Err(error) = output.flush() {
-            if error.kind() != io::ErrorKind::BrokenPipe {
-                exit_with_error(&mut stdout, &error, "Error flushing output");
+        Sink::File(path) => {
+            let mut buffer = Vec::with_capacity(data.len());
+            let count = replace_all_to(data, pattern, replacement, args.ignore_case, &mut buffer)
+                .expect("writing to a Vec cannot fail");
+            if let Err(error) = fs::write(path, &buffer) {
+                exit_with_error(&mut stdout, &error, "Error writing to file");
             }
+            count
         }
-        count
+        // Stream directly to stdout / -o — no full-output buffer.
+        Sink::Stream(path) => {
+            let mut output = get_output(path).unwrap_or_else(|error| {
+                exit_with_error(&mut stdout, &error, "Error opening output")
+            });
+            let count = replace_all_to(data, pattern, replacement, args.ignore_case, &mut *output)
+                .unwrap_or_else(|error| {
+                    exit_on_write_error(&mut *output, &error, "Error writing output")
+                });
+            if let Err(error) = output.flush() {
+                if error.kind() != io::ErrorKind::BrokenPipe {
+                    exit_with_error(&mut stdout, &error, "Error flushing output");
+                }
+            }
+            count
+        }
     };
 
     if args.json {
-        write_summary_json(&mut stdout, &args, count, false);
+        write_summary_json(&mut stdout, &args, count, args.dry_run);
+    } else if args.dry_run {
+        eprintln!("Dry run: would replace {} occurrence(s)", count);
     } else if args.count {
         eprintln!("Replaced {} occurrence(s)", count);
     }

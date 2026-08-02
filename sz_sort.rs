@@ -55,26 +55,27 @@ struct SortOrder {
 }
 
 impl SortOrder {
-    /// Compare two lines. Case-insensitive comparison uses StringZilla's on-the-fly
-    /// Unicode folding — no materialized keys.
+    /// Compare two lines in the requested direction. Case-insensitive comparison
+    /// uses StringZilla's on-the-fly Unicode folding — no materialized keys, and
+    /// reversal leaves `Equal` alone, so adjacency stays the same relation.
     #[inline]
     fn compare(self, left: &[u8], right: &[u8]) -> Ordering {
-        if self.ignore_case {
+        let ordering = if self.ignore_case {
             sz::utf8_uncased_order(left, right)
         } else {
             left.cmp(right)
+        };
+        if self.reverse {
+            ordering.reverse()
+        } else {
+            ordering
         }
     }
 
-    /// Whether `left` is allowed to precede `right`, honoring the direction.
+    /// Whether `left` is allowed to precede `right`.
     #[inline]
     fn holds(self, left: &[u8], right: &[u8]) -> bool {
-        let ordering = self.compare(left, right);
-        if self.reverse {
-            ordering != Ordering::Less
-        } else {
-            ordering != Ordering::Greater
-        }
+        self.compare(left, right).is_le()
     }
 
     /// The same order stated for `argsort`, which folds and reverses inside the
@@ -182,7 +183,8 @@ fn write_sorted(
     let mut written = 0;
     for &index in permutation {
         let line = line_at(lines, index);
-        if config.unique && previous.is_some_and(|kept| order.compare(kept, line) == Ordering::Equal)
+        if config.unique
+            && previous.is_some_and(|kept| order.compare(kept, line) == Ordering::Equal)
         {
             continue;
         }
@@ -246,7 +248,13 @@ struct Args {
     null: bool,
 
     /// Suppress output; with --check, report order through the exit code only
-    #[arg(short = 'q', long, requires = "check", conflicts_with = "output", help_heading = "Output Formats")]
+    #[arg(
+        short = 'q',
+        long,
+        requires = "check",
+        conflicts_with = "output",
+        help_heading = "Output Formats"
+    )]
     quiet: bool,
 }
 
@@ -257,23 +265,18 @@ fn main() {
     // UTF-8 mode is implicit when case-insensitive (case folding requires UTF-8).
     let utf8_mode = args.utf8 || args.ignore_case;
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(error) => exit_with_error(&mut stdout, &error, "Error reading input"),
-    };
+    let input = get_input(args.input.as_deref())
+        .unwrap_or_else(|error| exit_with_error(&mut stdout, &error, "Error reading input"));
     let data = input.as_bytes();
 
     let order = SortOrder {
         ignore_case: args.ignore_case,
         reverse: args.reverse,
     };
-    let lines = match collect_lines(data, Newlines::from_utf8(utf8_mode)) {
-        Ok(lines) => lines,
-        Err(error) => {
-            eprintln!("Error indexing lines: {:?}", error);
-            ExitCode::Error.exit(&mut stdout);
-        }
-    };
+    let lines = collect_lines(data, Newlines::from_utf8(utf8_mode)).unwrap_or_else(|error| {
+        eprintln!("Error indexing lines: {:?}", error);
+        ExitCode::Error.exit(&mut stdout)
+    });
     let name = args.input.as_deref().unwrap_or("-");
 
     if args.check {
@@ -288,18 +291,13 @@ fn main() {
         }
     }
 
-    let permutation = match sorted_order(&lines, order) {
-        Ok(permutation) => permutation,
-        Err(status) => {
-            eprintln!("Error sorting: {:?}", status);
-            ExitCode::Error.exit(&mut stdout);
-        }
-    };
+    let permutation = sorted_order(&lines, order).unwrap_or_else(|status| {
+        eprintln!("Error sorting: {:?}", status);
+        ExitCode::Error.exit(&mut stdout)
+    });
 
-    let mut output = match get_output(args.output.as_deref()) {
-        Ok(output) => output,
-        Err(error) => exit_with_error(&mut stdout, &error, "Error opening output"),
-    };
+    let mut output = get_output(args.output.as_deref())
+        .unwrap_or_else(|error| exit_with_error(&mut stdout, &error, "Error opening output"));
 
     let config = OutputConfig {
         json: args.json,
@@ -401,25 +399,70 @@ mod tests {
     #[test]
     fn reports_first_unsorted_line() {
         let sorted = lines_of(b"a\nb\nc\n");
-        assert_eq!(check_sorted(&sorted, SortOrder { ignore_case: false, reverse: false }), None);
+        assert_eq!(
+            check_sorted(
+                &sorted,
+                SortOrder {
+                    ignore_case: false,
+                    reverse: false
+                }
+            ),
+            None
+        );
 
         let unsorted = lines_of(b"a\nc\nb\n");
-        assert_eq!(check_sorted(&unsorted, SortOrder { ignore_case: false, reverse: false }), Some(3));
+        assert_eq!(
+            check_sorted(
+                &unsorted,
+                SortOrder {
+                    ignore_case: false,
+                    reverse: false
+                }
+            ),
+            Some(3)
+        );
     }
 
     #[test]
     fn accepts_descending_order_in_check() {
         let desc = lines_of(b"c\nb\na\n");
-        assert_eq!(check_sorted(&desc, SortOrder { ignore_case: false, reverse: true }), None);
+        assert_eq!(
+            check_sorted(
+                &desc,
+                SortOrder {
+                    ignore_case: false,
+                    reverse: true
+                }
+            ),
+            None
+        );
     }
 
     #[test]
     fn checks_sorted_order_ignoring_case() {
         // "Apple" < "BANANA" < "cherry" under folding, regardless of input casing.
         let folded = lines_of(b"Apple\nBANANA\ncherry\n");
-        assert_eq!(check_sorted(&folded, SortOrder { ignore_case: true, reverse: false }), None);
+        assert_eq!(
+            check_sorted(
+                &folded,
+                SortOrder {
+                    ignore_case: true,
+                    reverse: false
+                }
+            ),
+            None
+        );
         let not_folded = lines_of(b"BANANA\nApple\n");
-        assert_eq!(check_sorted(&not_folded, SortOrder { ignore_case: true, reverse: false }), Some(2));
+        assert_eq!(
+            check_sorted(
+                &not_folded,
+                SortOrder {
+                    ignore_case: true,
+                    reverse: false
+                }
+            ),
+            Some(2)
+        );
     }
 
     #[test]

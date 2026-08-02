@@ -533,9 +533,11 @@ fn search_lines<'a>(
                             }),
                     );
                 } else {
-                    tokens.extend(tokenize(lines[index]).filter(|token| {
-                        !filtering || survives(q, token, cfg.max_distance, false)
-                    }));
+                    tokens.extend(
+                        tokenize(lines[index]).filter(|token| {
+                            !filtering || survives(q, token, cfg.max_distance, false)
+                        }),
+                    );
                 }
                 token_runs.push((index, tokens.len()));
             }
@@ -547,7 +549,9 @@ fn search_lines<'a>(
                     .sw
                     .compute(&eng.device, &query[..], &tokens)
                     .expect("smith-waterman compute failed");
-                mark_lines_by_run(scores.row(0), &token_runs, &mut matched, |score| score >= thr);
+                mark_lines_by_run(scores.row(0), &token_runs, &mut matched, |score| {
+                    score >= thr
+                });
             } else if cfg.utf8 {
                 // Code-point-level distances; both sides validated above.
                 let needle = std::str::from_utf8(needle).expect("patterns are UTF-8 arguments");
@@ -587,7 +591,9 @@ fn search_lines<'a>(
                 .sw
                 .compute(&eng.device, &query[..], &haystacks)
                 .expect("smith-waterman compute failed");
-            mark_lines_by_run(scores.row(0), &token_runs, &mut matched, |score| score >= thr);
+            mark_lines_by_run(scores.row(0), &token_runs, &mut matched, |score| {
+                score >= thr
+            });
         }
     }
 

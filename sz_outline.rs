@@ -25,13 +25,12 @@
 use std::borrow::Cow;
 use std::io::{self, Write};
 use std::path::Path;
-use std::process;
 
 use clap::Parser;
 use stringzilla::sz::{find, StringZillableUnary};
 
 mod shared;
-use shared::{exit_with_error, json_text_field_to, stdout_writer};
+use shared::*;
 
 // region: Data Structures
 
@@ -49,7 +48,6 @@ enum FileType {
     Markdown,
     CSource,
     CHeader,
-    Unknown,
 }
 
 /// Types of outline elements
@@ -106,8 +104,64 @@ impl<'a> OutlineElement<'a> {
     }
 }
 
-/// Pending code-block start while scanning: (start line, start byte offset, fence language).
-type CodeBlockStart<'a> = (usize, usize, Option<Cow<'a, [u8]>>);
+/// Line number and byte offset of one point in the input.
+#[derive(Clone, Copy, Debug)]
+struct Position {
+    line: usize,
+    offset: usize,
+}
+
+/// A Markdown block that accumulates consecutive lines of one kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Block {
+    Paragraph,
+    Blockquote,
+    Table,
+}
+
+impl Block {
+    /// The element kind this block becomes once closed.
+    fn kind(self) -> ElementKind<'static> {
+        match self {
+            Block::Paragraph => ElementKind::Paragraph,
+            Block::Blockquote => ElementKind::Blockquote,
+            Block::Table => ElementKind::Table,
+        }
+    }
+
+    /// The element name this block becomes once closed.
+    fn label(self) -> &'static [u8] {
+        match self {
+            Block::Paragraph => b"paragraph",
+            Block::Blockquote => b"blockquote",
+            Block::Table => b"table",
+        }
+    }
+}
+
+/// The one block currently accumulating lines. At most one is open at a time, so
+/// block spans cannot overlap.
+#[derive(Clone, Copy, Debug)]
+struct OpenBlock {
+    block: Block,
+    start: Position,
+}
+
+/// A fenced code block being scanned: the fence character that closes it, its info
+/// string, and where it opened.
+#[derive(Clone, Debug)]
+struct OpenCodeBlock<'a> {
+    marker: u8,
+    language: Option<Cow<'a, [u8]>>,
+    start: Position,
+}
+
+/// A code fence line: the fence character and its info string.
+#[derive(Clone, Debug)]
+struct Fence<'a> {
+    marker: u8,
+    language: Option<Cow<'a, [u8]>>,
+}
 
 // endregion: Data Structures
 
@@ -143,22 +197,23 @@ struct Args {
 
 // region: File Type Detection
 
-fn detect_file_type(path: &str) -> FileType {
-    let path = Path::new(path);
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("md") | Some("markdown") => FileType::Markdown,
-        Some("c") => FileType::CSource,
-        Some("h") => FileType::CHeader,
-        _ => FileType::Unknown,
+/// File type from the path's extension, or `None` when the extension is not outlined.
+fn detect_file_type(path: &str) -> Option<FileType> {
+    match Path::new(path).extension()?.to_str()? {
+        "md" | "markdown" => Some(FileType::Markdown),
+        "c" => Some(FileType::CSource),
+        "h" => Some(FileType::CHeader),
+        _ => None,
     }
 }
 
-fn parse_file_type(type_str: &str) -> FileType {
-    match type_str.to_lowercase().as_str() {
-        "md" | "markdown" => FileType::Markdown,
-        "c" => FileType::CSource,
-        "h" => FileType::CHeader,
-        _ => FileType::Unknown,
+/// File type from the `--type` argument, or `None` when the name is not outlined.
+fn parse_file_type(name: &str) -> Option<FileType> {
+    match name.to_lowercase().as_str() {
+        "md" | "markdown" => Some(FileType::Markdown),
+        "c" => Some(FileType::CSource),
+        "h" => Some(FileType::CHeader),
+        _ => None,
     }
 }
 
@@ -170,131 +225,79 @@ fn parse_file_type(type_str: &str) -> FileType {
 fn parse_markdown<'a>(data: &'a [u8], verbosity: Verbosity) -> Vec<OutlineElement<'a>> {
     let mut elements: Vec<OutlineElement<'a>> = Vec::new();
     let mut line_number = 0usize;
-    let mut byte_offset = 0usize;
+    let mut current_section: Option<usize> = None;
+    let mut open_code_block: Option<OpenCodeBlock<'a>> = None;
+    let mut open_block: Option<OpenBlock> = None;
 
-    // State for code blocks
-    let mut in_code_block = false;
-    let mut code_fence_char: u8 = 0;
-    let mut code_block_start: Option<CodeBlockStart<'a>> = None;
-
-    // State for v2 block tracking
-    let mut current_section_idx: Option<usize> = None;
-    let mut in_blockquote = false;
-    let mut blockquote_start: Option<(usize, usize)> = None;
-    let mut in_table = false;
-    let mut table_start: Option<(usize, usize)> = None;
-    let mut paragraph_start: Option<(usize, usize)> = None;
-
-    for line in shared::LineIter::new(data, shared::Newlines::Lf) {
+    for line in LineIter::new(data, Newlines::Lf) {
         line_number += 1;
-        let line_start = byte_offset;
+        let line_start = offset_within(data, line);
         let line_len = line.len();
+        let start = Position {
+            line: line_number,
+            offset: line_start,
+        };
+        // A block interrupted by this line ends on the previous line, at this line's byte.
+        let interrupted = Position {
+            line: line_number - 1,
+            offset: line_start,
+        };
 
-        // Handle code blocks
-        if let Some((fence_char, lang)) = is_code_fence(line) {
-            if in_code_block && fence_char == code_fence_char {
-                // End code block
-                if let Some((start_line, start_offset, lang)) = code_block_start.take() {
-                    let elem = OutlineElement::new(
-                        ElementKind::CodeBlock { language: lang },
-                        Cow::Borrowed(b"code"),
-                        start_line,
-                        start_offset,
-                    )
-                    .with_length(
-                        byte_offset + line_len - start_offset,
-                        line_number - start_line + 1,
-                    );
-
-                    if verbosity >= Verbosity::Detailed {
-                        if let Some(idx) = current_section_idx {
-                            elements[idx].children.push(elem);
-                        } else {
-                            elements.push(elem);
-                        }
-                    }
-                }
-                in_code_block = false;
-            } else if !in_code_block {
-                // Start code block
-                code_fence_char = fence_char;
-                code_block_start = Some((line_number, line_start, lang));
-                in_code_block = true;
-                // End any ongoing paragraph
-                finalize_paragraph(
-                    &mut elements,
-                    &mut paragraph_start,
-                    current_section_idx,
-                    line_number - 1,
-                    line_start,
-                    verbosity,
+        // Code fences: the same fence character closes what it opened, and a
+        // different one inside the block is content.
+        if let Some(fence) = is_code_fence(line) {
+            if let Some(closed) = open_code_block.take_if(|open| open.marker == fence.marker) {
+                let element = OutlineElement::new(
+                    ElementKind::CodeBlock {
+                        language: closed.language,
+                    },
+                    Cow::Borrowed(b"code"),
+                    closed.start.line,
+                    closed.start.offset,
+                )
+                .with_length(
+                    line_start + line_len - closed.start.offset,
+                    line_number - closed.start.line + 1,
                 );
+                if verbosity >= Verbosity::Detailed {
+                    push_element(&mut elements, current_section, element);
+                }
+            } else if open_code_block.is_none() {
+                close_block(&mut elements, &mut open_block, current_section, interrupted);
+                open_code_block = Some(OpenCodeBlock {
+                    marker: fence.marker,
+                    language: fence.language,
+                    start,
+                });
             }
-            byte_offset += line_len + 1;
             continue;
         }
 
-        if in_code_block {
-            byte_offset += line_len + 1;
+        if open_code_block.is_some() {
             continue;
         }
 
         let trimmed = trim_start(line, 3);
 
-        // Detect headings
         if let Some((level, text)) = parse_heading(trimmed) {
-            // Finalize any ongoing blocks
-            finalize_paragraph(
-                &mut elements,
-                &mut paragraph_start,
-                current_section_idx,
-                line_number - 1,
-                line_start,
-                verbosity,
-            );
-            finalize_blockquote(
-                &mut elements,
-                &mut in_blockquote,
-                &mut blockquote_start,
-                current_section_idx,
-                line_number - 1,
-                line_start,
-                verbosity,
-            );
-            finalize_table(
-                &mut elements,
-                &mut in_table,
-                &mut table_start,
-                current_section_idx,
-                line_number - 1,
-                line_start,
-                verbosity,
-            );
-
-            let elem = OutlineElement::new(
-                ElementKind::Heading { level },
-                Cow::Borrowed(text),
-                line_number,
-                line_start,
-            )
-            .with_length(line_len, 1);
-
-            elements.push(elem);
-            current_section_idx = Some(elements.len() - 1);
-        }
-        // v2: Detect other block types
-        else if verbosity >= Verbosity::Detailed {
-            // Image detection: ![alt](url)
-            if let Some(alt) = parse_image(line) {
-                finalize_paragraph(
-                    &mut elements,
-                    &mut paragraph_start,
-                    current_section_idx,
-                    line_number - 1,
+            close_block(&mut elements, &mut open_block, current_section, interrupted);
+            elements.push(
+                OutlineElement::new(
+                    ElementKind::Heading { level },
+                    Cow::Borrowed(text),
+                    line_number,
                     line_start,
-                    verbosity,
-                );
-                let elem = OutlineElement::new(
+                )
+                .with_length(line_len, 1),
+            );
+            current_section = Some(elements.len() - 1);
+        }
+        // Blocks below headings are only reported at the most verbose level.
+        else if verbosity >= Verbosity::Detailed {
+            // Image: `![alt](url)`
+            if let Some(alt) = parse_image(line) {
+                close_block(&mut elements, &mut open_block, current_section, interrupted);
+                let element = OutlineElement::new(
                     ElementKind::Image {
                         alt: Cow::Borrowed(alt),
                     },
@@ -303,310 +306,164 @@ fn parse_markdown<'a>(data: &'a [u8], verbosity: Verbosity) -> Vec<OutlineElemen
                     line_start,
                 )
                 .with_length(line_len, 1);
-
-                if let Some(idx) = current_section_idx {
-                    elements[idx].children.push(elem);
-                } else {
-                    elements.push(elem);
-                }
+                push_element(&mut elements, current_section, element);
             }
-            // Blockquote: starts with >
+            // Blockquote: starts with `>`
             else if trimmed.starts_with(b">") {
-                finalize_paragraph(
+                open_or_extend(
                     &mut elements,
-                    &mut paragraph_start,
-                    current_section_idx,
-                    line_number - 1,
-                    line_start,
-                    verbosity,
+                    &mut open_block,
+                    current_section,
+                    Block::Blockquote,
+                    start,
                 );
-                if !in_blockquote {
-                    in_blockquote = true;
-                    blockquote_start = Some((line_number, line_start));
-                }
             }
-            // Table: contains |
-            else if find(trimmed, b"|").is_some() && !trimmed.is_empty() {
-                finalize_paragraph(
+            // Table: contains `|`
+            else if !trimmed.is_empty() && find(trimmed, b"|").is_some() {
+                open_or_extend(
                     &mut elements,
-                    &mut paragraph_start,
-                    current_section_idx,
-                    line_number - 1,
-                    line_start,
-                    verbosity,
+                    &mut open_block,
+                    current_section,
+                    Block::Table,
+                    start,
                 );
-                finalize_blockquote(
-                    &mut elements,
-                    &mut in_blockquote,
-                    &mut blockquote_start,
-                    current_section_idx,
-                    line_number - 1,
-                    line_start,
-                    verbosity,
-                );
-                if !in_table {
-                    in_table = true;
-                    table_start = Some((line_number, line_start));
-                }
             }
-            // Empty line ends blocks
+            // Blank line ends the open block
             else if trimmed.is_empty() {
-                finalize_paragraph(
-                    &mut elements,
-                    &mut paragraph_start,
-                    current_section_idx,
-                    line_number - 1,
-                    line_start,
-                    verbosity,
-                );
-                finalize_blockquote(
-                    &mut elements,
-                    &mut in_blockquote,
-                    &mut blockquote_start,
-                    current_section_idx,
-                    line_number - 1,
-                    line_start,
-                    verbosity,
-                );
-                finalize_table(
-                    &mut elements,
-                    &mut in_table,
-                    &mut table_start,
-                    current_section_idx,
-                    line_number - 1,
-                    line_start,
-                    verbosity,
-                );
+                close_block(&mut elements, &mut open_block, current_section, interrupted);
             }
-            // Regular text - paragraph
+            // Anything else is paragraph text
             else {
-                finalize_blockquote(
+                open_or_extend(
                     &mut elements,
-                    &mut in_blockquote,
-                    &mut blockquote_start,
-                    current_section_idx,
-                    line_number - 1,
-                    line_start,
-                    verbosity,
+                    &mut open_block,
+                    current_section,
+                    Block::Paragraph,
+                    start,
                 );
-                finalize_table(
-                    &mut elements,
-                    &mut in_table,
-                    &mut table_start,
-                    current_section_idx,
-                    line_number - 1,
-                    line_start,
-                    verbosity,
-                );
-                if paragraph_start.is_none() {
-                    paragraph_start = Some((line_number, line_start));
-                }
             }
         }
-
-        byte_offset += line_len + 1;
     }
 
-    // Finalize any remaining blocks
-    let final_offset = byte_offset;
-    finalize_paragraph(
+    // A block still open at end of input ends there, whether or not the file
+    // ends with a newline.
+    let end_of_input = Position {
+        line: line_number,
+        offset: data.len(),
+    };
+    close_block(
         &mut elements,
-        &mut paragraph_start,
-        current_section_idx,
-        line_number,
-        final_offset,
-        verbosity,
+        &mut open_block,
+        current_section,
+        end_of_input,
     );
-    finalize_blockquote(
-        &mut elements,
-        &mut in_blockquote,
-        &mut blockquote_start,
-        current_section_idx,
-        line_number,
-        final_offset,
-        verbosity,
-    );
-    finalize_table(
-        &mut elements,
-        &mut in_table,
-        &mut table_start,
-        current_section_idx,
-        line_number,
-        final_offset,
-        verbosity,
-    );
-
     elements
 }
 
-/// Check if line is a code fence, returns (fence_char, language)
-fn is_code_fence<'a>(line: &'a [u8]) -> Option<(u8, Option<Cow<'a, [u8]>>)> {
-    let trimmed = trim_start(line, 3);
-    if trimmed.len() < 3 {
-        return None;
+/// Record an element under the current section, or at the top level when there is none.
+fn push_element<'a>(
+    elements: &mut Vec<OutlineElement<'a>>,
+    section: Option<usize>,
+    element: OutlineElement<'a>,
+) {
+    match section {
+        Some(index) => elements[index].children.push(element),
+        None => elements.push(element),
     }
+}
 
-    let fence_char = trimmed[0];
-    if fence_char != b'`' && fence_char != b'~' {
-        return None;
-    }
-
-    // Count fence characters
-    let fence_count = trimmed.iter().take_while(|&&b| b == fence_char).count();
-    if fence_count < 3 {
-        return None;
-    }
-
-    // Extract language (info string)
-    let after_fence = &trimmed[fence_count..];
-    let lang = if after_fence.is_empty() {
-        None
-    } else {
-        let lang_bytes = trim_both(after_fence);
-        if lang_bytes.is_empty() {
-            None
-        } else {
-            Some(Cow::Borrowed(lang_bytes))
-        }
+/// Close the open block, if any, recording it as ending at `end`.
+fn close_block<'a>(
+    elements: &mut Vec<OutlineElement<'a>>,
+    open: &mut Option<OpenBlock>,
+    section: Option<usize>,
+    end: Position,
+) {
+    let Some(OpenBlock { block, start }) = open.take() else {
+        return;
     };
+    debug_assert!(
+        end.line >= start.line,
+        "a block closes on or after the line it opened on"
+    );
+    let element = OutlineElement::new(
+        block.kind(),
+        Cow::Borrowed(block.label()),
+        start.line,
+        start.offset,
+    )
+    .with_length(
+        end.offset.saturating_sub(start.offset),
+        end.line - start.line + 1,
+    );
+    push_element(elements, section, element);
+}
 
-    Some((fence_char, lang))
+/// Keep accumulating into the open block when it is already `block`, otherwise close
+/// it — ending on the previous line — and open a fresh one at `start`.
+fn open_or_extend<'a>(
+    elements: &mut Vec<OutlineElement<'a>>,
+    open: &mut Option<OpenBlock>,
+    section: Option<usize>,
+    block: Block,
+    start: Position,
+) {
+    if open.is_some_and(|current| current.block == block) {
+        return;
+    }
+    let interrupted = Position {
+        line: start.line - 1,
+        offset: start.offset,
+    };
+    close_block(elements, open, section, interrupted);
+    *open = Some(OpenBlock { block, start });
+}
+
+/// Read a code fence line — three or more backticks or tildes, plus an info string.
+fn is_code_fence(line: &[u8]) -> Option<Fence<'_>> {
+    let trimmed = trim_start(line, 3);
+    let marker = *trimmed.first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let width = trimmed.iter().take_while(|&&byte| byte == marker).count();
+    (width >= 3).then(|| Fence {
+        marker,
+        language: Some(trimmed[width..].trim_ascii())
+            .filter(|info| !info.is_empty())
+            .map(Cow::Borrowed),
+    })
 }
 
 /// Parse heading from line (ATX style)
 fn parse_heading(line: &[u8]) -> Option<(u8, &[u8])> {
-    if line.is_empty() || line[0] != b'#' {
+    if line.first() != Some(&b'#') {
         return None;
     }
 
     // Count # characters
-    let level = line.iter().take_while(|&&b| b == b'#').count();
-    if level == 0 || level > 6 {
+    let level = line.iter().take_while(|&&byte| byte == b'#').count();
+    if level > 6 {
         return None;
     }
 
     // Must be followed by space or end of line
-    if line.len() > level
-        && line[level] != b' ' && line[level] != b'\t' {
-            return None;
-        }
+    if line.len() > level && line[level] != b' ' && line[level] != b'\t' {
+        return None;
+    }
 
-    // Extract text
+    // Extract text, dropping the optional closing run of `#`
     let text_start = (level + 1).min(line.len());
-    let text = trim_both(&line[text_start..]);
-
-    // Remove trailing # characters (optional closing)
-    let text = trim_trailing_hashes(text);
-
+    let text = trim_trailing_hashes(line[text_start..].trim_ascii());
     Some((level as u8, text))
 }
 
 /// Parse image from line: ![alt](url)
 fn parse_image(line: &[u8]) -> Option<&[u8]> {
-    let pos = find(line, b"![")?;
-    let after_bang = &line[pos + 2..];
+    let position = find(line, b"![")?;
+    let after_bang = &line[position + 2..];
     let close_bracket = find(after_bang, b"]")?;
-    let alt = &after_bang[..close_bracket];
-    Some(alt)
-}
-
-fn finalize_paragraph<'a>(
-    elements: &mut Vec<OutlineElement<'a>>,
-    paragraph_start: &mut Option<(usize, usize)>,
-    section_idx: Option<usize>,
-    end_line: usize,
-    end_offset: usize,
-    verbosity: Verbosity,
-) {
-    if verbosity < Verbosity::Detailed {
-        return;
-    }
-    if let Some((start_line, start_offset)) = paragraph_start.take() {
-        if end_line >= start_line {
-            let elem = OutlineElement::new(
-                ElementKind::Paragraph,
-                Cow::Borrowed(b"paragraph"),
-                start_line,
-                start_offset,
-            )
-            .with_length(
-                end_offset.saturating_sub(start_offset),
-                end_line - start_line + 1,
-            );
-
-            if let Some(idx) = section_idx {
-                elements[idx].children.push(elem);
-            } else {
-                elements.push(elem);
-            }
-        }
-    }
-}
-
-fn finalize_blockquote<'a>(
-    elements: &mut Vec<OutlineElement<'a>>,
-    in_blockquote: &mut bool,
-    blockquote_start: &mut Option<(usize, usize)>,
-    section_idx: Option<usize>,
-    end_line: usize,
-    end_offset: usize,
-    verbosity: Verbosity,
-) {
-    if verbosity < Verbosity::Detailed || !*in_blockquote {
-        return;
-    }
-    if let Some((start_line, start_offset)) = blockquote_start.take() {
-        let elem = OutlineElement::new(
-            ElementKind::Blockquote,
-            Cow::Borrowed(b"blockquote"),
-            start_line,
-            start_offset,
-        )
-        .with_length(
-            end_offset.saturating_sub(start_offset),
-            end_line - start_line + 1,
-        );
-
-        if let Some(idx) = section_idx {
-            elements[idx].children.push(elem);
-        } else {
-            elements.push(elem);
-        }
-    }
-    *in_blockquote = false;
-}
-
-fn finalize_table<'a>(
-    elements: &mut Vec<OutlineElement<'a>>,
-    in_table: &mut bool,
-    table_start: &mut Option<(usize, usize)>,
-    section_idx: Option<usize>,
-    end_line: usize,
-    end_offset: usize,
-    verbosity: Verbosity,
-) {
-    if verbosity < Verbosity::Detailed || !*in_table {
-        return;
-    }
-    if let Some((start_line, start_offset)) = table_start.take() {
-        let elem = OutlineElement::new(
-            ElementKind::Table,
-            Cow::Borrowed(b"table"),
-            start_line,
-            start_offset,
-        )
-        .with_length(
-            end_offset.saturating_sub(start_offset),
-            end_line - start_line + 1,
-        );
-
-        if let Some(idx) = section_idx {
-            elements[idx].children.push(elem);
-        } else {
-            elements.push(elem);
-        }
-    }
-    *in_table = false;
+    Some(&after_bang[..close_bracket])
 }
 
 // endregion: Markdown Parser
@@ -617,7 +474,6 @@ fn finalize_table<'a>(
 fn parse_c<'a>(data: &'a [u8], _verbosity: Verbosity) -> Vec<OutlineElement<'a>> {
     let mut elements: Vec<OutlineElement<'a>> = Vec::new();
     let mut line_number = 0usize;
-    let mut byte_offset = 0usize;
 
     // State for function body tracking
     let mut brace_depth = 0i32;
@@ -628,91 +484,83 @@ fn parse_c<'a>(data: &'a [u8], _verbosity: Verbosity) -> Vec<OutlineElement<'a>>
     let mut in_multiline_comment = false;
     let mut pending_signature: Option<(usize, usize, Vec<u8>)> = None;
 
-    for line in shared::LineIter::new(data, shared::Newlines::Lf) {
+    for line in LineIter::new(data, Newlines::Lf) {
         line_number += 1;
-        let line_start = byte_offset;
-        let line_len = line.len();
+        let line_start = offset_within(data, line);
+        let line_end = line_start + line.len();
 
         // Handle multi-line comments
         if in_multiline_comment {
             if find(line, b"*/").is_some() {
                 in_multiline_comment = false;
             }
-            byte_offset += line_len + 1;
             continue;
         }
 
         // Check for comment start
         if find(line, b"/*").is_some() && find(line, b"*/").is_none() {
             in_multiline_comment = true;
-            byte_offset += line_len + 1;
             continue;
         }
 
         // Skip single-line comments for parsing
-        let effective_line = if let Some(pos) = find(line, b"//") {
-            &line[..pos]
-        } else {
-            line
+        let effective_line = match find(line, b"//") {
+            Some(position) => &line[..position],
+            None => line,
         };
 
-        let trimmed = trim_both(effective_line);
+        let trimmed = effective_line.trim_ascii();
 
         // Handle pending multi-line signature
-        if let Some((start_line, start_offset, ref mut sig_bytes)) = pending_signature {
-            sig_bytes.extend_from_slice(b" ");
-            sig_bytes.extend_from_slice(trimmed);
+        if let Some((start_line, start_offset, ref mut signature_bytes)) = pending_signature {
+            signature_bytes.extend_from_slice(b" ");
+            signature_bytes.extend_from_slice(trimmed);
 
             // Check if signature is complete
-            let has_semicolon = find(&sig_bytes, b";").is_some();
-            let has_open_brace = find(&sig_bytes, b"{").is_some();
+            let has_semicolon = find(&signature_bytes, b";").is_some();
+            let has_open_brace = find(&signature_bytes, b"{").is_some();
 
             if has_semicolon {
                 // Declaration — the signature was accumulated across lines into a
                 // fresh buffer, so it cannot borrow from `data`; keep it owned.
-                if let Some(sig) = extract_function_signature(sig_bytes) {
+                if let Some(signature) = extract_function_signature(signature_bytes) {
                     elements.push(
                         OutlineElement::new(
                             ElementKind::FunctionDeclaration,
-                            Cow::Owned(sig.into_owned()),
+                            Cow::Owned(signature.into_owned()),
                             start_line,
                             start_offset,
                         )
-                        .with_length(
-                            byte_offset + line_len - start_offset,
-                            line_number - start_line + 1,
-                        ),
+                        .with_length(line_end - start_offset, line_number - start_line + 1),
                     );
                 }
                 pending_signature = None;
             } else if has_open_brace {
                 // Definition - start tracking body
-                if let Some(sig) = extract_function_signature(sig_bytes) {
+                if let Some(signature) = extract_function_signature(signature_bytes) {
                     in_function_body = true;
-                    brace_depth = count_braces(sig_bytes);
-                    function_start = Some((start_line, start_offset, Cow::Owned(sig.into_owned())));
+                    brace_depth = count_braces(signature_bytes);
+                    function_start =
+                        Some((start_line, start_offset, Cow::Owned(signature.into_owned())));
                 }
                 pending_signature = None;
             }
 
-            byte_offset += line_len + 1;
             continue;
         }
 
         if !in_function_body {
             // Detect #include
-            if trimmed.starts_with(b"#include") {
-                if let Some((path, is_system)) = parse_include(trimmed) {
-                    elements.push(
-                        OutlineElement::new(
-                            ElementKind::Include { is_system },
-                            Cow::Borrowed(path),
-                            line_number,
-                            line_start,
-                        )
-                        .with_length(line_len, 1),
-                    );
-                }
+            if let Some((path, is_system)) = parse_include(trimmed) {
+                elements.push(
+                    OutlineElement::new(
+                        ElementKind::Include { is_system },
+                        Cow::Borrowed(path),
+                        line_number,
+                        line_start,
+                    )
+                    .with_length(line.len(), 1),
+                );
             }
             // Skip other preprocessor directives
             else if trimmed.starts_with(b"#") {
@@ -721,24 +569,24 @@ fn parse_c<'a>(data: &'a [u8], _verbosity: Verbosity) -> Vec<OutlineElement<'a>>
             // Look for function signatures
             else if let Some(result) = try_parse_function_line(trimmed) {
                 match result {
-                    FunctionParseResult::Declaration(sig) => {
+                    FunctionParseResult::Declaration(signature) => {
                         elements.push(
                             OutlineElement::new(
                                 ElementKind::FunctionDeclaration,
-                                sig,
+                                signature,
                                 line_number,
                                 line_start,
                             )
-                            .with_length(line_len, 1),
+                            .with_length(line.len(), 1),
                         );
                     }
-                    FunctionParseResult::DefinitionStart(sig) => {
+                    FunctionParseResult::DefinitionStart(signature) => {
                         in_function_body = true;
                         brace_depth = count_braces(trimmed);
-                        function_start = Some((line_number, line_start, sig));
+                        function_start = Some((line_number, line_start, signature));
                     }
-                    FunctionParseResult::Incomplete(sig_bytes) => {
-                        pending_signature = Some((line_number, line_start, sig_bytes));
+                    FunctionParseResult::Incomplete(signature_bytes) => {
+                        pending_signature = Some((line_number, line_start, signature_bytes));
                     }
                 }
             }
@@ -756,18 +604,13 @@ fn parse_c<'a>(data: &'a [u8], _verbosity: Verbosity) -> Vec<OutlineElement<'a>>
                             start_line,
                             start_offset,
                         )
-                        .with_length(
-                            byte_offset + line_len - start_offset,
-                            line_number - start_line + 1,
-                        ),
+                        .with_length(line_end - start_offset, line_number - start_line + 1),
                     );
                 }
                 in_function_body = false;
                 brace_depth = 0;
             }
         }
-
-        byte_offset += line_len + 1;
     }
 
     elements
@@ -781,16 +624,16 @@ enum FunctionParseResult<'a> {
 }
 
 /// Try to parse a line as a function signature
-fn try_parse_function_line<'a>(line: &'a [u8]) -> Option<FunctionParseResult<'a>> {
+fn try_parse_function_line(line: &[u8]) -> Option<FunctionParseResult<'_>> {
     // Must contain '(' for function
-    let paren_pos = find(line, b"(")?;
+    let open_paren = find(line, b"(")?;
 
     // Skip if empty before paren
-    if paren_pos == 0 {
+    if open_paren == 0 {
         return None;
     }
 
-    let before_paren = &line[..paren_pos];
+    let before_paren = &line[..open_paren];
 
     // Skip control flow statements
     let control_keywords = [
@@ -801,42 +644,39 @@ fn try_parse_function_line<'a>(line: &'a [u8]) -> Option<FunctionParseResult<'a>
         b"catch",
         b"return",
     ];
-    for kw in control_keywords {
-        if ends_with_identifier(before_paren, kw) {
+    for keyword in control_keywords {
+        if ends_with_identifier(before_paren, keyword) {
             return None;
         }
     }
 
     // Must have an identifier
-    let last_ident = extract_last_identifier(before_paren)?;
+    let last_identifier = extract_last_identifier(before_paren)?;
 
     // Skip macro-like names (all caps)
-    if last_ident
+    if last_identifier
         .iter()
-        .all(|&b| b.is_ascii_uppercase() || b == b'_')
-        && last_ident.len() > 1
+        .all(|&byte| byte.is_ascii_uppercase() || byte == b'_')
+        && last_identifier.len() > 1
     {
         return None;
     }
 
-    // Check for complete signature
-    let has_close_paren = find(&line[paren_pos..], b")").is_some();
-
-    if !has_close_paren {
-        // Multi-line signature
+    // A signature that does not close on this line continues on the next
+    let Some(close_paren) = find(&line[open_paren..], b")") else {
         return Some(FunctionParseResult::Incomplete(line.to_vec()));
-    }
+    };
 
     // Extract signature up to closing paren
-    let close_pos = paren_pos + find(&line[paren_pos..], b")").unwrap() + 1;
-    let sig = normalize_signature(&line[..close_pos]);
+    let signature_end = open_paren + close_paren + 1;
+    let signature = normalize_signature(&line[..signature_end]);
 
     // Check if declaration or definition
-    let after_sig = &line[close_pos..];
-    if find(after_sig, b";").is_some() {
-        Some(FunctionParseResult::Declaration(sig))
-    } else if find(after_sig, b"{").is_some() || find(line, b"{").is_some() {
-        Some(FunctionParseResult::DefinitionStart(sig))
+    let after_signature = &line[signature_end..];
+    if find(after_signature, b";").is_some() {
+        Some(FunctionParseResult::Declaration(signature))
+    } else if find(after_signature, b"{").is_some() || find(line, b"{").is_some() {
+        Some(FunctionParseResult::DefinitionStart(signature))
     } else {
         // Could be multi-line (attributes, const, etc.)
         Some(FunctionParseResult::Incomplete(line.to_vec()))
@@ -844,33 +684,25 @@ fn try_parse_function_line<'a>(line: &'a [u8]) -> Option<FunctionParseResult<'a>
 }
 
 /// Extract function signature from accumulated bytes
-fn extract_function_signature<'a>(data: &'a [u8]) -> Option<Cow<'a, [u8]>> {
-    let paren_pos = find(data, b"(")?;
-    let close_pos = paren_pos + find(&data[paren_pos..], b")")?;
-    Some(normalize_signature(&data[..close_pos + 1]))
+fn extract_function_signature(data: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let open_paren = find(data, b"(")?;
+    let close_paren = open_paren + find(&data[open_paren..], b")")?;
+    Some(normalize_signature(&data[..close_paren + 1]))
 }
 
-/// Parse #include directive
+/// Parse `#include` directive into the path and whether it is a system header
 fn parse_include(line: &[u8]) -> Option<(&[u8], bool)> {
-    // Skip "#include"
-    let after = &line[8..];
-    let trimmed = trim_start(after, usize::MAX);
+    let trimmed = line.strip_prefix(b"#include")?.trim_ascii_start();
 
-    if trimmed.starts_with(b"<") {
-        // System include
-        if let Some(end) = find(trimmed, b">") {
-            let path = &trimmed[1..end];
-            return Some((path, true));
-        }
-    } else if trimmed.starts_with(b"\"") {
-        // Local include
-        if let Some(end) = find(&trimmed[1..], b"\"") {
-            let path = &trimmed[1..end + 1];
-            return Some((path, false));
-        }
+    if let Some(system) = trimmed.strip_prefix(b"<") {
+        let end = find(system, b">")?;
+        Some((&system[..end], true))
+    } else if let Some(local) = trimmed.strip_prefix(b"\"") {
+        let end = find(local, b"\"")?;
+        Some((&local[..end], false))
+    } else {
+        None
     }
-
-    None
 }
 
 /// Count net brace changes (handling strings/chars)
@@ -900,64 +732,36 @@ fn count_braces(line: &[u8]) -> i32 {
 }
 
 /// Check if data ends with a given identifier
-fn ends_with_identifier(data: &[u8], ident: &[u8]) -> bool {
-    let trimmed = trim_both(data);
-    if trimmed.len() < ident.len() {
+fn ends_with_identifier(data: &[u8], identifier: &[u8]) -> bool {
+    let trimmed = data.trim_ascii();
+    let Some(before_suffix) = trimmed.len().checked_sub(identifier.len()) else {
         return false;
-    }
-
-    let suffix = &trimmed[trimmed.len() - ident.len()..];
-    if suffix != ident {
+    };
+    if &trimmed[before_suffix..] != identifier {
         return false;
     }
 
     // Must be word boundary before
-    if trimmed.len() > ident.len() {
-        let before = trimmed[trimmed.len() - ident.len() - 1];
-        if before.is_ascii_alphanumeric() || before == b'_' {
-            return false;
-        }
+    match before_suffix.checked_sub(1) {
+        Some(index) => !trimmed[index].is_ascii_alphanumeric() && trimmed[index] != b'_',
+        None => true,
     }
-
-    true
 }
 
 /// Extract last identifier from data
 fn extract_last_identifier(data: &[u8]) -> Option<&[u8]> {
-    let trimmed = trim_both(data);
-
-    // Find end of identifier (work backwards)
-    let mut end = trimmed.len();
-    while end > 0 && trimmed[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-
-    if end == 0 {
-        return None;
-    }
-
-    // Find start of identifier
-    let mut start = end;
-    while start > 0 {
-        let c = trimmed[start - 1];
-        if c.is_ascii_alphanumeric() || c == b'_' {
-            start -= 1;
-        } else {
-            break;
-        }
-    }
-
-    if start == end {
-        return None;
-    }
-
-    Some(&trimmed[start..end])
+    let trimmed = data.trim_ascii();
+    let width = trimmed
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        .count();
+    (width > 0).then(|| &trimmed[trimmed.len() - width..])
 }
 
 /// Normalize a function signature: collapse whitespace runs to single spaces,
-/// via StringZilla's SIMD whitespace splitter. Builds one output string (the old
-/// char-loop allocated twice: the buffer plus a trimmed copy).
-fn normalize_signature<'a>(data: &'a [u8]) -> Cow<'a, [u8]> {
+/// via StringZilla's SIMD whitespace splitter, into a single output buffer.
+fn normalize_signature(data: &[u8]) -> Cow<'_, [u8]> {
     let mut result: Vec<u8> = Vec::new();
     for token in data.sz_utf8_split_whitespaces().skip_empty() {
         if !result.is_empty() {
@@ -977,56 +781,22 @@ fn normalize_signature<'a>(data: &'a [u8]) -> Cow<'a, [u8]> {
 
 // region: String Utilities
 
-/// Trim leading whitespace (up to max_spaces)
-fn trim_start(data: &[u8], max_spaces: usize) -> &[u8] {
-    let mut count = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        if byte == b' ' || byte == b'\t' {
-            count += 1;
-            if count > max_spaces {
-                return &data[i..];
-            }
-        } else {
-            return &data[i..];
-        }
-    }
-    &[]
+/// Trim leading spaces and tabs, at most `max_indent` of them — Markdown treats a
+/// fourth leading space as indented code rather than as indentation.
+fn trim_start(data: &[u8], max_indent: usize) -> &[u8] {
+    let indent = data
+        .iter()
+        .take_while(|&&byte| byte == b' ' || byte == b'\t')
+        .count()
+        .min(max_indent);
+    &data[indent..]
 }
 
-/// Trim trailing whitespace
-fn trim_end(data: &[u8]) -> &[u8] {
-    let mut end = data.len();
-    while end > 0 && data[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &data[..end]
-}
-
-/// Trim both ends
-fn trim_both(data: &[u8]) -> &[u8] {
-    trim_end(trim_start(data, usize::MAX))
-}
-
-/// Remove trailing # characters from heading text
+/// Remove a heading's optional closing run of `#` characters and the space before it
 fn trim_trailing_hashes(data: &[u8]) -> &[u8] {
-    let mut end = data.len();
-
-    // Skip trailing whitespace
-    while end > 0 && data[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-
-    // Skip trailing #
-    while end > 0 && data[end - 1] == b'#' {
-        end -= 1;
-    }
-
-    // Skip whitespace before trailing #
-    while end > 0 && data[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-
-    &data[..end]
+    let text = data.trim_ascii_end();
+    let hashes = text.iter().rev().take_while(|&&byte| byte == b'#').count();
+    text[..text.len() - hashes].trim_ascii_end()
 }
 
 // endregion: String Utilities
@@ -1052,15 +822,15 @@ fn element_kind_name(kind: &ElementKind<'_>) -> &'static str {
 /// records carrying `parent_line`, rather than nested, which keeps `jq` filters simple.
 fn write_element_json(
     out: &mut dyn Write,
-    elem: &OutlineElement<'_>,
+    element: &OutlineElement<'_>,
     parent_line: Option<usize>,
 ) -> io::Result<()> {
     out.write_all(br#"{"type":"element","data":{"kind":""#)?;
-    out.write_all(element_kind_name(&elem.kind).as_bytes())?;
+    out.write_all(element_kind_name(&element.kind).as_bytes())?;
     out.write_all(br#"","name":"#)?;
-    json_text_field_to(out, &elem.name)?;
+    json_text_field_to(out, &element.name)?;
 
-    match &elem.kind {
+    match &element.kind {
         ElementKind::Heading { level } => write!(out, r#","level":{}"#, level)?,
         ElementKind::CodeBlock { language } => match language {
             Some(language) => {
@@ -1076,7 +846,7 @@ fn write_element_json(
     write!(
         out,
         r#","line_number":{},"line_count":{},"byte_offset":{},"byte_length":{}"#,
-        elem.line_number, elem.line_count, elem.byte_offset, elem.byte_length
+        element.line_number, element.line_count, element.byte_offset, element.byte_length
     )?;
     match parent_line {
         Some(line) => write!(out, r#","parent_line":{}"#, line)?,
@@ -1084,33 +854,32 @@ fn write_element_json(
     }
     out.write_all(b"}}\n")?;
 
-    for child in &elem.children {
-        write_element_json(out, child, Some(elem.line_number))?;
+    for child in &element.children {
+        write_element_json(out, child, Some(element.line_number))?;
     }
     Ok(())
 }
 
 fn write_element(
     out: &mut dyn Write,
-    elem: &OutlineElement<'_>,
+    element: &OutlineElement<'_>,
     verbosity: Verbosity,
     file_type: FileType,
 ) -> io::Result<()> {
     match file_type {
-        FileType::Markdown => write_markdown_element(out, elem, verbosity),
-        FileType::CSource | FileType::CHeader => write_c_element(out, elem, verbosity),
-        FileType::Unknown => Ok(()),
+        FileType::Markdown => write_markdown_element(out, element, verbosity),
+        FileType::CSource | FileType::CHeader => write_c_element(out, element, verbosity),
     }
 }
 
 fn write_markdown_element(
     out: &mut dyn Write,
-    elem: &OutlineElement<'_>,
+    element: &OutlineElement<'_>,
     verbosity: Verbosity,
 ) -> io::Result<()> {
     // `Cow<[u8]>` is not `Display`; `from_utf8_lossy` borrows for valid UTF-8.
-    let name = String::from_utf8_lossy(&elem.name);
-    match &elem.kind {
+    let name = String::from_utf8_lossy(&element.name);
+    match &element.kind {
         ElementKind::Heading { level } => {
             // Headings are levels 1..=6 — slice a static run, no allocation.
             let prefix = &"######"[..(*level as usize).min(6)];
@@ -1119,29 +888,33 @@ fn write_markdown_element(
                 Verbosity::LineNumbers => writeln!(
                     out,
                     "{} {:40} [L{}, @{}]",
-                    prefix, name, elem.line_number, elem.byte_offset
+                    prefix, name, element.line_number, element.byte_offset
                 )?,
                 Verbosity::Detailed => {
-                    let end_line = elem.line_number + elem.line_count - 1;
-                    if elem.line_count > 1 {
+                    let end_line = element.line_number + element.line_count - 1;
+                    if element.line_count > 1 {
                         writeln!(
                             out,
                             "{} {:40} [L{}-{}, @{}, {}B]",
                             prefix,
                             name,
-                            elem.line_number,
+                            element.line_number,
                             end_line,
-                            elem.byte_offset,
-                            elem.byte_length
+                            element.byte_offset,
+                            element.byte_length
                         )?;
                     } else {
                         writeln!(
                             out,
                             "{} {:40} [L{}, @{}, {}B]",
-                            prefix, name, elem.line_number, elem.byte_offset, elem.byte_length
+                            prefix,
+                            name,
+                            element.line_number,
+                            element.byte_offset,
+                            element.byte_length
                         )?;
                     }
-                    for child in &elem.children {
+                    for child in &element.children {
                         write_child_block(out, child)?;
                     }
                 }
@@ -1149,15 +922,17 @@ fn write_markdown_element(
         }
         ElementKind::CodeBlock { language } => {
             if verbosity >= Verbosity::Detailed {
-                let lang_cow = language.as_ref().map(|l| String::from_utf8_lossy(l));
-                let lang_str = lang_cow.as_deref().unwrap_or("code");
+                let info = language
+                    .as_ref()
+                    .map(|bytes| String::from_utf8_lossy(bytes));
+                let label = info.as_deref().unwrap_or("code");
                 writeln!(
                     out,
                     "  - {} [L{}-{}, {}B]",
-                    lang_str,
-                    elem.line_number,
-                    elem.line_number + elem.line_count - 1,
-                    elem.byte_length
+                    label,
+                    element.line_number,
+                    element.line_number + element.line_count - 1,
+                    element.byte_length
                 )?;
             }
         }
@@ -1166,11 +941,11 @@ fn write_markdown_element(
     Ok(())
 }
 
-fn write_child_block(out: &mut dyn Write, elem: &OutlineElement<'_>) -> io::Result<()> {
-    // Constant labels borrow; only code(lang)/image build a small owned label for the {:36} pad.
-    let kind_str: Cow<str> = match &elem.kind {
+fn write_child_block(out: &mut dyn Write, element: &OutlineElement<'_>) -> io::Result<()> {
+    // Constant labels borrow; only code and image build a small owned label for the {:36} pad.
+    let label: Cow<str> = match &element.kind {
         ElementKind::CodeBlock { language } => match language {
-            Some(l) => Cow::Owned(format!("code ({})", String::from_utf8_lossy(l))),
+            Some(bytes) => Cow::Owned(format!("code ({})", String::from_utf8_lossy(bytes))),
             None => Cow::Borrowed("code"),
         },
         ElementKind::Blockquote => Cow::Borrowed("blockquote"),
@@ -1182,32 +957,32 @@ fn write_child_block(out: &mut dyn Write, elem: &OutlineElement<'_>) -> io::Resu
         _ => Cow::Borrowed("block"),
     };
 
-    if elem.line_count > 1 {
+    if element.line_count > 1 {
         writeln!(
             out,
             "  - {:36} [L{}-{}, {}B]",
-            kind_str,
-            elem.line_number,
-            elem.line_number + elem.line_count - 1,
-            elem.byte_length
+            label,
+            element.line_number,
+            element.line_number + element.line_count - 1,
+            element.byte_length
         )
     } else {
         writeln!(
             out,
             "  - {:36} [L{}, {}B]",
-            kind_str, elem.line_number, elem.byte_length
+            label, element.line_number, element.byte_length
         )
     }
 }
 
 fn write_c_element(
     out: &mut dyn Write,
-    elem: &OutlineElement<'_>,
+    element: &OutlineElement<'_>,
     verbosity: Verbosity,
 ) -> io::Result<()> {
     // `Cow<[u8]>` is not `Display`; `from_utf8_lossy` borrows for valid UTF-8.
-    let name = String::from_utf8_lossy(&elem.name);
-    match &elem.kind {
+    let name = String::from_utf8_lossy(&element.name);
+    match &element.kind {
         ElementKind::Include { is_system } => {
             let (open, close) = if *is_system { ("<", ">") } else { ("\"", "\"") };
             match verbosity {
@@ -1220,7 +995,7 @@ fn write_c_element(
                     writeln!(
                         out,
                         "#include {:36} [L{}, @{}]",
-                        path, elem.line_number, elem.byte_offset
+                        path, element.line_number, element.byte_offset
                     )?;
                 }
             }
@@ -1230,35 +1005,35 @@ fn write_c_element(
             Verbosity::LineNumbers => writeln!(
                 out,
                 "{:44} [L{}, @{}, declaration]",
-                name, elem.line_number, elem.byte_offset
+                name, element.line_number, element.byte_offset
             )?,
             Verbosity::Detailed => writeln!(
                 out,
                 "{:44} [L{}, @{}, {}B, declaration]",
-                name, elem.line_number, elem.byte_offset, elem.byte_length
+                name, element.line_number, element.byte_offset, element.byte_length
             )?,
         },
         ElementKind::FunctionDefinition => match verbosity {
             Verbosity::Names => writeln!(out, "{:44} [definition]", name)?,
             Verbosity::LineNumbers => {
-                let end_line = elem.line_number + elem.line_count - 1;
+                let end_line = element.line_number + element.line_count - 1;
                 writeln!(
                     out,
                     "{:44} [L{}-{}, @{}, definition]",
-                    name, elem.line_number, end_line, elem.byte_offset
+                    name, element.line_number, end_line, element.byte_offset
                 )?;
             }
             Verbosity::Detailed => {
-                let end_line = elem.line_number + elem.line_count - 1;
+                let end_line = element.line_number + element.line_count - 1;
                 writeln!(
                     out,
                     "{:44} [L{}-{}, @{}, {}B, {} lines, definition]",
                     name,
-                    elem.line_number,
+                    element.line_number,
                     end_line,
-                    elem.byte_offset,
-                    elem.byte_length,
-                    elem.line_count
+                    element.byte_offset,
+                    element.byte_length,
+                    element.line_count
                 )?;
             }
         },
@@ -1273,6 +1048,7 @@ fn write_c_element(
 
 fn main() {
     let args = Args::parse();
+    let mut handle = stdout_writer();
 
     let verbosity = match args.verbose {
         0 => Verbosity::Names,
@@ -1281,45 +1057,35 @@ fn main() {
     };
 
     // Determine file type
-    let file_type = if let Some(ref ft) = args.file_type {
-        parse_file_type(ft)
-    } else if args.input != "-" {
-        detect_file_type(&args.input)
-    } else {
-        eprintln!("Error: cannot detect file type from stdin, use --type");
-        process::exit(1);
-    };
-
-    if file_type == FileType::Unknown {
-        eprintln!("Error: unknown file type, use --type to specify (md, c, h)");
-        process::exit(1);
-    }
-
-    // Get input — mmap is borrowed, not copied.
-    let input = match shared::get_input(Some(&args.input)) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
+    let detected = match args.file_type {
+        Some(ref name) => parse_file_type(name),
+        None if args.input != "-" => detect_file_type(&args.input),
+        None => {
+            eprintln!("Error: cannot detect file type from stdin, use --type");
+            ExitCode::Error.exit(&mut handle);
         }
     };
+    let Some(file_type) = detected else {
+        eprintln!("Error: unknown file type, use --type to specify (md, c, h)");
+        ExitCode::Error.exit(&mut handle);
+    };
+
+    // Get input — mmap is borrowed, not copied.
+    let input = get_input(Some(&args.input))
+        .unwrap_or_else(|error| exit_with_error(&mut handle, &error, "Error reading input"));
     let data = input.as_bytes();
 
     // Parse based on file type
     let elements = match file_type {
         FileType::Markdown => parse_markdown(data, verbosity),
         FileType::CSource | FileType::CHeader => parse_c(data, verbosity),
-        FileType::Unknown => Vec::new(),
     };
 
-    // Output
-    let mut handle = stdout_writer();
-
-    for elem in &elements {
+    for element in &elements {
         let written = if args.json {
-            write_element_json(&mut handle, elem, None)
+            write_element_json(&mut handle, element, None)
         } else {
-            write_element(&mut handle, elem, verbosity, file_type)
+            write_element(&mut handle, element, verbosity, file_type)
         };
         if let Err(error) = written {
             if error.kind() == io::ErrorKind::BrokenPipe {
@@ -1368,8 +1134,9 @@ mod tests {
         assert!(is_code_fence(b"text").is_none());
 
         // Check language extraction
-        let (_, lang) = is_code_fence(b"```rust").unwrap();
-        assert_eq!(lang, Some(Cow::Borrowed(b"rust".as_slice())));
+        let fence = is_code_fence(b"```rust").unwrap();
+        assert_eq!(fence.marker, b'`');
+        assert_eq!(fence.language, Some(Cow::Borrowed(b"rust".as_slice())));
     }
 
     #[test]
@@ -1382,6 +1149,11 @@ mod tests {
             parse_include(b"#include \"myheader.h\""),
             Some((b"myheader.h".as_slice(), false))
         );
+
+        // Lines shorter than the directive, and other directives, are rejected
+        assert_eq!(parse_include(b"#inc"), None);
+        assert_eq!(parse_include(b"#include"), None);
+        assert_eq!(parse_include(b"#define STDIO 1"), None);
     }
 
     #[test]
@@ -1431,6 +1203,67 @@ mod tests {
             elements[1].kind,
             ElementKind::Heading { level: 2 }
         ));
+    }
+
+    #[test]
+    fn markdown_block_spans_never_overlap() {
+        // A quote line ends the table above it, so the two spans stay disjoint
+        // instead of the quote nesting inside a still-open table.
+        let markdown = b"# Head\n\n| a | b |\n| - | - |\n> quoted\n\ntail\n";
+        let elements = parse_markdown(markdown, Verbosity::Detailed);
+        let blocks = &elements[0].children;
+
+        for pair in blocks.windows(2) {
+            let (earlier, later) = (&pair[0], &pair[1]);
+            assert!(
+                earlier.byte_offset + earlier.byte_length <= later.byte_offset,
+                "{:?} at {}..{} overlaps {:?} at {}",
+                earlier.kind,
+                earlier.byte_offset,
+                earlier.byte_offset + earlier.byte_length,
+                later.kind,
+                later.byte_offset
+            );
+            assert!(
+                earlier.line_number + earlier.line_count <= later.line_number,
+                "{:?} and {:?} share a line",
+                earlier.kind,
+                later.kind
+            );
+        }
+
+        let kinds: Vec<&ElementKind<'_>> = blocks.iter().map(|block| &block.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                &ElementKind::Table,
+                &ElementKind::Blockquote,
+                &ElementKind::Paragraph
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_block_at_end_of_input_stops_at_the_last_byte() {
+        // Without a trailing newline the final block must not claim a byte past the end.
+        let markdown = b"# Head\n\nparagraph";
+        let elements = parse_markdown(markdown, Verbosity::Detailed);
+        let paragraph = &elements[0].children[0];
+
+        assert!(matches!(paragraph.kind, ElementKind::Paragraph));
+        assert_eq!(
+            paragraph.byte_offset + paragraph.byte_length,
+            markdown.len()
+        );
+
+        // With the trailing newline the block owns it, and still ends at the last byte.
+        let terminated = b"# Head\n\nparagraph\n";
+        let elements = parse_markdown(terminated, Verbosity::Detailed);
+        let paragraph = &elements[0].children[0];
+        assert_eq!(
+            paragraph.byte_offset + paragraph.byte_length,
+            terminated.len()
+        );
     }
 
     #[test]

@@ -49,16 +49,17 @@
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Write};
+use std::ops::{ControlFlow, Range};
 use std::path::Path;
-use std::process;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
 use ignore::WalkBuilder;
-use stringzilla::sz::{find, rfind, utf8_uncased_search, StringZillableBinary};
+use stringzilla::sz::{find, rfind, utf8_uncased_search, StringZillableBinary, Utf8UncasedNeedle};
 
 mod shared;
 use shared::*;
+
+// region: CLI
 
 /// SIMD-accelerated substring search
 #[derive(Parser)]
@@ -222,7 +223,12 @@ impl std::str::FromStr for ColorChoice {
     }
 }
 
+// endregion: CLI
+
+// region: Output Configuration
+
 /// ANSI color codes
+#[derive(Clone, Copy)]
 struct Colors {
     filename: &'static str,
     line_number: &'static str,
@@ -268,41 +274,86 @@ enum OutputFormat {
     Json,     // JSON Lines format (ripgrep-compatible)
 }
 
-/// Statistics for the search
-#[derive(Default)]
-struct Stats {
-    files_searched: AtomicUsize,
-    files_matched: AtomicUsize,
-    lines_searched: AtomicUsize,
-    matches_found: AtomicUsize,
-    bytes_searched: AtomicUsize,
-}
-
-/// Search configuration
-struct SearchConfig<'a> {
-    pattern: &'a [u8],
-    ignore_case: bool,
-    line_number: bool,
-    count: bool,
-    files_with_matches: bool,
-    files_without_match: bool,
-    before_context: usize,
-    after_context: usize,
-    utf8: bool,
-    multiline: bool,
-    invert_match: bool,
-    whole_word: bool,
-    max_count: Option<usize>,
-    quiet: bool,
+/// Everything the line emitters read, resolved once from the flags.
+/// Only the printing paths hold one; [`SearchPath::Tally`] has no emitter.
+#[derive(Clone, Copy)]
+struct Printer {
+    output_format: OutputFormat,
     colors: Colors,
     show_filename: bool,
-    // New output options
+    line_number: bool,
     column: bool,
     byte_offset: bool,
     only_matching: bool,
-    output_format: OutputFormat,
     max_columns: Option<usize>,
+    /// Whether a selected line holds match positions to point at. `-v` selects the lines
+    /// that hold none, leaving columns, `-o` and `--vimgrep` nothing to resolve.
+    locates_matches: bool,
+    /// Whether a printed matching line has its matches wrapped in color codes.
+    highlight: bool,
 }
+
+impl Printer {
+    /// Collapse the output flags into the form every emitter reads.
+    fn new(args: &Args, multiple_inputs: bool) -> Self {
+        let output_format = if args.json {
+            OutputFormat::Json
+        } else if args.vimgrep {
+            OutputFormat::Vimgrep
+        } else if args.heading {
+            OutputFormat::Heading
+        } else {
+            OutputFormat::Standard
+        };
+
+        // JSON carries its own structure, so escape codes would corrupt it. `-q` and
+        // `-c` need no test here: a silent run tallies and never builds a `Printer`.
+        let use_color = match args.color {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => io::stdout().is_terminal() && output_format != OutputFormat::Json,
+        };
+        let colors = if use_color {
+            Colors::enabled()
+        } else {
+            Colors::disabled()
+        };
+
+        Self {
+            output_format,
+            colors,
+            show_filename: multiple_inputs && output_format != OutputFormat::Heading,
+            // Vimgrep implies line numbers and columns.
+            line_number: args.line_number || args.vimgrep,
+            column: args.column || args.vimgrep,
+            byte_offset: args.byte_offset,
+            only_matching: args.only_matching,
+            max_columns: args.max_columns,
+            locates_matches: !args.invert_match,
+            // `-o`, `--json` and `--vimgrep` reproduce the match text themselves,
+            // and an inverted line holds no match to wrap.
+            highlight: !colors.match_highlight.is_empty()
+                && !args.invert_match
+                && !args.only_matching
+                && output_format != OutputFormat::Json
+                && output_format != OutputFormat::Vimgrep,
+        }
+    }
+}
+
+/// What `--stats` reports, summed over the walk, which runs on this thread alone.
+#[derive(Default)]
+struct Stats {
+    files_searched: usize,
+    files_matched: usize,
+    lines_searched: usize,
+    matches_found: usize,
+    bytes_searched: usize,
+}
+
+// endregion: Output Configuration
+
+// region: Matching
 
 /// Check if byte is a word boundary character
 #[inline]
@@ -333,6 +384,33 @@ impl MatchInfo {
     fn column(&self) -> usize {
         self.offset + 1
     }
+
+    /// The matched bytes, borrowed from the line the match was found in.
+    #[inline]
+    fn text<'a>(&self, line: &'a [u8]) -> &'a [u8] {
+        &line[self.offset..self.offset + self.length]
+    }
+}
+
+/// The pattern in the form its search kernel takes.
+///
+/// The uncased variant borrows an already analyzed needle, so the metadata is
+/// computed once rather than on every call.
+#[derive(Clone, Copy)]
+enum Needle<'a> {
+    Cased(&'a [u8]),
+    Uncased(&'a Utf8UncasedNeedle<'a>),
+}
+
+impl<'a> Needle<'a> {
+    /// Pick the uncased needle when one was built, the raw pattern otherwise.
+    #[inline]
+    fn new(pattern: &'a [u8], uncased: Option<&'a Utf8UncasedNeedle<'a>>) -> Self {
+        match uncased {
+            Some(uncased) => Needle::Uncased(uncased),
+            None => Needle::Cased(pattern),
+        }
+    }
 }
 
 /// Zero-allocation iterator over pattern matches in data.
@@ -342,20 +420,18 @@ impl MatchInfo {
 /// may return matches of different lengths than the pattern.
 struct MatchIter<'a> {
     data: &'a [u8],
-    pattern: &'a [u8],
+    needle: Needle<'a>,
     pos: usize,
-    ignore_case: bool,
     whole_word: bool,
 }
 
 impl<'a> MatchIter<'a> {
     #[inline]
-    fn new(data: &'a [u8], pattern: &'a [u8], ignore_case: bool, whole_word: bool) -> Self {
+    fn new(data: &'a [u8], needle: Needle<'a>, whole_word: bool) -> Self {
         Self {
             data,
-            pattern,
+            needle,
             pos: 0,
-            ignore_case,
             whole_word,
         }
     }
@@ -368,11 +444,9 @@ impl<'a> Iterator for MatchIter<'a> {
         while self.pos < self.data.len() {
             let remaining = &self.data[self.pos..];
 
-            let (offset, len) = if self.ignore_case {
-                utf8_uncased_search(remaining, self.pattern)?
-            } else {
-                let off = find(remaining, self.pattern)?;
-                (off, self.pattern.len())
+            let (offset, len) = match self.needle {
+                Needle::Uncased(needle) => utf8_uncased_search(remaining, needle)?,
+                Needle::Cased(pattern) => (find(remaining, pattern)?, pattern.len()),
             };
 
             let abs_start = self.pos + offset;
@@ -394,645 +468,982 @@ impl<'a> Iterator for MatchIter<'a> {
     }
 }
 
-/// Create a match iterator from SearchConfig
-#[inline]
-fn matches<'a>(data: &'a [u8], config: &'a SearchConfig) -> MatchIter<'a> {
-    MatchIter::new(data, config.pattern, config.ignore_case, config.whole_word)
+/// The needle plus the boundary rule every search call shares.
+struct Matcher<'a> {
+    pattern: &'a [u8],
+    /// Present only under `-i`, holding the needle analysis shared by every search.
+    uncased_needle: Option<Utf8UncasedNeedle<'a>>,
+    whole_word: bool,
 }
 
-/// Highlight matches in a line, writing to a reusable buffer.
+impl Matcher<'_> {
+    /// The needle in the form the kernels take, borrowing the cached analysis.
+    #[inline]
+    fn needle(&self) -> Needle<'_> {
+        Needle::new(self.pattern, self.uncased_needle.as_ref())
+    }
+
+    /// Iterate every match within `data`.
+    #[inline]
+    fn matches<'d>(&'d self, data: &'d [u8]) -> MatchIter<'d> {
+        MatchIter::new(data, self.needle(), self.whole_word)
+    }
+}
+
+/// What every search path reads: the needle, the line split, and the selection rules.
+struct Search<'a> {
+    matcher: Matcher<'a>,
+    newlines: Newlines,
+    multiline: bool,
+    invert_match: bool,
+    max_count: Option<usize>,
+}
+
+impl Search<'_> {
+    /// Whether the line belongs in the result, accounting for `-v`.
+    #[inline]
+    fn selects(&self, line: &[u8]) -> bool {
+        self.matcher.matches(line).next().is_some() != self.invert_match
+    }
+}
+
+// endregion: Matching
+
+// region: Search Paths
+
+/// Lines of context requested on each side of a match.
+#[derive(Clone, Copy)]
+struct Context {
+    before: usize,
+    after: usize,
+}
+
+impl Context {
+    /// No surrounding lines, which is what every path but `PrintContext` carries.
+    #[inline]
+    fn none() -> Self {
+        Context {
+            before: 0,
+            after: 0,
+        }
+    }
+}
+
+/// What the per-line loop must remember between lines, decided once from the flags.
 ///
-/// Returns the number of bytes written. If 0, no highlighting was needed
-/// (caller should use the original line directly for zero-copy output).
-fn highlight_line(line: &[u8], config: &SearchConfig, buffer: &mut Vec<u8>) -> usize {
-    buffer.clear();
-
-    // Return 0 if no highlighting needed
-    if config.colors.match_highlight.is_empty() || config.invert_match {
-        return 0;
-    }
-
-    // Reserve capacity to minimize allocations during building
-    buffer.reserve(line.len() + 64);
-
-    let mut last_end = 0;
-    let mut found_match = false;
-
-    for m in matches(line, config) {
-        found_match = true;
-        // Add text before this match
-        buffer.extend_from_slice(&line[last_end..m.offset]);
-        // Add highlighted match
-        buffer.extend_from_slice(config.colors.match_highlight.as_bytes());
-        buffer.extend_from_slice(&line[m.offset..m.offset + m.length]);
-        buffer.extend_from_slice(config.colors.reset.as_bytes());
-        last_end = m.offset + m.length;
-    }
-
-    // If no matches found, return 0
-    if !found_match {
-        buffer.clear();
-        return 0;
-    }
-
-    // Add remaining text after last match
-    buffer.extend_from_slice(&line[last_end..]);
-    buffer.len()
+/// The split axis is the carried state, not the flag: output format, `-i`, `-o`,
+/// `-v` and `-w` all change what an emitter writes, not what the loop holds.
+#[derive(Clone, Copy)]
+enum SearchPath {
+    /// Two counters. Serves `-q`, `-c`, `-l` and `-L`.
+    Tally { stop_at_first: bool },
+    /// Counters plus a heading bit. Serves every format without context lines.
+    Print(Printer),
+    /// Counters, heading, a look-behind ring and group separators. Serves `-B`, `-A`, `-C`.
+    PrintContext(Printer, Context),
 }
+
+impl SearchPath {
+    /// Pick the path: existence only, plain printing, or printing with context.
+    fn choose(args: &Args, context: Context, multiple_inputs: bool) -> Self {
+        let silent =
+            args.quiet || args.count || args.files_with_matches || args.files_without_match;
+        if silent {
+            // `-c` must see every line. `-q`, `-l` and `-L` need only one hit — except
+            // under `--stats`, whose totals would otherwise describe a prefix of the file.
+            let exists_only = args.quiet || args.files_with_matches || args.files_without_match;
+            return SearchPath::Tally {
+                stop_at_first: exists_only && !args.count && !args.stats,
+            };
+        }
+
+        let printer = Printer::new(args, multiple_inputs);
+        if context.before == 0 && context.after == 0 {
+            SearchPath::Print(printer)
+        } else {
+            SearchPath::PrintContext(printer, context)
+        }
+    }
+
+    /// The emitter this path prints through, absent for the tally.
+    #[inline]
+    fn printer(&self) -> Option<&Printer> {
+        match self {
+            SearchPath::Tally { .. } => None,
+            SearchPath::Print(printer) | SearchPath::PrintContext(printer, _) => Some(printer),
+        }
+    }
+
+    /// The surrounding lines this path prints, none for the two that print none.
+    #[inline]
+    fn context(&self) -> Context {
+        match self {
+            SearchPath::PrintContext(_, context) => *context,
+            SearchPath::Tally { .. } | SearchPath::Print(_) => Context::none(),
+        }
+    }
+}
+
+// endregion: Search Paths
+
+// region: Line Loops
 
 /// Search result for a single file
 struct FileResult {
-    path: String,
     match_count: usize,
     lines_searched: usize,
+    bytes_searched: usize,
 }
 
-/// Search a memory-mapped file
-fn search_mmap(
+/// A line held for look-behind: its number, and its span within the current window,
+/// which the whole-slice paths open at byte zero.
+struct ContextLine {
+    line_number: usize,
+    span: Range<usize>,
+}
+
+/// The look-behind ring, pending after-context and group separator that `-B`, `-A`
+/// and `-C` carry from one line to the next.
+struct ContextState {
+    lines: Context,
+    /// Window offsets rather than copies, and `lines.before` entries is the exact ceiling.
+    /// Empty under `-A` alone, which is what lets that path stream.
+    behind: VecDeque<ContextLine>,
+    pending_after: usize,
+    last_printed_line: Option<usize>,
+    need_separator: bool,
+}
+
+impl ContextState {
+    /// A ring sized to the look-behind actually requested, allocating nothing at zero.
+    fn new(lines: Context) -> Self {
+        ContextState {
+            lines,
+            behind: VecDeque::with_capacity(lines.before),
+            pending_after: 0,
+            last_printed_line: None,
+            need_separator: false,
+        }
+    }
+}
+
+/// What a search path remembers between lines, and between windows once the input
+/// streams: the counters, the once-per-file heading bit and the context ring.
+struct Progress {
+    match_count: usize,
+    lines_searched: usize,
+    /// Offset of the current window's first byte within the whole input, which keeps
+    /// `-b`, `--json` and `--vimgrep` absolute across a streamed run.
+    window_base: usize,
+    printed_heading: bool,
+    /// Grown on the first highlighted line and reused for every later one.
+    highlight_buffer: Vec<u8>,
+    context: ContextState,
+}
+
+impl Progress {
+    /// Start a file at line zero, byte zero, with nothing printed yet.
+    fn new(lines: Context) -> Self {
+        Progress {
+            match_count: 0,
+            lines_searched: 0,
+            window_base: 0,
+            printed_heading: false,
+            highlight_buffer: Vec::new(),
+            context: ContextState::new(lines),
+        }
+    }
+
+    /// Whether `-m` is already satisfied, which is where every path stops reporting.
+    #[inline]
+    fn exhausted(&self, search: &Search) -> bool {
+        search.max_count.is_some_and(|max| self.match_count >= max)
+    }
+
+    /// The totals this file contributes, over `bytes_searched` bytes of input.
+    fn result(&self, bytes_searched: usize) -> FileResult {
+        FileResult {
+            match_count: self.match_count,
+            lines_searched: self.lines_searched,
+            bytes_searched,
+        }
+    }
+}
+
+/// Search one whole slice, which is the shape a mapped or buffered input already has.
+fn search_slice(
     data: &[u8],
     filename: &str,
-    config: &SearchConfig,
+    search: &Search,
+    path: &SearchPath,
     output: &mut dyn Write,
-    max_reached: &AtomicBool,
+    max_reached: &mut bool,
 ) -> io::Result<FileResult> {
-    if config.multiline {
-        search_multiline(data, filename, config, output, max_reached)
-    } else if config.utf8 {
-        search_intraline(
-            data,
-            LineIter::new(data, Newlines::Unicode),
+    if search.multiline {
+        return search_multiline(data, filename, search, path, output, max_reached);
+    }
+    let mut progress = Progress::new(path.context());
+    // One window spans the whole input, so there is nothing left to stop for.
+    let _ = search_window(
+        data,
+        filename,
+        search,
+        path,
+        &mut progress,
+        output,
+        max_reached,
+    )?;
+    print_json_end(output, filename, path, &progress)?;
+    Ok(progress.result(data.len()))
+}
+
+/// Run one window through the chosen path, folding its lines into `progress`.
+/// Breaks once the path has reported everything it will, which ends a streamed read.
+fn search_window(
+    window: &[u8],
+    filename: &str,
+    search: &Search,
+    path: &SearchPath,
+    progress: &mut Progress,
+    output: &mut dyn Write,
+    max_reached: &mut bool,
+) -> io::Result<ControlFlow<()>> {
+    match path {
+        SearchPath::Tally { stop_at_first } => Ok(tally_window(
+            window,
+            search,
+            *stop_at_first,
+            progress,
+            max_reached,
+        )),
+        SearchPath::Print(printer) => print_window(
+            window,
             filename,
-            config,
+            search,
+            printer,
+            progress,
             output,
             max_reached,
-        )
-    } else {
-        search_intraline(
-            data,
-            LineIter::new(data, Newlines::Lf),
+        ),
+        SearchPath::PrintContext(printer, _) => print_context_window(
+            window,
             filename,
-            config,
+            search,
+            printer,
+            progress,
             output,
             max_reached,
-        )
+        ),
     }
 }
 
-/// Context line info: (line_number, start_offset, end_offset)
-/// The actual line data is sliced from the original buffer when needed.
-type ContextLine = (usize, usize, usize);
+/// Count matching lines, stopping at the first when only existence is reported.
+/// Carries two counters, so it allocates nothing and resolves no offsets.
+fn tally_window(
+    window: &[u8],
+    search: &Search,
+    stop_at_first: bool,
+    progress: &mut Progress,
+    max_reached: &mut bool,
+) -> ControlFlow<()> {
+    for line in LineIter::new(window, search.newlines) {
+        // Counted before the limit is tested, so `--stats` includes the line that trips `-m`.
+        progress.lines_searched += 1;
+        if progress.exhausted(search) {
+            *max_reached = true;
+            return ControlFlow::Break(());
+        }
 
-/// Search using intra-line matching (lazy iteration)
-///
-/// `data` is the original buffer - lines from the iterator are slices into this buffer.
-/// This allows storing offsets in the context buffer instead of copying line data.
-fn search_intraline<'a, I>(
-    data: &'a [u8],
-    iter: I,
+        if search.selects(line) {
+            progress.match_count += 1;
+            if stop_at_first {
+                return ControlFlow::Break(());
+            }
+        }
+    }
+    ControlFlow::Continue(())
+}
+
+/// Print matching lines, carrying counters and the once-per-file heading bit.
+fn print_window(
+    window: &[u8],
     filename: &str,
-    config: &SearchConfig,
+    search: &Search,
+    printer: &Printer,
+    progress: &mut Progress,
     output: &mut dyn Write,
-    max_reached: &AtomicBool,
-) -> io::Result<FileResult>
-where
-    I: Iterator<Item = &'a [u8]>,
-{
-    let mut match_count = 0;
-    let mut lines_searched = 0;
-    let mut context_before: VecDeque<ContextLine> =
-        VecDeque::with_capacity(config.before_context + 1);
-    let mut pending_after: usize = 0;
-    let mut last_printed_line: Option<usize> = None;
-    let mut need_separator = false;
-    let mut printed_heading = false;
-    // Reusable buffer for highlighting (avoids per-line allocation)
-    let mut highlight_buffer = Vec::with_capacity(512);
+    max_reached: &mut bool,
+) -> io::Result<ControlFlow<()>> {
+    let mut emitter = Emitter {
+        output,
+        filename,
+        search,
+        printer,
+    };
+    for line in LineIter::new(window, search.newlines) {
+        // Counted before the limit is tested, so `--stats` includes the line that trips `-m`.
+        progress.lines_searched += 1;
+        if progress.exhausted(search) {
+            *max_reached = true;
+            return Ok(ControlFlow::Break(()));
+        }
 
-    for (line_num, line) in iter.enumerate() {
-        lines_searched += 1;
-        let line_num_1based = line_num + 1;
+        if !search.selects(line) {
+            continue;
+        }
+        progress.match_count += 1;
+
+        let record = LineRecord {
+            line,
+            line_number: progress.lines_searched,
+            // Taken from the slice itself. Accumulating `line.len() + 1` assumes a
+            // one-byte terminator and is wrong by one per CR, two per LS or PS.
+            byte_offset: progress.window_base + offset_within(window, line),
+            is_match: true,
+        };
+        emitter.file_heading(&mut progress.printed_heading)?;
+        emitter.match_line(record, &mut progress.highlight_buffer)?;
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+/// Print matching lines with their surrounding context, carrying a look-behind ring
+/// of window offsets, the pending after-context count, and separators.
+fn print_context_window(
+    window: &[u8],
+    filename: &str,
+    search: &Search,
+    printer: &Printer,
+    progress: &mut Progress,
+    output: &mut dyn Write,
+    max_reached: &mut bool,
+) -> io::Result<ControlFlow<()>> {
+    let mut emitter = Emitter {
+        output,
+        filename,
+        search,
+        printer,
+    };
+    for line in LineIter::new(window, search.newlines) {
+        // Counted before the limit is tested, so `--stats` includes the line that trips `-m`.
+        progress.lines_searched += 1;
+        if progress.exhausted(search) {
+            *max_reached = true;
+            return Ok(ControlFlow::Break(()));
+        }
+
+        let line_number = progress.lines_searched;
         // Taken from the slice itself. Accumulating `line.len() + 1` assumes a
         // one-byte terminator and is wrong by one per CR, two per LS or PS.
-        let current_byte_offset = offset_within(data, line);
+        let line_start = offset_within(window, line);
+        let byte_offset = progress.window_base + line_start;
 
-        // Check if we've hit max count
-        if let Some(max) = config.max_count {
-            if match_count >= max {
-                max_reached.store(true, Ordering::Relaxed);
-                break;
-            }
-        }
+        if search.selects(line) {
+            progress.match_count += 1;
+            emitter.file_heading(&mut progress.printed_heading)?;
 
-        let is_match = matches(line, config).next().is_some() != config.invert_match;
-
-        if is_match {
-            match_count += 1;
-
-            if config.quiet
-                || config.count
-                || config.files_with_matches
-                || config.files_without_match
-            {
-                // Maintain context buffer even when not printing (store offsets, not copies)
-                if config.before_context > 0 {
-                    if context_before.len() >= config.before_context {
-                        context_before.pop_front();
-                    }
-                    context_before.push_back((
-                        line_num_1based,
-                        current_byte_offset,
-                        current_byte_offset + line.len(),
-                    ));
-                }
-                continue;
+            // A gap since the last line printed opens a group, and `grep -C` divides
+            // groups with `--`.
+            let follows_a_gap = progress
+                .context
+                .last_printed_line
+                .is_some_and(|last| line_number > last + 1);
+            if follows_a_gap && progress.context.need_separator {
+                emitter.group_separator()?;
             }
 
-            // Print heading (filename header) on first match for this file
-            if config.output_format == OutputFormat::Heading && !printed_heading {
-                writeln!(
-                    output,
-                    "{}{}{}",
-                    config.colors.filename, filename, config.colors.reset
-                )?;
-                printed_heading = true;
-            }
-
-            // Print JSON begin message on first match
-            if config.output_format == OutputFormat::Json && !printed_heading {
-                output.write_all(br#"{"type":"begin","data":{"path":{"text":""#)?;
-                json_escape_to(output, filename.as_bytes())?;
-                output.write_all(b"\"}}}\n")?;
-                printed_heading = true;
-            }
-
-            // Print separator between non-contiguous match groups
-            if config.before_context > 0 || config.after_context > 0 {
-                if let Some(last) = last_printed_line {
-                    if line_num_1based > last + 1 && need_separator
-                        && config.output_format != OutputFormat::Json {
-                            writeln!(
-                                output,
-                                "{}--{}",
-                                config.colors.separator, config.colors.reset
-                            )?;
-                        }
+            // Print the buffered look-behind lines, sliced from the current window.
+            for buffered in progress.context.behind.iter() {
+                if progress
+                    .context
+                    .last_printed_line
+                    .is_none_or(|last| buffered.line_number > last)
+                {
+                    emitter.line(LineRecord {
+                        line: &window[buffered.span.start..buffered.span.end],
+                        line_number: buffered.line_number,
+                        byte_offset: progress.window_base + buffered.span.start,
+                        is_match: false,
+                    })?;
+                    progress.context.last_printed_line = Some(buffered.line_number);
                 }
             }
 
-            // Print buffered context_before lines (slice from original data)
-            for &(ctx_line_num, ctx_start, ctx_end) in context_before.iter() {
-                if last_printed_line.is_none_or(|lp| ctx_line_num > lp) {
-                    let ctx_line = &data[ctx_start..ctx_end];
-                    print_line(
-                        output,
-                        ctx_line,
-                        ctx_line_num,
-                        ctx_start,
-                        filename,
-                        config,
-                        false,
-                    )?;
-                    last_printed_line = Some(ctx_line_num);
-                }
-            }
-
-            // Print matching line (highlight only for standard/heading modes)
-            // Use highlight_buffer to avoid per-line allocation
-            let needs_highlight = config.output_format != OutputFormat::Json
-                && config.output_format != OutputFormat::Vimgrep
-                && !config.only_matching;
-
-            let line_to_print: &[u8] =
-                if needs_highlight && highlight_line(line, config, &mut highlight_buffer) > 0 {
-                    &highlight_buffer
-                } else {
-                    line
-                };
-
-            print_line(
-                output,
-                line_to_print,
-                line_num_1based,
-                current_byte_offset,
-                filename,
-                config,
-                true,
+            emitter.match_line(
+                LineRecord {
+                    line,
+                    line_number,
+                    byte_offset,
+                    is_match: true,
+                },
+                &mut progress.highlight_buffer,
             )?;
-            last_printed_line = Some(line_num_1based);
-            pending_after = config.after_context;
-            need_separator = true;
-        } else if pending_after > 0 {
-            // Print as after-context
-            print_line(
-                output,
+            progress.context.last_printed_line = Some(line_number);
+            progress.context.pending_after = progress.context.lines.after;
+            progress.context.need_separator = true;
+        } else if progress.context.pending_after > 0 {
+            emitter.line(LineRecord {
                 line,
-                line_num_1based,
-                current_byte_offset,
-                filename,
-                config,
-                false,
-            )?;
-            last_printed_line = Some(line_num_1based);
-            pending_after -= 1;
+                line_number,
+                byte_offset,
+                is_match: false,
+            })?;
+            progress.context.last_printed_line = Some(line_number);
+            progress.context.pending_after -= 1;
         }
 
-        // Maintain rolling context_before buffer (store offsets, not copies)
-        if config.before_context > 0 {
-            if context_before.len() >= config.before_context {
-                context_before.pop_front();
+        // Maintain the rolling look-behind ring.
+        if progress.context.lines.before > 0 {
+            if progress.context.behind.len() >= progress.context.lines.before {
+                progress.context.behind.pop_front();
             }
-            context_before.push_back((
-                line_num_1based,
-                current_byte_offset,
-                current_byte_offset + line.len(),
-            ));
+            progress.context.behind.push_back(ContextLine {
+                line_number,
+                span: line_start..line_start + line.len(),
+            });
         }
     }
+    Ok(ControlFlow::Continue(()))
+}
 
-    // Print JSON end message if we printed any matches
-    if config.output_format == OutputFormat::Json && printed_heading {
-        output.write_all(br#"{"type":"end","data":{"path":{"text":""#)?;
-        json_escape_to(output, filename.as_bytes())?;
-        write!(
-            output,
-            r#""}},"stats":{{"matches":{},"lines_searched":{}}}}}}}"#,
-            match_count, lines_searched
-        )?;
-        output.write_all(b"\n")?;
+/// A 1-based line number for positions visited in increasing order.
+///
+/// Each answer costs one scan of the gap since the previous position, so a whole-buffer
+/// search stays linear in its input. Counting from byte zero per match makes it quadratic.
+#[derive(Default)]
+struct LineCursor {
+    counted_through: usize,
+    newlines_before: usize,
+}
+
+impl LineCursor {
+    /// The line number at `position`, which must not precede the previous answer.
+    fn line_at(&mut self, data: &[u8], position: usize) -> usize {
+        debug_assert!(
+            position >= self.counted_through,
+            "positions must move forward"
+        );
+        self.newlines_before += data[self.counted_through..position]
+            .sz_matches(b"\n")
+            .count();
+        self.counted_through = position;
+        self.newlines_before + 1
     }
-
-    Ok(FileResult {
-        path: filename.to_string(),
-        match_count,
-        lines_searched,
-    })
 }
 
 /// Search using multi-line matching (whole buffer search)
 fn search_multiline(
     data: &[u8],
     filename: &str,
-    config: &SearchConfig,
+    search: &Search,
+    path: &SearchPath,
     output: &mut dyn Write,
-    max_reached: &AtomicBool,
+    max_reached: &mut bool,
 ) -> io::Result<FileResult> {
-    let mut match_count = 0;
-    let mut pos = 0;
-    let mut last_printed_end: usize = 0;
-    let lines_searched = data.sz_matches(b"\n").count() + 1;
+    // The emitter, the tally's early stop and the context width hold for the whole file.
+    let stop_at_first = matches!(
+        path,
+        SearchPath::Tally {
+            stop_at_first: true
+        }
+    );
+    let context = path.context();
+    // Groups are divided only where surrounding lines are printed, as in line mode.
+    let separates_groups = context.before > 0 || context.after > 0;
+    let mut emitter = path.printer().map(|printer| Emitter {
+        output,
+        filename,
+        search,
+        printer,
+    });
 
-    while pos < data.len() {
-        // Check max count
-        if let Some(max) = config.max_count {
-            if match_count >= max {
-                max_reached.store(true, Ordering::Relaxed);
+    // Each region carries its own surrounding lines, so this path keeps no look-behind
+    // ring, and the whole file is one window that counts its lines up front.
+    let mut progress = Progress::new(Context::none());
+    progress.lines_searched = data.sz_matches(b"\n").count() + 1;
+    let mut scanned_through = 0;
+    // One past the terminator of the last printed region, absent until one is printed.
+    let mut last_printed_end: Option<usize> = None;
+    // Regions arrive in increasing order, which is what lets the line number carry.
+    let mut line_numbers = LineCursor::default();
+
+    for found in search.matcher.matches(data) {
+        if progress.exhausted(search) {
+            break;
+        }
+        progress.match_count += 1;
+        let match_end = found.offset + found.length;
+        scanned_through = match_end;
+
+        let Some(emitter) = emitter.as_mut() else {
+            if stop_at_first {
                 break;
             }
-        }
-
-        // Find next match
-        let match_result = if config.ignore_case {
-            utf8_uncased_search(&data[pos..], config.pattern).map(|(off, len)| (pos + off, len))
-        } else {
-            find(&data[pos..], config.pattern).map(|off| (pos + off, config.pattern.len()))
-        };
-
-        let (match_offset, match_len) = match match_result {
-            Some(m) => m,
-            None => break,
-        };
-
-        // Check word boundary
-        if config.whole_word && !is_word_boundary(data, match_offset, match_offset + match_len) {
-            pos = match_offset + 1;
             continue;
-        }
-
-        match_count += 1;
-
-        if config.quiet || config.count || config.files_with_matches || config.files_without_match {
-            pos = match_offset + match_len;
-            continue;
-        }
+        };
 
         // Find line boundaries around the match
-        let line_start = if match_offset == 0 {
-            0
-        } else {
-            rfind(&data[..match_offset], b"\n")
-                .map(|i| i + 1)
-                .unwrap_or(0)
-        };
+        let line_start = rfind(&data[..found.offset], b"\n").map_or(0, |offset| offset + 1);
+        let line_end =
+            find(&data[match_end..], b"\n").map_or(data.len(), |offset| match_end + offset);
 
-        let match_end = match_offset + match_len;
-        let line_end = find(&data[match_end..], b"\n")
-            .map(|i| match_end + i)
-            .unwrap_or(data.len());
-
-        // Expand for before_context
+        // Expand for before context
         let mut output_start = line_start;
-        if config.before_context > 0 {
-            let mut count = 0;
-            let mut search_pos = line_start;
-            while count < config.before_context && search_pos > 0 {
-                search_pos = if search_pos <= 1 {
+        if context.before > 0 {
+            let mut expanded = 0;
+            let mut search_start = line_start;
+            while expanded < context.before && search_start > 0 {
+                search_start = if search_start <= 1 {
                     0
                 } else {
-                    rfind(&data[..search_pos - 1], b"\n")
-                        .map(|i| i + 1)
+                    rfind(&data[..search_start - 1], b"\n")
+                        .map(|offset| offset + 1)
                         .unwrap_or(0)
                 };
-                count += 1;
+                expanded += 1;
             }
-            output_start = search_pos;
+            output_start = search_start;
         }
 
-        // Expand for after_context
+        // Expand for after context
         let mut output_end = line_end;
-        if config.after_context > 0 {
-            let mut count = 0;
-            let mut search_pos = line_end;
-            while count < config.after_context && search_pos < data.len() {
-                if let Some(next_nl) = find(&data[search_pos + 1..], b"\n") {
-                    search_pos = search_pos + 1 + next_nl;
+        if context.after > 0 {
+            let mut expanded = 0;
+            let mut search_end = line_end;
+            while expanded < context.after && search_end < data.len() {
+                if let Some(next_newline) = find(&data[search_end + 1..], b"\n") {
+                    search_end = search_end + 1 + next_newline;
                 } else {
-                    search_pos = data.len();
+                    search_end = data.len();
                     break;
                 }
-                count += 1;
+                expanded += 1;
             }
-            output_end = search_pos;
+            output_end = search_end;
         }
 
         // Avoid printing overlapping regions
-        let actual_start = output_start.max(last_printed_end);
-        if actual_start < output_end {
-            if config.line_number
-                || config.byte_offset
-                || config.output_format != OutputFormat::Standard
+        let actual_start = output_start.max(last_printed_end.unwrap_or(0));
+        // `output_end` addresses the newline terminating the region's last line, so the
+        // region reaches one past it and carries that terminator. A region of exactly one
+        // newline is a blank line, which is context like any other.
+        let region_end = (output_end + 1).min(data.len());
+        if actual_start < region_end {
+            // A region that does not abut the previous one opens a group, and `grep -C`
+            // divides groups with `--`.
+            let follows_a_gap = last_printed_end.is_some_and(|end| actual_start > end);
+            if separates_groups && follows_a_gap {
+                emitter.group_separator()?;
+            }
+
+            let region = &data[actual_start..region_end];
+            if emitter.printer.line_number
+                || emitter.printer.byte_offset
+                || emitter.printer.output_format != OutputFormat::Standard
             {
-                let line_num = data[..actual_start].sz_matches(b"\n").count() + 1;
-                let region = &data[actual_start..output_end];
-                let mut line_byte_offset = actual_start;
-                for (i, line) in region.sz_splits(b"\n").enumerate() {
-                    if !line.is_empty() || i == 0 {
-                        print_line(
-                            output,
-                            line,
-                            line_num + i,
-                            line_byte_offset,
-                            filename,
-                            config,
-                            true,
-                        )?;
-                    }
-                    line_byte_offset += line.len() + 1;
+                let line_number = line_numbers.line_at(data, actual_start);
+                for (index, line) in LineIter::new(region, Newlines::Lf).enumerate() {
+                    emitter.line(LineRecord {
+                        line,
+                        line_number: line_number + index,
+                        byte_offset: actual_start + offset_within(region, line),
+                        is_match: true,
+                    })?;
                 }
             } else {
-                if config.show_filename {
+                emitter.region(region)?;
+            }
+            last_printed_end = Some(region_end);
+        }
+    }
+
+    // `-m` caps this file, and reaching the cap ends the walk over the remaining files —
+    // but only with input still unread, which is where the line paths stop as well.
+    if progress.exhausted(search) && scanned_through < data.len() {
+        *max_reached = true;
+    }
+
+    Ok(progress.result(data.len()))
+}
+
+// endregion: Line Loops
+
+// region: Streaming
+
+/// Whether a true pipe can be searched through a bounded window rather than drained whole.
+///
+/// `-U` searches the whole input backward and `-B` reaches back past the window, so those
+/// two keep every byte. `-A` alone qualifies; it only reaches forward.
+fn can_stream(search: &Search, path: &SearchPath) -> bool {
+    !search.multiline
+        && match path {
+            SearchPath::Tally { .. } | SearchPath::Print(_) => true,
+            SearchPath::PrintContext(_, context) => context.before == 0,
+        }
+}
+
+/// Drive the chosen path over a reader, handing it whole-line prefixes of one reused
+/// window so that a pipe costs bounded memory rather than the input's size.
+///
+/// A match cannot cross a newline here — the paths search within each line — so cutting
+/// at [`last_cut`] needs no carry, not even under `-i`. `-U` is the mode where a
+/// match does cross, and it never reaches this driver.
+fn search_stream<R: Read>(
+    refill: &mut Refill<R>,
+    filename: &str,
+    search: &Search,
+    path: &SearchPath,
+    output: &mut dyn Write,
+    max_reached: &mut bool,
+) -> io::Result<FileResult> {
+    debug_assert!(can_stream(search, path), "this path reads earlier lines");
+
+    let mut progress = Progress::new(path.context());
+    refill.try_for_each_window(search.newlines.into(), |window| {
+        let flow = search_window(
+            window,
+            filename,
+            search,
+            path,
+            &mut progress,
+            output,
+            max_reached,
+        )?;
+        // Counted before the flow is honoured, so a stop still reports the window it read.
+        progress.window_base += window.len();
+        Ok(flow)
+    })?;
+
+    print_json_end(output, filename, path, &progress)?;
+    // An early stop leaves the rest of the pipe unread, so the total describes what
+    // was searched rather than what the writer still holds.
+    Ok(progress.result(progress.window_base))
+}
+
+// endregion: Streaming
+
+// region: Line Output
+
+/// One line as an emitter sees it: its bytes, where it sits, and how it was selected.
+#[derive(Clone, Copy)]
+struct LineRecord<'a> {
+    line: &'a [u8],
+    line_number: usize,
+    byte_offset: usize,
+    /// False for a surrounding context line, which prints `-` where a match prints `:`.
+    is_match: bool,
+}
+
+/// Everything a printed line reads beyond the line itself: the sink, the file it came
+/// from, the pattern its matches are resolved against, and the resolved output flags.
+struct Emitter<'a, 'p> {
+    output: &'a mut dyn Write,
+    filename: &'a str,
+    search: &'a Search<'p>,
+    printer: &'a Printer,
+}
+
+impl Emitter<'_, '_> {
+    /// Emit the once-per-file header the format calls for, on its first printed match.
+    fn file_heading(&mut self, printed: &mut bool) -> io::Result<()> {
+        if *printed {
+            return Ok(());
+        }
+        let (filename, printer) = (self.filename, self.printer);
+        match printer.output_format {
+            OutputFormat::Heading => {
+                writeln!(
+                    self.output,
+                    "{}{}{}",
+                    printer.colors.filename, filename, printer.colors.reset
+                )?;
+                *printed = true;
+            }
+            OutputFormat::Json => {
+                self.output
+                    .write_all(br#"{"type":"begin","data":{"path":{"text":""#)?;
+                json_escape_to(self.output, filename.as_bytes())?;
+                self.output.write_all(b"\"}}}\n")?;
+                *printed = true;
+            }
+            OutputFormat::Standard | OutputFormat::Vimgrep => {}
+        }
+        Ok(())
+    }
+
+    /// The `--` divider `grep -C` writes between groups of lines that do not adjoin.
+    /// JSON Lines has no such record, and every line it emits carries its own number.
+    fn group_separator(&mut self) -> io::Result<()> {
+        let printer = self.printer;
+        if printer.output_format == OutputFormat::Json {
+            return Ok(());
+        }
+        writeln!(
+            self.output,
+            "{}--{}",
+            printer.colors.separator, printer.colors.reset
+        )
+    }
+
+    /// Print a matching line, coloring its matches where the format allows.
+    fn match_line(&mut self, record: LineRecord, highlight_buffer: &mut Vec<u8>) -> io::Result<()> {
+        let (search, printer) = (self.search, self.printer);
+        let highlighted = printer
+            .highlight
+            .then(|| highlight_line(record.line, search, printer, highlight_buffer))
+            .flatten();
+        self.line(LineRecord {
+            line: highlighted.unwrap_or(record.line),
+            ..record
+        })
+    }
+
+    /// Print one line with the prefixes its format asks for.
+    fn line(&mut self, record: LineRecord) -> io::Result<()> {
+        let (filename, search, printer) = (self.filename, self.search, self.printer);
+        let colors = printer.colors;
+        // A context line is set off by `-` where a matching line uses `:`.
+        let separator = if record.is_match { ":" } else { "-" };
+        let locates_matches = record.is_match && printer.locates_matches;
+
+        match printer.output_format {
+            OutputFormat::Json => self.json_line(record),
+            OutputFormat::Vimgrep => {
+                // Vimgrep puts every match on its own `file:line:column:text` line.
+                if locates_matches {
+                    for found in search.matcher.matches(record.line) {
+                        write!(
+                            self.output,
+                            "{}:{}:{}:",
+                            filename,
+                            record.line_number,
+                            found.column()
+                        )?;
+                        if printer.only_matching {
+                            self.output.write_all(found.text(record.line))?;
+                        } else {
+                            self.write_trimmed(record.line)?;
+                        }
+                        self.output.write_all(b"\n")?;
+                    }
+                } else if record.is_match {
+                    // An inverted match holds no position, so the line prints at column one.
+                    write!(self.output, "{}:{}:1:", filename, record.line_number)?;
+                    self.write_trimmed(record.line)?;
+                    self.output.write_all(b"\n")?;
+                }
+                Ok(())
+            }
+            // `Printer::new` clears `show_filename` under `--heading`, where the name is a
+            // header rather than a per-line prefix, so both formats print the same line.
+            OutputFormat::Standard | OutputFormat::Heading => {
+                if printer.show_filename {
                     write!(
-                        output,
-                        "{}{}{}:",
-                        config.colors.filename, filename, config.colors.reset
+                        self.output,
+                        "{}{}{}{}",
+                        colors.filename, filename, colors.reset, separator
                     )?;
                 }
-                output.write_all(&data[actual_start..output_end])?;
-                if output_end < data.len() && data[output_end] != b'\n' {
-                    output.write_all(b"\n")?;
+                if printer.line_number {
+                    write!(
+                        self.output,
+                        "{}{}{}{}",
+                        colors.line_number, record.line_number, colors.reset, separator
+                    )?;
                 }
-            }
-            last_printed_end = output_end;
-        }
-
-        pos = match_end;
-    }
-
-    Ok(FileResult {
-        path: filename.to_string(),
-        match_count,
-        lines_searched,
-    })
-}
-
-/// Print a single line with optional filename, line numbers, columns, byte offsets
-fn print_line(
-    output: &mut dyn Write,
-    line: &[u8],
-    line_num: usize,
-    byte_offset: usize,
-    filename: &str,
-    config: &SearchConfig,
-    is_match: bool,
-) -> io::Result<()> {
-    // Use different separator for context vs match lines
-    let sep = if is_match { ":" } else { "-" };
-
-    match config.output_format {
-        OutputFormat::Json => print_line_json(
-            output,
-            line,
-            line_num,
-            byte_offset,
-            filename,
-            config,
-            is_match,
-        ),
-        OutputFormat::Vimgrep => {
-            // Vimgrep: output each match on its own line with file:line:col:text
-            if is_match && !config.invert_match {
-                for m in matches(line, config) {
-                    write!(output, "{}:{}:{}:", filename, line_num, m.column())?;
-                    if config.only_matching {
-                        output.write_all(&line[m.offset..m.offset + m.length])?;
-                    } else {
-                        write_line_trimmed(output, line, config)?;
-                    }
-                    output.write_all(b"\n")?;
+                if printer.column && locates_matches {
+                    let column = search
+                        .matcher
+                        .matches(record.line)
+                        .next()
+                        .map_or(1, |found| found.column());
+                    write!(
+                        self.output,
+                        "{}{}{}{}",
+                        colors.column, column, colors.reset, separator
+                    )?;
                 }
-            } else if is_match {
-                // Inverted match - just print the line
-                write!(output, "{}:{}:1:", filename, line_num)?;
-                write_line_trimmed(output, line, config)?;
-                output.write_all(b"\n")?;
+                if printer.byte_offset {
+                    write!(
+                        self.output,
+                        "{}{}{}{}",
+                        colors.byte_offset, record.byte_offset, colors.reset, separator
+                    )?;
+                }
+                self.write_content(record)?;
+                self.output.write_all(b"\n")
             }
-            Ok(())
-        }
-        OutputFormat::Heading => {
-            // Heading mode: filename is printed separately as header
-            // Just print line_num:col:text
-            if config.line_number {
-                write!(
-                    output,
-                    "{}{}{}{}",
-                    config.colors.line_number, line_num, config.colors.reset, sep
-                )?;
-            }
-            if config.column && is_match && !config.invert_match {
-                let col = matches(line, config).next().map_or(1, |m| m.column());
-                write!(
-                    output,
-                    "{}{}{}{}",
-                    config.colors.column, col, config.colors.reset, sep
-                )?;
-            }
-            if config.byte_offset {
-                write!(
-                    output,
-                    "{}{}{}{}",
-                    config.colors.byte_offset, byte_offset, config.colors.reset, sep
-                )?;
-            }
-            print_line_content(output, line, config, is_match)?;
-            output.write_all(b"\n")?;
-            Ok(())
-        }
-        OutputFormat::Standard => {
-            // Standard: file:line:col:byte:text
-            if config.show_filename {
-                write!(
-                    output,
-                    "{}{}{}{}",
-                    config.colors.filename, filename, config.colors.reset, sep
-                )?;
-            }
-            if config.line_number {
-                write!(
-                    output,
-                    "{}{}{}{}",
-                    config.colors.line_number, line_num, config.colors.reset, sep
-                )?;
-            }
-            if config.column && is_match && !config.invert_match {
-                let col = matches(line, config).next().map_or(1, |m| m.column());
-                write!(
-                    output,
-                    "{}{}{}{}",
-                    config.colors.column, col, config.colors.reset, sep
-                )?;
-            }
-            if config.byte_offset {
-                write!(
-                    output,
-                    "{}{}{}{}",
-                    config.colors.byte_offset, byte_offset, config.colors.reset, sep
-                )?;
-            }
-            print_line_content(output, line, config, is_match)?;
-            output.write_all(b"\n")?;
-            Ok(())
         }
     }
-}
 
-/// Print line content (handles only_matching mode)
-/// Write a whole line, trimmed to `--max-columns` on a character boundary.
-/// One long minified line would otherwise flood a terminal or a context window.
-fn write_line_trimmed(output: &mut dyn Write, line: &[u8], config: &SearchConfig) -> io::Result<()> {
-    let Some(limit) = config.max_columns else {
-        return output.write_all(line);
-    };
-    let (kept, trimmed) = truncate_at_character(line, limit);
-    output.write_all(kept)?;
-    if trimmed {
-        output.write_all(b" [...]")?;
+    /// Print one line in JSON Lines format (ripgrep-compatible), writing straight to the
+    /// sink so that no record is staged in a `String` first.
+    fn json_line(&mut self, record: LineRecord) -> io::Result<()> {
+        let (filename, search, printer) = (self.filename, self.search, self.printer);
+        if !record.is_match {
+            self.output
+                .write_all(br#"{"type":"context","data":{"path":{"text":""#)?;
+            json_escape_to(self.output, filename.as_bytes())?;
+            self.output.write_all(br#""},"lines":{"text":""#)?;
+            json_escape_to(self.output, record.line)?;
+            write!(
+                self.output,
+                r#""}},"line_number":{},"absolute_offset":{}}}}}"#,
+                record.line_number, record.byte_offset
+            )?;
+            self.output.write_all(b"\n")
+        } else if !printer.locates_matches {
+            // An inverted match holds no position, so it carries no submatches.
+            self.output
+                .write_all(br#"{"type":"match","data":{"path":{"text":""#)?;
+            json_escape_to(self.output, filename.as_bytes())?;
+            self.output.write_all(br#""},"lines":{"text":""#)?;
+            json_escape_to(self.output, record.line)?;
+            write!(
+                self.output,
+                r#""}},"line_number":{},"absolute_offset":{},"submatches":[]}}}}"#,
+                record.line_number, record.byte_offset
+            )?;
+            self.output.write_all(b"\n")
+        } else {
+            self.output
+                .write_all(br#"{"type":"match","data":{"path":{"text":""#)?;
+            json_escape_to(self.output, filename.as_bytes())?;
+            self.output.write_all(br#""},"lines":{"text":""#)?;
+            json_escape_to(self.output, record.line)?;
+            write!(
+                self.output,
+                r#""}},"line_number":{},"absolute_offset":{},"submatches":["#,
+                record.line_number, record.byte_offset
+            )?;
+
+            for (index, found) in search.matcher.matches(record.line).enumerate() {
+                if index > 0 {
+                    self.output.write_all(b",")?;
+                }
+                self.output.write_all(br#"{"match":{"text":""#)?;
+                json_escape_to(self.output, found.text(record.line))?;
+                write!(
+                    self.output,
+                    r#""}},"start":{},"end":{}}}"#,
+                    found.offset,
+                    found.offset + found.length
+                )?;
+            }
+
+            self.output.write_all(b"]}}\n")
+        }
     }
-    Ok(())
-}
 
-fn print_line_content(
-    output: &mut dyn Write,
-    line: &[u8],
-    config: &SearchConfig,
-    is_match: bool,
-) -> io::Result<()> {
-    if config.only_matching && is_match && !config.invert_match {
-        // Only print matching parts
-        let mut first = true;
-        for m in matches(line, config) {
-            if !first {
-                output.write_all(b"\n")?;
+    /// Write a line's content, reduced to the matches themselves under `-o`.
+    fn write_content(&mut self, record: LineRecord) -> io::Result<()> {
+        let (search, printer) = (self.search, self.printer);
+        if !(printer.only_matching && record.is_match && printer.locates_matches) {
+            return self.write_trimmed(record.line);
+        }
+        for (index, found) in search.matcher.matches(record.line).enumerate() {
+            if index > 0 {
+                self.output.write_all(b"\n")?;
             }
-            first = false;
-            if !config.colors.match_highlight.is_empty() {
-                output.write_all(config.colors.match_highlight.as_bytes())?;
+            if !printer.colors.match_highlight.is_empty() {
+                self.output
+                    .write_all(printer.colors.match_highlight.as_bytes())?;
             }
-            output.write_all(&line[m.offset..m.offset + m.length])?;
-            if !config.colors.reset.is_empty() {
-                output.write_all(config.colors.reset.as_bytes())?;
+            self.output.write_all(found.text(record.line))?;
+            if !printer.colors.reset.is_empty() {
+                self.output.write_all(printer.colors.reset.as_bytes())?;
             }
         }
         Ok(())
-    } else {
-        write_line_trimmed(output, line, config)
     }
-}
 
-/// Print a line in JSON Lines format (ripgrep-compatible)
-/// Writes directly to output without intermediate String allocations.
-fn print_line_json(
-    output: &mut dyn Write,
-    line: &[u8],
-    line_num: usize,
-    byte_offset: usize,
-    filename: &str,
-    config: &SearchConfig,
-    is_match: bool,
-) -> io::Result<()> {
-    if !is_match {
-        // Context line in JSON format
-        output.write_all(br#"{"type":"context","data":{"path":{"text":""#)?;
-        json_escape_to(output, filename.as_bytes())?;
-        output.write_all(br#""},"lines":{"text":""#)?;
-        json_escape_to(output, line)?;
-        write!(
-            output,
-            r#""}},"line_number":{},"absolute_offset":{}}}}}"#,
-            line_num, byte_offset
-        )?;
-        output.write_all(b"\n")
-    } else if config.invert_match {
-        // Inverted match - no submatches
-        output.write_all(br#"{"type":"match","data":{"path":{"text":""#)?;
-        json_escape_to(output, filename.as_bytes())?;
-        output.write_all(br#""},"lines":{"text":""#)?;
-        json_escape_to(output, line)?;
-        write!(
-            output,
-            r#""}},"line_number":{},"absolute_offset":{},"submatches":[]}}}}"#,
-            line_num, byte_offset
-        )?;
-        output.write_all(b"\n")
-    } else {
-        // Regular match with submatches - write directly to avoid Vec allocation
-        output.write_all(br#"{"type":"match","data":{"path":{"text":""#)?;
-        json_escape_to(output, filename.as_bytes())?;
-        output.write_all(br#""},"lines":{"text":""#)?;
-        json_escape_to(output, line)?;
-        write!(
-            output,
-            r#""}},"line_number":{},"absolute_offset":{},"submatches":["#,
-            line_num, byte_offset
-        )?;
+    /// Write a whole line, trimmed to `--max-columns` on a character boundary.
+    /// One long minified line would otherwise flood a terminal or a context window.
+    fn write_trimmed(&mut self, line: &[u8]) -> io::Result<()> {
+        let Some(limit) = self.printer.max_columns else {
+            return self.output.write_all(line);
+        };
+        let (kept, trimmed) = truncate_at_character(line, limit);
+        self.output.write_all(kept)?;
+        if trimmed {
+            self.output.write_all(b" [...]")?;
+        }
+        Ok(())
+    }
 
-        let mut first = true;
-        for m in matches(line, config) {
-            if !first {
-                output.write_all(b",")?;
-            }
-            first = false;
-            output.write_all(br#"{"match":{"text":""#)?;
-            json_escape_to(output, &line[m.offset..m.offset + m.length])?;
+    /// Write a whole multi-line region verbatim, which is what `-U` prints when no
+    /// per-line prefix is asked for.
+    fn region(&mut self, region: &[u8]) -> io::Result<()> {
+        let (filename, printer) = (self.filename, self.printer);
+        if printer.show_filename {
             write!(
-                output,
-                r#""}},"start":{},"end":{}}}"#,
-                m.offset,
-                m.offset + m.length
+                self.output,
+                "{}{}{}:",
+                printer.colors.filename, filename, printer.colors.reset
             )?;
         }
-
-        output.write_all(b"]}}\n")
+        self.output.write_all(region)?;
+        // An input whose last line is unterminated still prints as a whole line.
+        if !region.ends_with(b"\n") {
+            self.output.write_all(b"\n")?;
+        }
+        Ok(())
     }
 }
+
+/// Wrap every match in `line` with the highlight color, building into a reused buffer.
+/// `None` when the line holds no match, leaving the caller to print the line itself.
+fn highlight_line<'b>(
+    line: &[u8],
+    search: &Search,
+    printer: &Printer,
+    buffer: &'b mut Vec<u8>,
+) -> Option<&'b [u8]> {
+    // Peeked before the buffer is touched: a line with no match is printed as it stands.
+    let mut matches = search.matcher.matches(line).peekable();
+    matches.peek()?;
+
+    buffer.clear();
+    // Reserve capacity to minimize allocations during building
+    buffer.reserve(line.len() + 64);
+    let mut last_end = 0;
+    for found in matches {
+        buffer.extend_from_slice(&line[last_end..found.offset]);
+        buffer.extend_from_slice(printer.colors.match_highlight.as_bytes());
+        buffer.extend_from_slice(found.text(line));
+        buffer.extend_from_slice(printer.colors.reset.as_bytes());
+        last_end = found.offset + found.length;
+    }
+    buffer.extend_from_slice(&line[last_end..]);
+    Some(buffer)
+}
+
+/// Close the JSON Lines record for a file that opened one, once every window is done.
+fn print_json_end(
+    output: &mut dyn Write,
+    filename: &str,
+    path: &SearchPath,
+    progress: &Progress,
+) -> io::Result<()> {
+    let Some(printer) = path.printer() else {
+        return Ok(());
+    };
+    if printer.output_format != OutputFormat::Json || !progress.printed_heading {
+        return Ok(());
+    }
+    output.write_all(br#"{"type":"end","data":{"path":{"text":""#)?;
+    json_escape_to(output, filename.as_bytes())?;
+    write!(
+        output,
+        r#""}},"stats":{{"matches":{},"lines_searched":{}}}}}}}"#,
+        progress.match_count, progress.lines_searched
+    )?;
+    output.write_all(b"\n")
+}
+
+// endregion: Line Output
+
+// region: Input Processing
 
 /// Check if data appears to be binary (contains NUL bytes in first 8KB)
 fn is_binary(data: &[u8]) -> bool {
@@ -1040,74 +1451,60 @@ fn is_binary(data: &[u8]) -> bool {
     find(&data[..check_len], b"\0").is_some()
 }
 
-/// Process a single file
-fn process_file(
-    path: &Path,
-    config: &SearchConfig,
+/// Process stdin: a redirect maps, and a true pipe streams through one reused window
+/// unless the path reads lines the window has already dropped.
+fn process_stdin(
+    search: &Search,
+    search_path: &SearchPath,
     output: &mut dyn Write,
-    stats: &Stats,
-    max_reached: &AtomicBool,
-    skip_binary: bool,
-) -> io::Result<Option<FileResult>> {
-    let input = open_input(path)?;
-    let mmap = input.as_bytes();
+    stats: &mut Stats,
+    max_reached: &mut bool,
+) -> io::Result<FileResult> {
+    stats.files_searched += 1;
 
-    stats.files_searched.fetch_add(1, Ordering::Relaxed);
-    stats
-        .bytes_searched
-        .fetch_add(mmap.len(), Ordering::Relaxed);
+    let result = if can_stream(search, search_path) {
+        match get_input_streaming(None)?.into_window(DEFAULT_WINDOW_BYTES) {
+            InputWindow::Whole(source) => search_slice(
+                source.as_bytes(),
+                "(stdin)",
+                search,
+                search_path,
+                output,
+                max_reached,
+            )?,
+            InputWindow::Stream(mut refill) => search_stream(
+                &mut refill,
+                "(stdin)",
+                search,
+                search_path,
+                output,
+                max_reached,
+            )?,
+        }
+    } else {
+        let input = get_input(None)?;
+        search_slice(
+            input.as_bytes(),
+            "(stdin)",
+            search,
+            search_path,
+            output,
+            max_reached,
+        )?
+    };
 
-    // Skip binary files unless -a is specified
-    if skip_binary && is_binary(&mmap) {
-        return Ok(None);
-    }
-
-    let filename = path.to_string_lossy();
-    let result = search_mmap(&mmap, &filename, config, output, max_reached)?;
-
-    stats
-        .lines_searched
-        .fetch_add(result.lines_searched, Ordering::Relaxed);
-    stats
-        .matches_found
-        .fetch_add(result.match_count, Ordering::Relaxed);
-
-    if result.match_count > 0 {
-        stats.files_matched.fetch_add(1, Ordering::Relaxed);
-    }
-
-    Ok(Some(result))
+    stats.bytes_searched += result.bytes_searched;
+    record_file_result(stats, &result);
+    Ok(result)
 }
 
-/// Process stdin
-fn process_stdin(
-    config: &SearchConfig,
-    output: &mut dyn Write,
-    stats: &Stats,
-    max_reached: &AtomicBool,
-) -> io::Result<FileResult> {
-    let mut buffer = Vec::new();
-    io::stdin().read_to_end(&mut buffer)?;
-
-    stats.files_searched.fetch_add(1, Ordering::Relaxed);
-    stats
-        .bytes_searched
-        .fetch_add(buffer.len(), Ordering::Relaxed);
-
-    let result = search_mmap(&buffer, "(stdin)", config, output, max_reached)?;
-
-    stats
-        .lines_searched
-        .fetch_add(result.lines_searched, Ordering::Relaxed);
-    stats
-        .matches_found
-        .fetch_add(result.match_count, Ordering::Relaxed);
-
+/// Fold one file's outcome into the `--stats` totals.
+fn record_file_result(stats: &mut Stats, result: &FileResult) {
+    stats.lines_searched += result.lines_searched;
+    stats.matches_found += result.match_count;
     if result.match_count > 0 {
-        stats.files_matched.fetch_add(1, Ordering::Relaxed);
+        stats.files_matched += 1;
     }
-
-    Ok(result)
 }
 
 /// Build the directory walker with all filters
@@ -1158,18 +1555,14 @@ fn build_walker(inputs: &[String], args: &Args) -> ignore::Walk {
 
 /// Print final statistics
 fn print_stats(stats: &Stats, elapsed: std::time::Duration) {
-    let files = stats.files_searched.load(Ordering::Relaxed);
-    let matched = stats.files_matched.load(Ordering::Relaxed);
-    let lines = stats.lines_searched.load(Ordering::Relaxed);
-    let matches = stats.matches_found.load(Ordering::Relaxed);
-    let bytes = stats.bytes_searched.load(Ordering::Relaxed);
+    let bytes = stats.bytes_searched;
 
     eprintln!();
     eprintln!("Statistics:");
-    eprintln!("  Files searched: {}", files);
-    eprintln!("  Files matched:  {}", matched);
-    eprintln!("  Lines searched: {}", lines);
-    eprintln!("  Matches found:  {}", matches);
+    eprintln!("  Files searched: {}", stats.files_searched);
+    eprintln!("  Files matched:  {}", stats.files_matched);
+    eprintln!("  Lines searched: {}", stats.lines_searched);
+    eprintln!("  Matches found:  {}", stats.matches_found);
     eprintln!(
         "  Bytes searched: {} ({:.2} MB)",
         bytes,
@@ -1184,26 +1577,35 @@ fn print_stats(stats: &Stats, elapsed: std::time::Duration) {
     }
 }
 
+// endregion: Input Processing
+
 fn main() {
     let args = Args::parse();
     let start_time = std::time::Instant::now();
+    // Every byte this run prints goes here, so the records stay in one order.
+    let mut output = stdout_writer();
 
     // Validate arguments
     if args.pattern.is_empty() {
         eprintln!("Error: pattern cannot be empty");
-        process::exit(ExitCode::Error as i32);
+        ExitCode::Error.exit(&mut output);
     }
 
     if args.files_with_matches && args.files_without_match {
         eprintln!("Error: -l and -L are mutually exclusive");
-        process::exit(ExitCode::Error as i32);
+        ExitCode::Error.exit(&mut output);
     }
 
-    // Handle -C flag (context on both sides)
-    let (before_context, after_context) = if let Some(ctx) = args.context {
-        (ctx, ctx)
-    } else {
-        (args.before_context, args.after_context)
+    // `-C` sets both sides at once.
+    let context = match args.context {
+        Some(lines) => Context {
+            before: lines,
+            after: lines,
+        },
+        None => Context {
+            before: args.before_context,
+            after: args.after_context,
+        },
     };
 
     // Determine if we're searching multiple files/directories
@@ -1211,102 +1613,83 @@ fn main() {
     let has_directory = !is_stdin && args.inputs.iter().any(|p| Path::new(p).is_dir());
     let multiple_inputs = args.inputs.len() > 1 || has_directory;
 
-    // Determine output format
-    let output_format = if args.json {
-        OutputFormat::Json
-    } else if args.vimgrep {
-        OutputFormat::Vimgrep
-    } else if args.heading {
-        OutputFormat::Heading
-    } else {
-        OutputFormat::Standard
-    };
+    // One dispatch decision for the whole run: what the per-line loop remembers.
+    let search_path = SearchPath::choose(&args, context, multiple_inputs);
 
-    // Determine color mode (JSON disables colors)
-    let use_color = match args.color {
-        ColorChoice::Always => true,
-        ColorChoice::Never => false,
-        ColorChoice::Auto => {
-            io::stdout().is_terminal()
-                && !args.quiet
-                && !args.count
-                && output_format != OutputFormat::Json
-        }
-    };
-
-    let colors = if use_color {
-        Colors::enabled()
-    } else {
-        Colors::disabled()
-    };
-
-    // Vimgrep implies line numbers and column
-    let show_line_number = args.line_number || args.vimgrep;
-    let show_column = args.column || args.vimgrep;
-
-    // Build search configuration
-    let config = SearchConfig {
-        pattern: args.pattern.as_bytes(),
-        ignore_case: args.ignore_case,
-        line_number: show_line_number,
-        count: args.count,
-        files_with_matches: args.files_with_matches,
-        files_without_match: args.files_without_match,
-        before_context,
-        after_context,
-        utf8: args.utf8,
+    let pattern = args.pattern.as_bytes();
+    let search = Search {
+        matcher: Matcher {
+            pattern,
+            uncased_needle: args.ignore_case.then(|| Utf8UncasedNeedle::new(pattern)),
+            whole_word: args.word,
+        },
+        newlines: Newlines::from_utf8(args.utf8),
         multiline: args.multiline,
         invert_match: args.invert_match,
-        whole_word: args.word,
         max_count: args.max_count,
-        quiet: args.quiet,
-        colors,
-        show_filename: multiple_inputs && !args.count && output_format != OutputFormat::Heading,
-        column: show_column,
-        byte_offset: args.byte_offset,
-        only_matching: args.only_matching,
-        output_format,
-        max_columns: args.max_columns,
     };
 
-    let stats = Stats::default();
-    let max_reached = AtomicBool::new(false);
-    let mut output = stdout_writer();
+    let mut stats = Stats::default();
+    let mut max_reached = false;
     let mut any_match = false;
     let mut file_counts: Vec<(String, usize)> = Vec::new();
 
     // Handle stdin
     if is_stdin {
-        match process_stdin(&config, &mut output, &stats, &max_reached) {
+        match process_stdin(
+            &search,
+            &search_path,
+            &mut output,
+            &mut stats,
+            &mut max_reached,
+        ) {
             Ok(result) => {
                 if result.match_count > 0 {
                     any_match = true;
                 }
                 if args.count {
-                    println!("{}", result.match_count);
+                    let written = writeln!(output, "{}", result.match_count);
+                    if let Err(error) = written {
+                        exit_on_write_error(&mut output, &error, "Error writing output");
+                    }
                 }
             }
-            Err(e) => {
-                if e.kind() != io::ErrorKind::BrokenPipe {
-                    eprintln!("Error reading stdin: {}", e);
-                    process::exit(ExitCode::Error as i32);
+            Err(error) => {
+                if error.kind() != io::ErrorKind::BrokenPipe {
+                    eprintln!("Error reading stdin: {}", error);
+                    ExitCode::Error.exit(&mut output);
                 }
             }
         }
     } else {
+        // Compile each `-g` glob once, so a malformed one is reported here rather than
+        // silently matching nothing on every file of the walk.
+        let globs = args.glob.as_ref().map(|globs| {
+            globs
+                .iter()
+                .filter_map(|glob| match glob::Pattern::new(glob) {
+                    Ok(pattern) => Some(pattern),
+                    Err(error) => {
+                        eprintln!("Warning: invalid glob '{}': {}", glob, error);
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
         // Process files and directories
         let walker = build_walker(&args.inputs, &args);
 
         for result in walker {
             // Check if we've hit global max count
-            if max_reached.load(Ordering::Relaxed) {
+            if max_reached {
                 break;
             }
 
             let entry = match result {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("Warning: {}", e);
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!("Warning: {}", error);
                     continue;
                 }
             };
@@ -1316,119 +1699,214 @@ fn main() {
                 continue;
             }
 
-            // Apply glob filters manually since add_custom_ignore_filename doesn't work as expected
-            if let Some(ref globs) = args.glob {
-                let path_str = entry.path().to_string_lossy();
-                let mut matches_glob = false;
-                for glob in globs {
-                    if let Ok(pattern) = glob::Pattern::new(glob) {
-                        if pattern.matches(&path_str)
-                            || pattern.matches(entry.file_name().to_string_lossy().as_ref())
-                        {
-                            matches_glob = true;
-                            break;
-                        }
-                    }
-                }
-                if !matches_glob {
+            // The walker has no glob filter of its own, so `-g` is applied here.
+            if let Some(globs) = &globs {
+                let path_text = entry.path().to_string_lossy();
+                let name_text = entry.file_name().to_string_lossy();
+                let selected = globs
+                    .iter()
+                    .any(|pattern| pattern.matches(&path_text) || pattern.matches(&name_text));
+                if !selected {
                     continue;
                 }
             }
 
-            match process_file(
-                entry.path(),
-                &config,
+            let input = match open_input(entry.path()) {
+                Ok(input) => input,
+                Err(error) => {
+                    eprintln!("Warning: {}: {}", entry.path().display(), error);
+                    continue;
+                }
+            };
+            let data = input.as_bytes();
+            stats.files_searched += 1;
+            stats.bytes_searched += data.len();
+
+            // A binary file is skipped unless `-a` asked for it.
+            if !args.binary && is_binary(data) {
+                continue;
+            }
+
+            let filename = entry.path().to_string_lossy();
+            let searched = search_slice(
+                data,
+                &filename,
+                &search,
+                &search_path,
                 &mut output,
-                &stats,
-                &max_reached,
-                !args.binary,
-            ) {
-                Ok(Some(result)) => {
-                    if result.match_count > 0 {
-                        any_match = true;
-                        if args.files_with_matches {
-                            let sep = if args.null { "\0" } else { "\n" };
-                            print!("{}{}", result.path, sep);
-                        }
-                    } else if args.files_without_match {
-                        let sep = if args.null { "\0" } else { "\n" };
-                        print!("{}{}", result.path, sep);
-                    }
-                    // Only files with matches are reported, as `grep -c` and `rg -c` do.
-                    // Listing every `path:0` buries the answer in a directory walk.
-                    if args.count && result.match_count > 0 {
-                        file_counts.push((result.path, result.match_count));
-                    }
+                &mut max_reached,
+            );
+            let result = match searched {
+                Ok(result) => result,
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    ExitCode::Success.exit(&mut output)
                 }
-                Ok(None) => {
-                    // Binary file skipped
+                Err(error) => {
+                    eprintln!("Warning: {}: {}", entry.path().display(), error);
+                    continue;
                 }
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::BrokenPipe {
-                        process::exit(0);
-                    }
-                    eprintln!("Warning: {}: {}", entry.path().display(), e);
+            };
+            record_file_result(&mut stats, &result);
+
+            if result.match_count > 0 {
+                any_match = true;
+                // Only files with matches are reported, as `grep -c` and `rg -c` do.
+                // Listing every `path:0` buries the answer in a directory walk.
+                if args.count {
+                    file_counts.push((filename.to_string(), result.match_count));
+                }
+            }
+
+            // `-l` names the files that matched, `-L` those that did not.
+            let named = if result.match_count > 0 {
+                args.files_with_matches
+            } else {
+                args.files_without_match
+            };
+            if named {
+                let terminator = if args.null { "\0" } else { "\n" };
+                let written = write!(output, "{}{}", filename, terminator);
+                if let Err(error) = written {
+                    exit_on_write_error(&mut output, &error, "Error writing output");
                 }
             }
         }
 
         // Print counts for multi-file mode
-        if args.count && !file_counts.is_empty() {
-            for (path, count) in &file_counts {
-                if multiple_inputs {
-                    println!("{}:{}", path, count);
-                } else {
-                    println!("{}", count);
-                }
+        for (path, count) in &file_counts {
+            let written = if multiple_inputs {
+                writeln!(output, "{}:{}", path, count)
+            } else {
+                writeln!(output, "{}", count)
+            };
+            if let Err(error) = written {
+                exit_on_write_error(&mut output, &error, "Error writing output");
             }
         }
     }
 
-    // Print statistics
+    // Print statistics. The results are stdout and the report is stderr, so the buffer
+    // is flushed first to keep the two ordered where they land in one stream.
     if args.stats {
+        let _ = output.flush();
         print_stats(&stats, start_time.elapsed());
     }
 
     // Exit with status 1 if no matches found (like grep). Exiting skips the
     // buffer's `Drop`, so the flush has to happen first.
-    if !any_match && !args.quiet {
+    if !any_match {
         ExitCode::NoResult.exit(&mut output);
     }
 }
+
+// region: Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_config(pattern: &[u8]) -> SearchConfig<'_> {
-        SearchConfig {
-            pattern,
-            ignore_case: false,
-            line_number: false,
-            count: false,
-            files_with_matches: false,
-            files_without_match: false,
-            before_context: 0,
-            after_context: 0,
-            utf8: false,
+    fn make_search(pattern: &[u8]) -> Search<'_> {
+        Search {
+            matcher: Matcher {
+                pattern,
+                uncased_needle: None,
+                whole_word: false,
+            },
+            newlines: Newlines::Lf,
             multiline: false,
             invert_match: false,
-            whole_word: false,
             max_count: None,
-            quiet: false,
-            colors: Colors::disabled(),
-            show_filename: false,
-            column: false,
-            byte_offset: false,
-            only_matching: false,
-            output_format: OutputFormat::Standard,
-            max_columns: None,
         }
     }
 
+    fn make_printer() -> Printer {
+        Printer {
+            output_format: OutputFormat::Standard,
+            colors: Colors::disabled(),
+            show_filename: false,
+            line_number: false,
+            column: false,
+            byte_offset: false,
+            only_matching: false,
+            max_columns: None,
+            locates_matches: true,
+            highlight: false,
+        }
+    }
+
+    /// Search a whole slice, returning what it printed and what it counted.
+    fn search_whole(data: &[u8], search: &Search, path: &SearchPath) -> (Vec<u8>, usize, usize) {
+        let mut output = Vec::new();
+        let mut max_reached = false;
+        let result = search_slice(
+            data,
+            "test.txt",
+            search,
+            path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
+        (output, result.match_count, result.lines_searched)
+    }
+
+    /// Search the same way, but through a window of exactly `capacity` bytes.
+    fn search_streamed(
+        data: &[u8],
+        capacity: usize,
+        search: &Search,
+        path: &SearchPath,
+    ) -> (Vec<u8>, usize, usize) {
+        let mut refill = Refill::new(data, capacity);
+        let mut output = Vec::new();
+        let mut max_reached = false;
+        let result = search_stream(
+            &mut refill,
+            "test.txt",
+            search,
+            path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
+        (output, result.match_count, result.lines_searched)
+    }
+
+    /// A reader that fails once a budget of bytes has been handed out, so a test can prove
+    /// a path stopped reading rather than merely stopped printing.
+    struct BudgetedReader<'a> {
+        data: &'a [u8],
+        position: usize,
+        budget: usize,
+    }
+
+    impl Read for BudgetedReader<'_> {
+        fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
+            if self.position >= self.budget {
+                return Err(io::Error::other("read past the budget"));
+            }
+            let available = self.data.len() - self.position;
+            let taken = destination
+                .len()
+                .min(available)
+                .min(self.budget - self.position);
+            destination[..taken].copy_from_slice(&self.data[self.position..self.position + taken]);
+            self.position += taken;
+            Ok(taken)
+        }
+    }
+
+    /// Lines that put every seam case in reach of a tiny window: multi-byte characters,
+    /// CRLF, blank lines, a line wider than the smallest capacity, and no trailing newline.
+    const SEAM_CORPUS: &[u8] =
+        "alpha error one\nbeta ok\n\ngamma error two\r\nδέλτα error três\nlong \
+         xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx error tail\nepsilon ok\nzeta error last"
+            .as_bytes();
+
     /// Test helper: check if pattern matches in line
     fn has_match(line: &[u8], pattern: &[u8], ignore_case: bool, whole_word: bool) -> bool {
-        MatchIter::new(line, pattern, ignore_case, whole_word)
+        let uncased = ignore_case.then(|| Utf8UncasedNeedle::new(pattern));
+        MatchIter::new(line, Needle::new(pattern, uncased.as_ref()), whole_word)
             .next()
             .is_some()
     }
@@ -1467,17 +1945,13 @@ mod tests {
 
     #[test]
     fn inverts_line_match_selection() {
-        let selects = |line: &[u8], config: &SearchConfig| {
-            matches(line, config).next().is_some() != config.invert_match
-        };
-
         let line = b"hello world";
-        let mut config = make_config(b"hello");
-        assert!(selects(line, &config));
+        let mut search = make_search(b"hello");
+        assert!(search.selects(line));
 
-        config.invert_match = true;
-        assert!(!selects(line, &config));
-        assert!(selects(b"goodbye world", &config));
+        search.invert_match = true;
+        assert!(!search.selects(line));
+        assert!(search.selects(b"goodbye world"));
     }
 
     #[test]
@@ -1490,11 +1964,20 @@ mod tests {
     #[test]
     fn reports_matching_line() {
         let data = b"line1\nerror here\nline3\n";
-        let config = make_config(b"error");
-        let max_reached = AtomicBool::new(false);
+        let search = make_search(b"error");
+        let path = SearchPath::Print(make_printer());
+        let mut max_reached = false;
         let mut output = Vec::new();
 
-        let result = search_mmap(data, "test.txt", &config, &mut output, &max_reached).unwrap();
+        let result = search_slice(
+            data,
+            "test.txt",
+            &search,
+            &path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
 
         assert_eq!(result.match_count, 1);
         let output_str = String::from_utf8(output).unwrap();
@@ -1504,13 +1987,24 @@ mod tests {
     #[test]
     fn includes_surrounding_context_lines() {
         let data = b"line1\nline2\nerror here\nline4\nline5\n";
-        let mut config = make_config(b"error");
-        config.before_context = 1;
-        config.after_context = 1;
-        let max_reached = AtomicBool::new(false);
+        let search = make_search(b"error");
+        let context = Context {
+            before: 1,
+            after: 1,
+        };
+        let path = SearchPath::PrintContext(make_printer(), context);
+        let mut max_reached = false;
         let mut output = Vec::new();
 
-        search_mmap(data, "test.txt", &config, &mut output, &max_reached).unwrap();
+        search_slice(
+            data,
+            "test.txt",
+            &search,
+            &path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(output_str.contains("line2"));
@@ -1521,42 +2015,433 @@ mod tests {
     #[test]
     fn stops_after_max_count() {
         let data = b"error1\nerror2\nerror3\nerror4\n";
-        let mut config = make_config(b"error");
-        config.max_count = Some(2);
-        let max_reached = AtomicBool::new(false);
+        let mut search = make_search(b"error");
+        search.max_count = Some(2);
+        let path = SearchPath::Print(make_printer());
+        let mut max_reached = false;
         let mut output = Vec::new();
 
-        let result = search_mmap(data, "test.txt", &config, &mut output, &max_reached).unwrap();
+        let result = search_slice(
+            data,
+            "test.txt",
+            &search,
+            &path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
 
         assert_eq!(result.match_count, 2);
-        assert!(max_reached.load(Ordering::Relaxed));
+        assert!(max_reached);
+    }
+
+    #[test]
+    fn counts_without_printing() {
+        let data = b"error1\nok\nerror2\n";
+        let search = make_search(b"error");
+        let path = SearchPath::Tally {
+            stop_at_first: false,
+        };
+        let mut max_reached = false;
+        let mut output = Vec::new();
+
+        let result = search_slice(
+            data,
+            "test.txt",
+            &search,
+            &path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
+
+        assert_eq!(result.match_count, 2);
+        assert_eq!(result.lines_searched, 3);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn stops_the_tally_at_the_first_match() {
+        let data = b"ok\nerror1\nerror2\nerror3\n";
+        let search = make_search(b"error");
+        let path = SearchPath::Tally {
+            stop_at_first: true,
+        };
+        let mut max_reached = false;
+        let mut output = Vec::new();
+
+        let result = search_slice(
+            data,
+            "test.txt",
+            &search,
+            &path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
+
+        assert_eq!(result.match_count, 1);
+        assert_eq!(result.lines_searched, 2);
+    }
+
+    #[test]
+    fn streams_every_path_that_reads_no_earlier_line() {
+        let search = make_search(b"error");
+        assert!(can_stream(
+            &search,
+            &SearchPath::Tally {
+                stop_at_first: true
+            }
+        ));
+        assert!(can_stream(&search, &SearchPath::Print(make_printer())));
+        assert!(can_stream(
+            &search,
+            &SearchPath::PrintContext(
+                make_printer(),
+                Context {
+                    before: 0,
+                    after: 3
+                }
+            )
+        ));
+        assert!(!can_stream(
+            &search,
+            &SearchPath::PrintContext(
+                make_printer(),
+                Context {
+                    before: 1,
+                    after: 0
+                }
+            )
+        ));
     }
 
     #[test]
     fn wraps_matches_in_color_codes() {
         let line = b"hello world hello";
-        let mut config = make_config(b"hello");
-        config.colors = Colors::enabled();
+        let search = make_search(b"hello");
+        let mut printer = make_printer();
+        printer.colors = Colors::enabled();
+        printer.highlight = true;
 
         let mut buffer = Vec::new();
-        let len = highlight_line(line, &config, &mut buffer);
-        assert!(len > 0);
-        let result = String::from_utf8(buffer).unwrap();
+        let highlighted = highlight_line(line, &search, &printer, &mut buffer).unwrap();
+        let result = String::from_utf8(highlighted.to_vec()).unwrap();
 
         assert!(result.contains("\x1b[1;31m")); // Contains highlight
         assert!(result.contains("\x1b[0m")); // Contains reset
+
+        // A line without a match leaves the buffer alone, so the caller prints the line.
+        assert!(highlight_line(b"nothing here", &search, &printer, &mut buffer).is_none());
     }
 
     #[test]
     fn matches_across_newlines_in_multiline_mode() {
         let data = b"hello\nworld\nfoo bar\n";
-        let mut config = make_config(b"hello\nworld");
-        config.multiline = true;
-        let max_reached = AtomicBool::new(false);
+        let mut search = make_search(b"hello\nworld");
+        search.multiline = true;
+        let path = SearchPath::Print(make_printer());
+        let mut max_reached = false;
         let mut output = Vec::new();
 
-        let result = search_mmap(data, "test.txt", &config, &mut output, &max_reached).unwrap();
+        let result = search_slice(
+            data,
+            "test.txt",
+            &search,
+            &path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
 
         assert_eq!(result.match_count, 1);
     }
+
+    #[test]
+    fn keeps_blank_context_lines_in_multiline_mode() {
+        // The blank lines either side of the match are context that `grep -C 1` prints.
+        let data = b"alpha\n\nbeta MATCH here\n\ngamma\n";
+        let mut search = make_search(b"MATCH");
+        search.multiline = true;
+        let context = Context {
+            before: 1,
+            after: 1,
+        };
+
+        let path = SearchPath::PrintContext(make_printer(), context);
+        let (printed, ..) = search_whole(data, &search, &path);
+        assert_eq!(printed, b"\nbeta MATCH here\n\n");
+
+        let mut printer = make_printer();
+        printer.line_number = true;
+        let path = SearchPath::PrintContext(printer, context);
+        let (numbered, ..) = search_whole(data, &search, &path);
+        assert_eq!(numbered, b"2:\n3:beta MATCH here\n4:\n");
+    }
+
+    #[test]
+    fn terminates_every_multiline_region() {
+        // Two matches far apart print as two whole lines, not one run-on line. The first
+        // sits at byte zero, where the search for the line start has nothing to scan.
+        let data = b"MATCH l1\nl2\nl3\nl4\nl5 MATCH\nl6\n";
+        let mut search = make_search(b"MATCH");
+        search.multiline = true;
+        let path = SearchPath::Print(make_printer());
+
+        let (printed, ..) = search_whole(data, &search, &path);
+        assert_eq!(printed, b"MATCH l1\nl5 MATCH\n");
+    }
+
+    #[test]
+    fn prints_a_context_region_that_is_only_a_blank_line() {
+        // The after-context of the first match and the before-context of the second are
+        // one blank line each, so neither region holds anything but its terminator.
+        let data = b"MATCH one\n\n\nMATCH two\n";
+        let mut search = make_search(b"MATCH");
+        search.multiline = true;
+        let context = Context {
+            before: 1,
+            after: 1,
+        };
+        let path = SearchPath::PrintContext(make_printer(), context);
+
+        let (printed, ..) = search_whole(data, &search, &path);
+        assert_eq!(printed, b"MATCH one\n\n\nMATCH two\n");
+    }
+
+    #[test]
+    fn divides_multiline_groups_that_do_not_adjoin() {
+        // Two matches four lines apart print as two groups, and `grep -C 1` divides
+        // groups with `--`. Line mode and multiline mode answer alike.
+        let data = b"alpha\nbeta MATCH one\ngamma\ndelta\nepsilon\nzeta MATCH two\neta\n";
+        let mut search = make_search(b"MATCH");
+        let context = Context {
+            before: 1,
+            after: 1,
+        };
+        let path = SearchPath::PrintContext(make_printer(), context);
+
+        let (by_line, ..) = search_whole(data, &search, &path);
+        search.multiline = true;
+        let (by_region, ..) = search_whole(data, &search, &path);
+        assert_eq!(
+            by_region,
+            b"alpha\nbeta MATCH one\ngamma\n--\nepsilon\nzeta MATCH two\neta\n"
+        );
+        assert_eq!(by_region, by_line);
+    }
+
+    #[test]
+    fn joins_multiline_groups_that_adjoin() {
+        // The after-context of the first match and the before-context of the second are
+        // consecutive lines, so the whole file prints as one group, as `grep -C 1` does.
+        // Line mode measures the gap from the matching line rather than from the group's
+        // first line, and divides here where `grep` does not.
+        let data = b"alpha\nbeta MATCH one\ngamma\ndelta\nepsilon MATCH two\nzeta\n";
+        let mut search = make_search(b"MATCH");
+        search.multiline = true;
+        let context = Context {
+            before: 1,
+            after: 1,
+        };
+        let path = SearchPath::PrintContext(make_printer(), context);
+
+        let (by_region, ..) = search_whole(data, &search, &path);
+        assert_eq!(by_region, data);
+    }
+
+    #[test]
+    fn divides_no_multiline_groups_without_context() {
+        // Without `-A`, `-B` or `-C` there are no groups, so no divider is written.
+        let data = b"alpha\nbeta MATCH one\ngamma\ndelta\nepsilon\nzeta MATCH two\neta\n";
+        let mut search = make_search(b"MATCH");
+        search.multiline = true;
+        let path = SearchPath::Print(make_printer());
+
+        let (printed, ..) = search_whole(data, &search, &path);
+        assert_eq!(printed, b"beta MATCH one\nzeta MATCH two\n");
+    }
+
+    #[test]
+    fn counts_lines_forward_without_rescanning() {
+        // Newlines at 1, 3, 5, 7 and 9.
+        let mut data = b"a\nb\nc\nd\ne\n".to_vec();
+        let mut lines = LineCursor::default();
+        assert_eq!(lines.line_at(&data, 0), 1);
+        assert_eq!(lines.line_at(&data, 4), 3);
+
+        // Rewrite the prefix already counted: an implementation that rescans from byte
+        // zero would see the two added newlines and report 7 rather than 5.
+        data[0] = b'\n';
+        data[2] = b'\n';
+        assert_eq!(lines.line_at(&data, 8), 5);
+        assert_eq!(lines.line_at(&data, data.len()), 6);
+    }
+
+    #[test]
+    fn numbers_every_multiline_region_from_the_running_count() {
+        let mut data = Vec::new();
+        for index in 0..1000 {
+            data.extend_from_slice(if index % 5 == 0 {
+                b"line MATCH\n".as_slice()
+            } else {
+                b"line plain\n".as_slice()
+            });
+        }
+        let mut search = make_search(b"MATCH");
+        search.multiline = true;
+        let mut printer = make_printer();
+        printer.line_number = true;
+        let path = SearchPath::Print(printer);
+
+        let (printed, matches, _) = search_whole(&data, &search, &path);
+        assert_eq!(matches, 200);
+        let text = String::from_utf8(printed).unwrap();
+        let numbers: Vec<&str> = text
+            .lines()
+            .map(|line| line.split(':').next().unwrap())
+            .collect();
+        assert_eq!(numbers.first().copied(), Some("1"));
+        assert_eq!(numbers.last().copied(), Some("996"));
+        assert_eq!(numbers.len(), 200);
+    }
+
+    #[test]
+    fn never_streams_a_multiline_search() {
+        let mut search = make_search(b"error");
+        let path = SearchPath::Print(make_printer());
+        assert!(can_stream(&search, &path));
+
+        search.multiline = true;
+        assert!(!can_stream(&search, &path));
+    }
+
+    #[test]
+    fn streams_the_same_output_at_tiny_capacities() {
+        let printer = make_printer();
+        let paths = [
+            SearchPath::Tally {
+                stop_at_first: false,
+            },
+            SearchPath::Print(printer),
+            SearchPath::PrintContext(
+                printer,
+                Context {
+                    before: 0,
+                    after: 2,
+                },
+            ),
+        ];
+
+        for newlines in [Newlines::Lf, Newlines::Unicode] {
+            for path in &paths {
+                let mut search = make_search(b"error");
+                search.newlines = newlines;
+                let expected = search_whole(SEAM_CORPUS, &search, path);
+                for capacity in [1, 2, 3, 7, 13, 64, 4096] {
+                    let streamed = search_streamed(SEAM_CORPUS, capacity, &search, path);
+                    assert_eq!(streamed, expected, "capacity {}", capacity);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_line_numbers_and_offsets_absolute_across_windows() {
+        let mut printer = make_printer();
+        printer.line_number = true;
+        printer.byte_offset = true;
+        printer.column = true;
+        let path = SearchPath::Print(printer);
+        let search = make_search(b"error");
+
+        let (expected, ..) = search_whole(SEAM_CORPUS, &search, &path);
+        for capacity in [1, 7, 13, 64] {
+            let (streamed, ..) = search_streamed(SEAM_CORPUS, capacity, &search, &path);
+            assert_eq!(streamed, expected, "capacity {}", capacity);
+        }
+        // The last line starts well past any of the tiny windows, so a window-relative
+        // offset would report it near zero.
+        let text = String::from_utf8(expected).unwrap();
+        let last = text.lines().last().unwrap();
+        let offset = SEAM_CORPUS.len() - b"zeta error last".len();
+        assert_eq!(last, format!("8:6:{}:zeta error last", offset));
+    }
+
+    #[test]
+    fn opens_and_closes_one_json_record_per_streamed_file() {
+        let mut printer = make_printer();
+        printer.output_format = OutputFormat::Json;
+        let path = SearchPath::Print(printer);
+        let search = make_search(b"error");
+
+        let (streamed, ..) = search_streamed(SEAM_CORPUS, 7, &search, &path);
+        let text = String::from_utf8(streamed).unwrap();
+        assert_eq!(text.matches(r#""type":"begin""#).count(), 1);
+        assert_eq!(text.matches(r#""type":"end""#).count(), 1);
+    }
+
+    #[test]
+    fn stops_reading_the_stream_at_the_first_match() {
+        let data = b"error one\nerror two\nerror three\nerror four\n";
+        let search = make_search(b"error");
+        let path = SearchPath::Tally {
+            stop_at_first: true,
+        };
+        // A budget of one window proves nothing past it was ever requested.
+        let reader = BudgetedReader {
+            data,
+            position: 0,
+            budget: 10,
+        };
+        let mut refill = Refill::new(reader, 10);
+        let mut output = Vec::new();
+        let mut max_reached = false;
+
+        let result = search_stream(
+            &mut refill,
+            "test.txt",
+            &search,
+            &path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
+
+        assert_eq!(result.match_count, 1);
+        assert_eq!(result.lines_searched, 1);
+    }
+
+    #[test]
+    fn stops_reading_the_stream_at_the_max_count() {
+        let data = b"error one\nerror two\nerror three\nerror four\n";
+        let mut search = make_search(b"error");
+        search.max_count = Some(1);
+        let path = SearchPath::Print(make_printer());
+        // Two lines fit the budget: the second is where the max-count test fires.
+        let reader = BudgetedReader {
+            data,
+            position: 0,
+            budget: 20,
+        };
+        let mut refill = Refill::new(reader, 20);
+        let mut output = Vec::new();
+        let mut max_reached = false;
+
+        let result = search_stream(
+            &mut refill,
+            "test.txt",
+            &search,
+            &path,
+            &mut output,
+            &mut max_reached,
+        )
+        .unwrap();
+
+        assert_eq!(result.match_count, 1);
+        assert!(max_reached);
+        assert_eq!(output, b"error one\n");
+    }
 }
+
+// endregion: Tests

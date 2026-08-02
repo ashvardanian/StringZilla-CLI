@@ -89,7 +89,12 @@ struct Args {
     keep_empty: bool,
 
     /// NUL-terminate each record instead of newline; needed when segments contain newlines
-    #[arg(short = '0', long, conflicts_with = "json", help_heading = "Output Formats")]
+    #[arg(
+        short = '0',
+        long,
+        conflicts_with = "json",
+        help_heading = "Output Formats"
+    )]
     null: bool,
 
     /// Prefix each record with `start<TAB>end<TAB>`, as byte offsets into the input
@@ -133,7 +138,9 @@ struct Args {
 
 /// Parse a `--chunk-bytes` budget, rejecting zero as unsatisfiable.
 fn parse_chunk_bytes(value: &str) -> Result<usize, String> {
-    let budget: usize = value.parse().map_err(|_| format!("`{}` is not a number", value))?;
+    let budget: usize = value
+        .parse()
+        .map_err(|_| format!("`{}` is not a number", value))?;
     if budget == 0 {
         return Err("must be at least 1".to_string());
     }
@@ -191,6 +198,58 @@ impl Mode {
             Mode::Graphemes | Mode::Wordbreaks | Mode::Sentences | Mode::Linebreaks
         )
     }
+
+    /// Where a window may be cut so the streamed records match the whole input's. Grapheme,
+    /// word and line-break segments never cross a hard line terminator, so a cut at any of
+    /// the seven is invisible. Sentences run through VT and FF — `Sentence_Break=Sp` rather
+    /// than `Sep` — so only a paragraph separator returns their automaton to its start.
+    fn cut_after(self) -> CutAfter {
+        match self {
+            Mode::Sentences => CutAfter::ParagraphSeparators,
+            _ => CutAfter::LineTerminators,
+        }
+    }
+}
+
+/// Which segmenter runs and which of its segments count. `--keep-empty` lives here rather
+/// than beside the output flags because it decides which segments exist, not how they print.
+#[derive(Clone, Copy)]
+struct Segmentation {
+    mode: Mode,
+    /// Keep zero-length segments, which only the `--split-*` modes produce.
+    keep_empty: bool,
+}
+
+impl Segmentation {
+    /// Read the segmenter and the empty-segment rule the flags name.
+    fn from_args(args: &Args) -> Self {
+        Segmentation {
+            mode: Mode::from_args(args),
+            keep_empty: args.keep_empty,
+        }
+    }
+
+    /// Whether a window cut at [`Mode::cut_after`] yields the records the whole input
+    /// yields, which is what lets this segmentation read a pipe in windows.
+    ///
+    /// `--split-delimiters` segments the same bytes differently depending on where they sit
+    /// in the buffer — it truncates a token starting within four bytes of a 64-byte boundary
+    /// — and streaming shifts every offset, so the two paths would disagree. The splitters
+    /// close each window with an empty segment, which the whole input yields only at its
+    /// end, and `--keep-empty` is what makes those visible.
+    fn window_stable(self) -> bool {
+        match self.mode {
+            Mode::Graphemes | Mode::Wordbreaks | Mode::Sentences | Mode::Linebreaks => true,
+            Mode::SplitWhitespaces | Mode::SplitNewlines => !self.keep_empty,
+            Mode::SplitDelimiters => false,
+        }
+    }
+}
+
+/// Whether this run can read a pipe one window at a time. Chunking re-slices the source
+/// span, so it needs the whole input however stable the segmenter is on a window.
+fn can_stream(segmentation: Segmentation, config: &OutputConfig) -> bool {
+    config.chunk_bytes.is_none() && segmentation.window_stable()
 }
 
 /// Iterator over one segmenter's output. The seven modes are seven distinct types —
@@ -220,7 +279,9 @@ impl<'a> SegmentIter<'a> {
             Mode::Wordbreaks => SegmentIter::Wordbreaks(Utf8Segments::new(data)),
             Mode::Sentences => SegmentIter::Sentences(Utf8Segments::new(data)),
             Mode::Linebreaks => SegmentIter::Linebreaks(Utf8Segments::new(data)),
-            Mode::SplitWhitespaces => SegmentIter::SplitWhitespaces(data.sz_utf8_split_whitespaces()),
+            Mode::SplitWhitespaces => {
+                SegmentIter::SplitWhitespaces(data.sz_utf8_split_whitespaces())
+            }
             Mode::SplitDelimiters => SegmentIter::SplitDelimiters(data.sz_utf8_split_delimiters()),
             Mode::SplitNewlines => SegmentIter::SplitNewlines(data.sz_utf8_split_newlines()),
         }
@@ -259,12 +320,12 @@ enum Format {
     Json,
 }
 
-/// What the run reports once every segment has been seen.
+/// What the run puts on stdout.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Summary {
-    /// Nothing; the records were the output.
-    None,
-    /// The number of records.
+enum Report {
+    /// One record per segment, rendered this way.
+    Records(Format),
+    /// The number of segments, once every input has been read.
     Count,
     /// Nothing at all — the exit code carries whether anything was found.
     Quiet,
@@ -273,36 +334,30 @@ enum Summary {
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig {
-    /// How to render each record, or `None` when records are not emitted.
-    format: Option<Format>,
-    summary: Summary,
+    report: Report,
     terminator: Terminator,
     /// Pack consecutive segments up to this many bytes; tiling modes only.
     chunk_bytes: Option<usize>,
-    /// Keep zero-length segments, which only the `--split-*` modes produce.
-    keep_empty: bool,
 }
 
 impl OutputConfig {
     fn from_args(args: &Args) -> Self {
         // Clap's conflicts keep `-q`, `-c`, `--json` and `--offsets` exclusive.
-        let (format, summary) = if args.quiet {
-            (None, Summary::Quiet)
+        let report = if args.quiet {
+            Report::Quiet
         } else if args.count {
-            (None, Summary::Count)
+            Report::Count
         } else if args.json {
-            (Some(Format::Json), Summary::None)
+            Report::Records(Format::Json)
         } else if args.offsets {
-            (Some(Format::Offsets), Summary::None)
+            Report::Records(Format::Offsets)
         } else {
-            (Some(Format::Plain), Summary::None)
+            Report::Records(Format::Plain)
         };
         Self {
-            format,
-            summary,
+            report,
             terminator: Terminator::from_null(args.null),
             chunk_bytes: args.chunk_bytes,
-            keep_empty: args.keep_empty,
         }
     }
 }
@@ -343,29 +398,52 @@ fn write_record(
 
 // region: Segmentation
 
-/// Segment `data` and write the records, returning how many were emitted.
-fn segment_data(
+/// Segment a whole input. A `--chunk-bytes` budget packs the segments into chunks, which
+/// re-slices the source span and so needs every byte of the input at once.
+fn segment_whole(
     data: &[u8],
-    mode: Mode,
+    segmentation: Segmentation,
     config: &OutputConfig,
     path_json: &[u8],
     output: &mut dyn Write,
 ) -> io::Result<usize> {
-    if let Some(chunk_bytes) = config.chunk_bytes {
-        return write_chunks(data, mode, config, path_json, chunk_bytes, output);
+    match config.chunk_bytes {
+        Some(chunk_bytes) => {
+            write_chunks(data, segmentation, config, path_json, chunk_bytes, output)
+        }
+        None => segment_data(data, segmentation, config, path_json, 0, output),
     }
+}
 
+/// Segment `data` and write the records, returning how many were emitted. `base` is where
+/// `data` starts in the input, so a streamed window still reports absolute offsets.
+fn segment_data(
+    data: &[u8],
+    segmentation: Segmentation,
+    config: &OutputConfig,
+    path_json: &[u8],
+    base: usize,
+    output: &mut dyn Write,
+) -> io::Result<usize> {
     let mut records = 0;
-    for segment in SegmentIter::new(data, mode) {
-        if segment.is_empty() && !config.keep_empty {
+    for segment in SegmentIter::new(data, segmentation.mode) {
+        if segment.is_empty() && !segmentation.keep_empty {
             continue;
         }
         records += 1;
-        let Some(format) = config.format else {
+        let Report::Records(format) = config.report else {
             continue;
         };
-        let start = offset_within(data, segment);
-        write_record(output, config, format, path_json, segment, start, start + segment.len())?;
+        let start = base + offset_within(data, segment);
+        write_record(
+            output,
+            config,
+            format,
+            path_json,
+            segment,
+            start,
+            start + segment.len(),
+        )?;
     }
     Ok(records)
 }
@@ -376,29 +454,37 @@ fn segment_data(
 /// honoring the budget, since the alternative is emitting a broken grapheme or sentence.
 fn write_chunks(
     data: &[u8],
-    mode: Mode,
+    segmentation: Segmentation,
     config: &OutputConfig,
     path_json: &[u8],
     chunk_bytes: usize,
     output: &mut dyn Write,
 ) -> io::Result<usize> {
     debug_assert!(
-        mode.tiles(),
+        segmentation.mode.tiles(),
         "chunking slices the source span, so it needs a tiling mode"
     );
 
     let flush = |output: &mut dyn Write, start: usize, end: usize| -> io::Result<()> {
-        let Some(format) = config.format else {
+        let Report::Records(format) = config.report else {
             return Ok(());
         };
-        write_record(output, config, format, path_json, &data[start..end], start, end)
+        write_record(
+            output,
+            config,
+            format,
+            path_json,
+            &data[start..end],
+            start,
+            end,
+        )
     };
 
     let mut records = 0;
     let mut chunk_start = 0;
     let mut chunk_end = 0;
 
-    for segment in SegmentIter::new(data, mode) {
+    for segment in SegmentIter::new(data, segmentation.mode) {
         // Tiling leaves no gaps, so this segment begins where the previous one ended.
         let segment_end = chunk_end + segment.len();
         if chunk_end > chunk_start && segment_end - chunk_start > chunk_bytes {
@@ -416,23 +502,63 @@ fn write_chunks(
     Ok(records)
 }
 
-/// Segment one input, mapping it into memory when it is a file.
+// endregion: Segmentation
+
+// region: Streaming
+
+/// Segment a pipe one window at a time, cutting each window where [`Mode::cut_after`] says
+/// the mode's automaton restarts. `base` tracks where the window starts in the input, so
+/// `--offsets` and `--json` report the same absolute positions the whole-slice path reports.
+fn segment_stream(
+    refill: &mut Refill<impl io::Read>,
+    segmentation: Segmentation,
+    config: &OutputConfig,
+    path_json: &[u8],
+    output: &mut dyn Write,
+) -> io::Result<usize> {
+    let mut records = 0;
+    let mut base = 0;
+    refill.for_each_window(segmentation.mode.cut_after(), |window| {
+        records += segment_data(window, segmentation, config, path_json, base, output)?;
+        base += window.len();
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+// endregion: Streaming
+
+// region: Inputs
+
+/// Segment one input, mapping it into memory when it is a file and windowing it when it
+/// is a pipe.
 fn segment_input(
     path: Option<&str>,
-    mode: Mode,
+    segmentation: Segmentation,
     config: &OutputConfig,
     output: &mut dyn Write,
 ) -> io::Result<usize> {
-    let input = get_input(path)?;
+    let input = if can_stream(segmentation, config) {
+        get_input_streaming(path)?
+    } else {
+        get_input(path)?
+    };
     let display = path.unwrap_or("-");
 
     // Escape the path once per file, never per segment.
     let mut path_json = Vec::new();
-    if config.format == Some(Format::Json) {
+    if config.report == Report::Records(Format::Json) {
         json_text_field_to(&mut path_json, display.as_bytes())?;
     }
 
-    segment_data(input.as_bytes(), mode, config, &path_json, output)
+    match input.into_window(DEFAULT_WINDOW_BYTES) {
+        InputWindow::Whole(source) => {
+            segment_whole(source.as_bytes(), segmentation, config, &path_json, output)
+        }
+        InputWindow::Stream(mut refill) => {
+            segment_stream(&mut refill, segmentation, config, &path_json, output)
+        }
+    }
 }
 
 /// Collect the files named by the inputs, walking directories with ignore support.
@@ -462,11 +588,11 @@ fn resolve_inputs(args: &Args) -> Vec<String> {
     resolved
 }
 
-// endregion: Segmentation
+// endregion: Inputs
 
 fn main() {
     let args = Args::parse();
-    let mode = Mode::from_args(&args);
+    let segmentation = Segmentation::from_args(&args);
     let config = OutputConfig::from_args(&args);
 
     let inputs = resolve_inputs(&args);
@@ -474,8 +600,12 @@ fn main() {
     let mut records = 0;
 
     for input in &inputs {
-        let path = if input == "-" { None } else { Some(input.as_str()) };
-        match segment_input(path, mode, &config, &mut output) {
+        let path = if input == "-" {
+            None
+        } else {
+            Some(input.as_str())
+        };
+        match segment_input(path, segmentation, &config, &mut output) {
             Ok(count) => records += count,
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
                 ExitCode::Success.exit(&mut output)
@@ -487,7 +617,7 @@ fn main() {
         }
     }
 
-    if config.summary == Summary::Count {
+    if config.report == Report::Count {
         if let Err(error) = writeln!(output, "{}", records) {
             exit_on_write_error(&mut output, &error, "Error writing output");
         }
@@ -497,7 +627,7 @@ fn main() {
         exit_on_write_error(&mut output, &error, "Error writing output");
     }
 
-    if config.summary == Summary::Quiet {
+    if config.report == Report::Quiet {
         ExitCode::from_found(records > 0).exit(&mut output);
     }
 }
@@ -510,19 +640,229 @@ mod tests {
         SegmentIter::new(data, mode).collect()
     }
 
+    /// The default segmentation for `mode`, which drops the empty segments a splitter emits.
+    fn segmenting(mode: Mode) -> Segmentation {
+        Segmentation {
+            mode,
+            keep_empty: false,
+        }
+    }
+
     fn rendered(data: &[u8], mode: Mode, config: &OutputConfig) -> (String, usize) {
+        let (bytes, records) = whole(data, segmenting(mode), config);
+        (String::from_utf8(bytes).unwrap(), records)
+    }
+
+    /// Render the whole input in one call, the way a mapped file is read.
+    fn whole(data: &[u8], segmentation: Segmentation, config: &OutputConfig) -> (Vec<u8>, usize) {
         let mut output = Vec::new();
-        let records = segment_data(data, mode, config, br#"{"text":"-"}"#, &mut output).unwrap();
-        (String::from_utf8(output).unwrap(), records)
+        let records =
+            segment_whole(data, segmentation, config, br#"{"text":"-"}"#, &mut output).unwrap();
+        (output, records)
+    }
+
+    /// Render the same input through `capacity`-byte windows, the way a pipe is read.
+    fn streamed(
+        data: &[u8],
+        segmentation: Segmentation,
+        config: &OutputConfig,
+        capacity: usize,
+    ) -> (Vec<u8>, usize) {
+        let mut output = Vec::new();
+        let mut refill = Refill::new(data, capacity);
+        let records = segment_stream(
+            &mut refill,
+            segmentation,
+            config,
+            br#"{"text":"-"}"#,
+            &mut output,
+        )
+        .unwrap();
+        (output, records)
+    }
+
+    const ALL_MODES: [Mode; 7] = [
+        Mode::Graphemes,
+        Mode::Wordbreaks,
+        Mode::Sentences,
+        Mode::Linebreaks,
+        Mode::SplitWhitespaces,
+        Mode::SplitDelimiters,
+        Mode::SplitNewlines,
+    ];
+
+    fn mode_name(mode: Mode) -> &'static str {
+        match mode {
+            Mode::Graphemes => "graphemes",
+            Mode::Wordbreaks => "wordbreaks",
+            Mode::Sentences => "sentences",
+            Mode::Linebreaks => "linebreaks",
+            Mode::SplitWhitespaces => "split-whitespaces",
+            Mode::SplitDelimiters => "split-delimiters",
+            Mode::SplitNewlines => "split-newlines",
+        }
+    }
+
+    /// Every hard terminator, both line endings, blank lines and a missing final newline,
+    /// within two-byte codepoints — the UAX-29 word and sentence kernels fault on wider
+    /// ones in unoptimized builds, which is where `cargo test` runs.
+    const SEAM_CORPUS: &[u8] = concat!(
+        "Hello world. Dr. Smith left.\n",
+        "A wrapped\nsentence here. And another.\n",
+        "crlf line\r\n",
+        "bare cr line\rnext\n",
+        "vt\u{0b}ff\u{0c} end\n",
+        "nel\u{85} end\n",
+        "Привет мир, café naïve.\n",
+        "tabs\tand   spaces\n",
+        "\n\n",
+        "no trailing newline at all"
+    )
+    .as_bytes();
+
+    #[test]
+    fn streamed_windows_match_the_whole_input() {
+        for mode in ALL_MODES {
+            for keep_empty in [false, true] {
+                for format in [Format::Plain, Format::Offsets, Format::Json] {
+                    let segmentation = Segmentation { mode, keep_empty };
+                    let mut config = plain();
+                    config.report = Report::Records(format);
+                    if !can_stream(segmentation, &config) {
+                        continue;
+                    }
+                    let reference = whole(SEAM_CORPUS, segmentation, &config);
+                    // Tiny windows maximize seam crossings; 4096 spans the whole corpus.
+                    for capacity in [7, 13, 64, 4096] {
+                        assert_eq!(
+                            streamed(SEAM_CORPUS, segmentation, &config, capacity),
+                            reference,
+                            "{} keep_empty={} capacity={}",
+                            mode_name(mode),
+                            keep_empty,
+                            capacity
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_offsets_stay_absolute() {
+        // Offsets are window-relative before the running base is added, so the last
+        // record of a multi-window run is where an unadded base would show up.
+        let mut config = plain();
+        config.report = Report::Records(Format::Offsets);
+        let (bytes, records) = streamed(SEAM_CORPUS, segmenting(Mode::SplitNewlines), &config, 16);
+        let text = String::from_utf8(bytes).unwrap();
+        let last = text.lines().next_back().unwrap();
+        let start: usize = last.split('\t').next().unwrap().parse().unwrap();
+        assert_eq!(
+            start,
+            SEAM_CORPUS.len() - "no trailing newline at all".len()
+        );
+        assert_eq!(records, text.lines().count());
+    }
+
+    #[test]
+    fn grows_the_window_past_a_line_wider_than_it() {
+        let mut data = vec![b'x'; 5000];
+        data.extend_from_slice(b"\nshort\n");
+        let config = plain();
+        assert_eq!(
+            streamed(&data, segmenting(Mode::SplitNewlines), &config, 8),
+            whole(&data, segmenting(Mode::SplitNewlines), &config)
+        );
+    }
+
+    /// Every cut candidate placed inside a sentence: VT and FF run through, NEL, LS, PS and
+    /// both line endings end one, a bare CR sits mid-sentence, and the abbreviations put
+    /// SB8's unbounded right context across the seams the tiny capacities create.
+    const SENTENCE_CORPUS: &[u8] = concat!(
+        "Dr. Smith met Mrs. Jones.\n",
+        "A sentence spanning\u{0B}a vertical tab stays whole. ",
+        "Another spanning\u{0C}a form feed stays whole too.\n",
+        "crlf ends this one.\r\n",
+        "bare\rcr sits inside this one. ",
+        "nel ends this one.\u{0085}",
+        "ls ends this one.\u{2028}",
+        "ps ends this one.\u{2029}",
+        "Mr. Brown left.\r\n",
+        "no terminator at the end"
+    )
+    .as_bytes();
+
+    // LS and PS are three bytes wide, and the UAX-29 sentence kernel faults on those in
+    // unoptimized builds, so this one runs under `cargo test --release`.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "sentence kernel needs an optimized build here"
+    )]
+    fn streams_sentences_across_every_cut_candidate() {
+        let config = plain();
+        let segmentation = segmenting(Mode::Sentences);
+        assert!(can_stream(segmentation, &config));
+        let reference = whole(SENTENCE_CORPUS, segmentation, &config);
+        for capacity in [7, 13, 64, 4096] {
+            assert_eq!(
+                streamed(SENTENCE_CORPUS, segmentation, &config, capacity),
+                reference,
+                "capacity={}",
+                capacity
+            );
+        }
+    }
+
+    #[test]
+    fn sentences_run_through_a_vertical_tab_and_form_feed() {
+        // VT and FF are `Sentence_Break=Sp`, so one sentence spans them. Offering them as
+        // cut points reports two sentences where the whole input reports one.
+        let config = plain();
+        for fixture in [&b"one\x0Btwo. Done."[..], &b"one\x0Ctwo. Done."[..]] {
+            assert_eq!(segments(fixture, Mode::Sentences).len(), 2);
+            assert_eq!(last_cut(fixture, CutAfter::LineTerminators), Some(4));
+            assert_eq!(last_cut(fixture, CutAfter::ParagraphSeparators), None);
+            let reference = whole(fixture, segmenting(Mode::Sentences), &config);
+            // Every capacity puts the seam at a different byte, including right on the
+            // vertical tab and the form feed.
+            for capacity in 1..=fixture.len() + 2 {
+                assert_eq!(
+                    streamed(fixture, segmenting(Mode::Sentences), &config, capacity),
+                    reference,
+                    "capacity={}",
+                    capacity
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_modes_break_right_after_a_form_feed() {
+        // Grapheme, word and line-break automata restart at every hard terminator, which is
+        // what lets those modes cut on the wider set.
+        for mode in [Mode::Graphemes, Mode::Wordbreaks, Mode::Linebreaks] {
+            assert_eq!(mode.cut_after(), CutAfter::LineTerminators);
+            let mut boundary = 0;
+            let breaks = segments(b"one\x0ctwo", mode).iter().any(|segment| {
+                boundary += segment.len();
+                boundary == 4
+            });
+            assert!(
+                breaks,
+                "{} must break right after the form feed",
+                mode_name(mode)
+            );
+        }
+        assert_eq!(Mode::Sentences.cut_after(), CutAfter::ParagraphSeparators);
     }
 
     fn plain() -> OutputConfig {
         OutputConfig {
-            format: Some(Format::Plain),
-            summary: Summary::None,
+            report: Report::Records(Format::Plain),
             terminator: Terminator::Newline,
             chunk_bytes: None,
-            keep_empty: false,
         }
     }
 
@@ -530,7 +870,10 @@ mod tests {
     fn tiling_modes_cover_every_byte() {
         let data = "Hi there. Bye!".as_bytes();
         for mode in [Mode::Graphemes, Mode::Wordbreaks, Mode::Sentences] {
-            let total: usize = segments(data, mode).iter().map(|segment| segment.len()).sum();
+            let total: usize = segments(data, mode)
+                .iter()
+                .map(|segment| segment.len())
+                .sum();
             assert_eq!(total, data.len(), "segments must tile the input");
         }
     }
@@ -541,7 +884,10 @@ mod tests {
         // sentence is two sentences. Verified identical to ICU's break iterator.
         let data = "A wrapped\nsentence here. And another.".as_bytes();
         let found = segments(data, Mode::Sentences);
-        assert_eq!(found, vec![&b"A wrapped\n"[..], b"sentence here. ", b"And another."]);
+        assert_eq!(
+            found,
+            vec![&b"A wrapped\n"[..], b"sentence here. ", b"And another."]
+        );
     }
 
     #[test]
@@ -549,7 +895,10 @@ mod tests {
         // No abbreviation dictionary, per the standard. This is documented behavior,
         // not a defect, and is where `punkt` and `pysbd` genuinely do better.
         let data = "Dr. Smith left.".as_bytes();
-        assert_eq!(segments(data, Mode::Sentences), vec![&b"Dr. "[..], b"Smith left."]);
+        assert_eq!(
+            segments(data, Mode::Sentences),
+            vec![&b"Dr. "[..], b"Smith left."]
+        );
     }
 
     #[test]
@@ -559,9 +908,12 @@ mod tests {
         assert_eq!(text, "a\nb\n");
         assert_eq!(records, 2);
 
-        let mut keeping = plain();
-        keeping.keep_empty = true;
-        let (text, records) = rendered(data, Mode::SplitWhitespaces, &keeping);
+        let keeping = Segmentation {
+            mode: Mode::SplitWhitespaces,
+            keep_empty: true,
+        };
+        let (bytes, records) = whole(data, keeping, &plain());
+        let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text, "a\n\nb\n");
         assert_eq!(records, 3);
     }
@@ -611,7 +963,7 @@ mod tests {
     #[test]
     fn emits_json_with_offsets() {
         let mut config = plain();
-        config.format = Some(Format::Json);
+        config.report = Report::Records(Format::Json);
         let (text, records) = rendered(b"hi", Mode::Wordbreaks, &config);
         assert_eq!(records, 1);
         assert_eq!(

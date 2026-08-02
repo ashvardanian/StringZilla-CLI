@@ -140,17 +140,27 @@ impl AppendOnlyFlatHashSet {
         self.slots.len() - 1
     }
 
-    /// Find all entries with the given hash.
-    /// Returns an iterator that probes from the hash's home slot until an empty slot.
+    /// Entries carrying the given hash, probing forward from its home slot until an
+    /// empty one. The load factor stays under 60%, so an empty slot always ends it.
     #[inline]
-    fn find(&self, hash: u64) -> FindIter<'_> {
+    fn find(&self, hash: u64) -> impl Iterator<Item = &LineEntry> {
         let mask = self.mask();
-        FindIter {
-            slots: &self.slots,
-            target_hash: hash,
-            slot: (hash as usize) & mask,
-            done: false,
-        }
+        let home = (hash as usize) & mask;
+        (0..self.slots.len())
+            .map(move |step| &self.slots[(home + step) & mask])
+            .take_while(|entry| !entry.is_empty())
+            .filter(move |entry| entry.hash == hash)
+    }
+
+    /// Whether `line` was already recorded, comparing it against the bytes each
+    /// same-hash entry points at in `data`.
+    #[inline]
+    fn contains(&self, hash: u64, line: &[u8], data: &[u8], ignore_case: bool) -> bool {
+        self.find(hash).any(|entry| {
+            let start = entry.offset as usize;
+            let existing = &data[start..start + entry.length as usize];
+            lines_equal(existing, line, ignore_case)
+        })
     }
 
     /// Insert a new entry. Grows the table if load factor > 60%.
@@ -194,40 +204,6 @@ impl AppendOnlyFlatHashSet {
     }
 }
 
-/// Iterator over entries matching a specific hash
-struct FindIter<'a> {
-    slots: &'a [LineEntry],
-    target_hash: u64,
-    slot: usize,
-    done: bool,
-}
-
-impl<'a> Iterator for FindIter<'a> {
-    type Item = &'a LineEntry;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        let mask = self.slots.len() - 1;
-        loop {
-            let entry = &self.slots[self.slot];
-            self.slot = (self.slot + 1) & mask;
-
-            if entry.is_empty() {
-                self.done = true;
-                return None;
-            }
-
-            if entry.hash == self.target_hash {
-                return Some(entry);
-            }
-        }
-    }
-}
-
 // endregion: AppendOnlyFlatHashSet
 
 // region: Hash and Comparison Utilities
@@ -262,14 +238,12 @@ fn lines_equal(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
 
 /// Deduplicate lines in-place, compacting the buffer.
 ///
-/// Returns (new_length, unique_count).
 /// When `utf8` is true, handles all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
 /// When `utf8` is false, only handles LF newlines.
-fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> (usize, DedupCounts) {
+fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> DedupCounts {
     // Compaction only overwrites `[0..write_pos]`, which is always behind `line_start`,
     // so the tail `data[line_start..]` is intact — find each newline lazily there with
     // no up-front offset buffer.
-    let base = data.as_ptr() as usize;
     let mut seen = AppendOnlyFlatHashSet::new();
     let mut scratch = Vec::new();
     let mut write_pos: usize = 0;
@@ -282,7 +256,7 @@ fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> (usize, Ded
         let (line_end, newline_len) = if utf8 {
             // UTF-8 aware: first of the 7 Unicode newline chars, CRLF as one run.
             match sz::Utf8Newlines::new(&data[line_start..]).next() {
-                Some(run) => (run.as_ptr() as usize - base, run.len()),
+                Some(run) => (offset_within(data, run), run.len()),
                 None => (data.len(), 0),
             }
         } else {
@@ -293,13 +267,11 @@ fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> (usize, Ded
         };
 
         let line_len = line_end - line_start;
-        let hash = compute_hash(&data[line_start..line_end], ignore_case, &mut scratch);
+        let line = &data[line_start..line_end];
+        let hash = compute_hash(line, ignore_case, &mut scratch);
 
         // Check for duplicate against already-written lines in [0..write_pos].
-        let is_duplicate = seen.find(hash).any(|entry| {
-            let existing = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
-            lines_equal(existing, &data[line_start..line_end], ignore_case)
-        });
+        let is_duplicate = seen.contains(hash, line, data, ignore_case);
 
         if !is_duplicate {
             seen.insert(hash, write_pos as u64, line_len as u64);
@@ -319,20 +291,22 @@ fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> (usize, Ded
         line_start = line_end + newline_len;
     }
 
-    (
-        write_pos,
-        DedupCounts {
-            total: total_count,
-            unique: unique_count,
-        },
-    )
+    DedupCounts {
+        total: total_count,
+        unique: unique_count,
+        compacted_bytes: write_pos,
+    }
 }
 
-/// How many lines were read and how many survived deduplication.
+/// How many lines were read, how many survived deduplication, and how many bytes
+/// the survivors occupy.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct DedupCounts {
     total: usize,
     unique: usize,
+    /// Length to truncate the file to after in-place compaction. The streaming
+    /// path rewrites nothing and leaves it zero.
+    compacted_bytes: usize,
 }
 
 impl DedupCounts {
@@ -347,7 +321,6 @@ impl DedupCounts {
 struct OutputConfig<'a> {
     json: bool,
     terminator: Terminator,
-    quiet: bool,
     /// Input name carried into the JSON envelope.
     path: &'a str,
 }
@@ -359,9 +332,6 @@ fn write_line(
     line: &[u8],
     index: usize,
 ) -> io::Result<()> {
-    if config.quiet {
-        return Ok(());
-    }
     if config.json {
         output.write_all(br#"{"type":"line","data":{"path":"#)?;
         json_text_field_to(output, config.path.as_bytes())?;
@@ -393,13 +363,10 @@ fn dedup_to_writer(
 
     for line in lines {
         counts.total += 1;
-        let line_offset = line.as_ptr() as usize - data.as_ptr() as usize;
+        let line_offset = offset_within(data, line);
         let hash = compute_hash(line, ignore_case, &mut scratch);
 
-        let is_duplicate = seen.find(hash).any(|entry| {
-            let existing = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
-            lines_equal(existing, line, ignore_case)
-        });
+        let is_duplicate = seen.contains(hash, line, data, ignore_case);
 
         if !is_duplicate {
             seen.insert(hash, line_offset as u64, line.len() as u64);
@@ -467,58 +434,58 @@ fn main() {
 
     // In-place is opt-in: the default writes to stdout like every other binary,
     // so `sz-dedup file | head` cannot destroy the input.
-    let in_place = args.in_place;
-    if in_place && args.input.as_deref().unwrap_or("-") == "-" {
-        eprintln!("Error: --in-place requires a file argument (cannot rewrite stdin)");
-        ExitCode::Error.exit(&mut stdout);
-    }
+    let in_place_path = if args.in_place {
+        let Some(path) = args.input.as_deref().filter(|path| *path != "-") else {
+            eprintln!("Error: --in-place requires a file argument (cannot rewrite stdin)");
+            ExitCode::Error.exit(&mut stdout);
+        };
+        Some(path)
+    } else {
+        None
+    };
 
     let config = OutputConfig {
         json: args.json,
         terminator: Terminator::from_null(args.null),
-        quiet: args.quiet,
         path: args.input.as_deref().unwrap_or("-"),
     };
 
-    let counts = if in_place {
+    let counts = if let Some(input_path) = in_place_path {
         // In-place mode: mutable mmap, compact, truncate
-        let input_path = args.input.as_ref().unwrap();
-
-        let mut input = match get_input_mutable(input_path) {
-            Ok(input) => input,
-            Err(error) => exit_with_error(
+        let mut input = get_input_mutable(input_path).unwrap_or_else(|error| {
+            exit_with_error(
                 &mut stdout,
                 &error,
                 "Error opening file for in-place modification",
-            ),
-        };
+            )
+        });
 
         let data = input.as_mut_bytes().unwrap();
-        let (new_len, counts) = dedup_in_place(data, args.ignore_case, utf8_mode);
+        let counts = dedup_in_place(data, args.ignore_case, utf8_mode);
 
-        if let Err(error) = input.truncate_and_flush(new_len as u64) {
+        if let Err(error) = input.truncate_and_flush(counts.compacted_bytes as u64) {
             exit_with_error(&mut stdout, &error, "Error truncating file");
         }
 
         counts
     } else {
         // Streaming mode: read-only input, write to output
-        let input = match get_input(args.input.as_deref()) {
-            Ok(input) => input,
-            Err(error) => exit_with_error(&mut stdout, &error, "Error reading input"),
-        };
+        let input = get_input(args.input.as_deref())
+            .unwrap_or_else(|error| exit_with_error(&mut stdout, &error, "Error reading input"));
 
         let data = input.as_bytes();
 
-        let mut output = match get_output(args.output.as_deref()) {
-            Ok(output) => output,
-            Err(error) => exit_with_error(&mut stdout, &error, "Error opening output"),
+        // `-q` reports through the exit code alone, so the lines go nowhere.
+        let mut output: Box<dyn Write> = if args.quiet {
+            Box::new(io::sink())
+        } else {
+            get_output(args.output.as_deref()).unwrap_or_else(|error| {
+                exit_with_error(&mut stdout, &error, "Error opening output")
+            })
         };
 
-        match dedup_to_writer(data, &mut output, args.ignore_case, utf8_mode, &config) {
-            Ok(counts) => counts,
-            Err(error) => exit_on_write_error(&mut output, &error, "Error deduplicating"),
-        }
+        dedup_to_writer(data, &mut output, args.ignore_case, utf8_mode, &config)
+            .unwrap_or_else(|error| exit_on_write_error(&mut output, &error, "Error deduplicating"))
     };
 
     // The summary always terminates a `--json` run. In-place mode has no per-line
@@ -552,7 +519,6 @@ mod tests {
         OutputConfig {
             json: false,
             terminator: Terminator::Newline,
-            quiet: false,
             path: "-",
         }
     }
@@ -589,10 +555,10 @@ mod tests {
     #[test]
     fn dedups_repeated_lines_in_place() {
         let mut data = b"line1\nline2\nline1\nline3\n".to_vec();
-        let (new_len, counts) = dedup_in_place(&mut data, false, false);
+        let counts = dedup_in_place(&mut data, false, false);
 
         assert_eq!(counts.unique, 3);
-        let result = String::from_utf8(data[..new_len].to_vec()).unwrap();
+        let result = String::from_utf8(data[..counts.compacted_bytes].to_vec()).unwrap();
         let lines: Vec<_> = result.lines().collect();
         assert_eq!(lines, vec!["line1", "line2", "line3"]);
     }
@@ -600,10 +566,10 @@ mod tests {
     #[test]
     fn dedups_in_place_ignoring_case() {
         let mut data = b"Hello\nhello\nworld\nWORLD\n".to_vec();
-        let (new_len, counts) = dedup_in_place(&mut data, true, true);
+        let counts = dedup_in_place(&mut data, true, true);
 
         assert_eq!(counts.unique, 2);
-        let result = String::from_utf8(data[..new_len].to_vec()).unwrap();
+        let result = String::from_utf8(data[..counts.compacted_bytes].to_vec()).unwrap();
         let lines: Vec<_> = result.lines().collect();
         assert_eq!(lines, vec!["Hello", "world"]);
     }
@@ -611,10 +577,10 @@ mod tests {
     #[test]
     fn dedups_in_place_folding_unicode() {
         let mut data = "MÜNCHEN\nmünchen\nberlin\n".as_bytes().to_vec();
-        let (new_len, counts) = dedup_in_place(&mut data, true, true);
+        let counts = dedup_in_place(&mut data, true, true);
 
         assert_eq!(counts.unique, 2);
-        let result = String::from_utf8(data[..new_len].to_vec()).unwrap();
+        let result = String::from_utf8(data[..counts.compacted_bytes].to_vec()).unwrap();
         let lines: Vec<_> = result.lines().collect();
         assert_eq!(lines, vec!["MÜNCHEN", "berlin"]);
     }
@@ -622,20 +588,20 @@ mod tests {
     #[test]
     fn collapses_all_duplicate_lines_in_place() {
         let mut data = b"dup\ndup\ndup\ndup\n".to_vec();
-        let (new_len, counts) = dedup_in_place(&mut data, false, false);
+        let counts = dedup_in_place(&mut data, false, false);
 
         assert_eq!(counts.unique, 1);
-        assert_eq!(&data[..new_len], b"dup\n");
+        assert_eq!(&data[..counts.compacted_bytes], b"dup\n");
     }
 
     #[test]
     fn keeps_unique_lines_in_place() {
         let mut data = b"a\nb\nc\n".to_vec();
         let original_len = data.len();
-        let (new_len, counts) = dedup_in_place(&mut data, false, false);
+        let counts = dedup_in_place(&mut data, false, false);
 
         assert_eq!(counts.unique, 3);
-        assert_eq!(new_len, original_len);
+        assert_eq!(counts.compacted_bytes, original_len);
     }
 
     #[test]
