@@ -200,8 +200,11 @@ const HEADERS: &[&str] = &["lines", "words", "bytes", "chars", "maxline"];
 /// measurement that reaches only one of the three fails to compile.
 const FIELD_COUNT: usize = HEADERS.len();
 
-/// Width of the leading name column in the aligned table.
+/// Longest name the table prints in full; anything longer is truncated from the left.
 const NAME_WIDTH: usize = 40;
+
+/// Columns a tree branch glyph occupies ahead of an entry's name, as in `├─ `.
+const TREE_GLYPH_WIDTH: usize = 3;
 
 /// One input's measurements. Every field is always computed cheaply enough to
 /// keep this a plain record; [`Fields`] decides which of them reach the output.
@@ -652,6 +655,12 @@ fn truncate_path(path: &str, max_width: usize) -> Cow<'_, str> {
     Cow::Owned(format!("...{}", tail))
 }
 
+/// Every width one table needs: the name column, and each selected count column.
+struct TableWidths {
+    name: usize,
+    columns: [usize; FIELD_COUNT],
+}
+
 /// Width of each selected column: the widest of its header and any of its values.
 /// A fixed width silently misaligns the moment a count outgrows it.
 fn column_widths<'a>(
@@ -671,10 +680,27 @@ fn column_widths<'a>(
     widths
 }
 
+/// Width of the name column: the widest name any row prints, its tree glyphs included and
+/// [`NAME_WIDTH`] the bound past which [`truncate_path`] takes over. Padding every table to
+/// that bound instead strands one short name a screen away from its own counts.
+fn name_width<'a>(names: impl Iterator<Item = (&'a str, usize)>) -> usize {
+    names
+        .map(|(name, prefix)| prefix + name.chars().count().min(NAME_WIDTH - prefix))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Write the header row
-fn print_header(output: &mut dyn Write, config: &RenderConfig, widths: &[usize]) -> io::Result<()> {
-    write!(output, "{:>width$}", "", width = NAME_WIDTH)?;
-    for ((header, _), width) in Counts::default().columns(config.fields).zip(widths) {
+fn print_header(
+    output: &mut dyn Write,
+    config: &RenderConfig,
+    widths: &TableWidths,
+) -> io::Result<()> {
+    write!(output, "{:>width$}", "", width = widths.name)?;
+    for ((header, _), width) in Counts::default()
+        .columns(config.fields)
+        .zip(&widths.columns)
+    {
         write!(output, " {:>width$}", header, width = width)?;
     }
     output.write_all(b"\n")
@@ -688,7 +714,7 @@ fn print_row(
     name: &str,
     counts: &Counts,
     config: &RenderConfig,
-    widths: &[usize],
+    widths: &TableWidths,
 ) -> io::Result<()> {
     let prefix_width = prefix.chars().count();
     let name = truncate_path(name, NAME_WIDTH.saturating_sub(prefix_width));
@@ -697,10 +723,10 @@ fn print_row(
         output,
         "{:width$}",
         name,
-        width = NAME_WIDTH.saturating_sub(prefix_width)
+        width = widths.name.saturating_sub(prefix_width)
     )?;
     let mut buffer = [0u8; 26];
-    for ((_, value), width) in counts.columns(config.fields).zip(widths) {
+    for ((_, value), width) in counts.columns(config.fields).zip(&widths.columns) {
         write!(
             output,
             " {:>width$}",
@@ -718,7 +744,7 @@ fn print_tree_line(
     name: &str,
     counts: &Counts,
     config: &RenderConfig,
-    widths: &[usize],
+    widths: &TableWidths,
     is_last: bool,
     depth: usize,
 ) -> io::Result<()> {
@@ -733,10 +759,13 @@ fn print_tree_line(
 fn print_separator(
     output: &mut dyn Write,
     config: &RenderConfig,
-    widths: &[usize],
+    widths: &TableWidths,
 ) -> io::Result<()> {
-    write!(output, "{:>width$}", "", width = NAME_WIDTH)?;
-    for (_, width) in Counts::default().columns(config.fields).zip(widths) {
+    write!(output, "{:>width$}", "", width = widths.name)?;
+    for (_, width) in Counts::default()
+        .columns(config.fields)
+        .zip(&widths.columns)
+    {
         write!(output, " {:─>width$}", "", width = width)?;
     }
     output.write_all(b"\n")
@@ -747,11 +776,11 @@ fn print_totals(
     output: &mut dyn Write,
     counts: &Counts,
     config: &RenderConfig,
-    widths: &[usize],
+    widths: &TableWidths,
 ) -> io::Result<()> {
-    write!(output, "{:>width$}", "", width = NAME_WIDTH)?;
+    write!(output, "{:>width$}", "", width = widths.name)?;
     let mut buffer = [0u8; 26];
-    for ((_, value), width) in counts.columns(config.fields).zip(widths) {
+    for ((_, value), width) in counts.columns(config.fields).zip(&widths.columns) {
         write!(
             output,
             " {:>width$}",
@@ -802,7 +831,10 @@ fn report_single(name: &str, counts: &Counts, config: &RenderConfig) -> io::Resu
         // Exactly one selector and exactly one input: a bare integer, for `n=$(...)`.
         return writeln!(output, "{}", value);
     }
-    let widths = column_widths(std::iter::once(counts), config);
+    let widths = TableWidths {
+        name: name_width(std::iter::once((name, 0))),
+        columns: column_widths(std::iter::once(counts), config),
+    };
     print_header(&mut output, config, &widths)?;
     print_row(&mut output, "", name, counts, config, &widths)?;
     output.flush()
@@ -886,29 +918,41 @@ fn process_directory(
         return write_total_json(&mut output, entries.len(), &total, config.fields);
     }
 
-    let widths = column_widths(
-        entries.iter().map(|(_, counts)| counts).chain([&total]),
-        config,
-    );
-    print_header(&mut output, config, &widths)?;
-
-    // Print directory summary first
+    // The directory summary heads the table, and each entry hangs off it behind a branch
+    // glyph, so the names are gathered before the widths that have to cover them all.
     let path_text = path.to_string_lossy();
     let directory_display: Cow<'_, str> = if path_text.ends_with('/') {
         path_text
     } else {
         Cow::Owned(format!("{}/", path_text))
     };
+    let names: Vec<String> = entries
+        .iter()
+        .map(|(entry_path, _)| {
+            entry_path
+                .strip_prefix(path)
+                .unwrap_or(entry_path)
+                .display()
+                .to_string()
+        })
+        .collect();
+
+    let widths = TableWidths {
+        name: name_width(
+            std::iter::once((directory_display.as_ref(), 0))
+                .chain(names.iter().map(|name| (name.as_str(), TREE_GLYPH_WIDTH))),
+        ),
+        columns: column_widths(
+            entries.iter().map(|(_, counts)| counts).chain([&total]),
+            config,
+        ),
+    };
+    print_header(&mut output, config, &widths)?;
     print_row(&mut output, "", &directory_display, &total, config, &widths)?;
 
-    for (index, (entry_path, counts)) in entries.iter().enumerate() {
+    for (index, ((_, counts), name)) in entries.iter().zip(&names).enumerate() {
         let is_last = index == entries.len() - 1;
-        let name = entry_path
-            .strip_prefix(path)
-            .unwrap_or(entry_path)
-            .display()
-            .to_string();
-        print_tree_line(&mut output, &name, counts, config, &widths, is_last, 0)?;
+        print_tree_line(&mut output, name, counts, config, &widths, is_last, 0)?;
     }
 
     print_separator(&mut output, config, &widths)?;
@@ -949,10 +993,17 @@ fn process_multiple_files(
         return write_total_json(&mut output, results.len(), &total, config.fields);
     }
 
-    let widths = column_widths(
-        results.iter().map(|(_, counts)| counts).chain([&total]),
-        config,
-    );
+    let names: Vec<Cow<'_, str>> = results
+        .iter()
+        .map(|(path, _)| path.to_string_lossy())
+        .collect();
+    let widths = TableWidths {
+        name: name_width(names.iter().map(|name| (name.as_ref(), 0))),
+        columns: column_widths(
+            results.iter().map(|(_, counts)| counts).chain([&total]),
+            config,
+        ),
+    };
     print_header(&mut output, config, &widths)?;
     for (path, counts) in &results {
         print_row(
@@ -1374,6 +1425,24 @@ mod tests {
         assert!(truncated.starts_with("..."));
         assert_eq!(truncated.chars().count(), 40);
         assert_eq!(truncate_path("short.txt", 40), "short.txt");
+    }
+
+    #[test]
+    fn sizes_the_name_column_to_the_names() {
+        // Short names sit beside their counts rather than a column away from them.
+        assert_eq!(name_width(std::iter::once(("tiny.txt", 0))), 8);
+        // A tree entry's branch glyphs count toward the width its row occupies.
+        assert_eq!(
+            name_width(std::iter::once(("tiny.txt", TREE_GLYPH_WIDTH))),
+            11
+        );
+        // The widest row sets the column, and truncation bounds it at `NAME_WIDTH`.
+        let names = [("a.txt", 0), ("nested/directory/b.txt", 0)];
+        assert_eq!(name_width(names.into_iter()), 22);
+        let long = "é".repeat(60);
+        assert_eq!(name_width(std::iter::once((long.as_str(), 0))), NAME_WIDTH);
+        // Empty input renders a header alone, so the column collapses rather than pads.
+        assert_eq!(name_width(std::iter::empty()), 0);
     }
 
     #[test]
