@@ -36,14 +36,6 @@
 //! # Run on the GPU (requires: cargo build --features cuda)
 //! sz-fuzzy-find --device gpu -k 1 needle big.txt
 //! ```
-//!
-//! TODO: `-o`/span output — Smith-Waterman score kernels carry no traceback, so
-//! reporting the matched byte range needs either a traceback-capable kernel or a
-//! second, per-match alignment pass over the few winning lines.
-//!
-//! TODO: `--whole-file` mode — tiny needles over short lines are overhead-bound,
-//! so GPU offload only pays off for large alignment matrices, like a long needle
-//! aligned against an entire file rather than line by line.
 
 use std::io::{self, Write};
 use std::process;
@@ -296,20 +288,9 @@ fn build_scheme(cost: &Cost, custom_path: Option<&str>) -> io::Result<Scheme> {
 // region: Matching
 
 /// Tokenize a line into maximal runs of ASCII alphanumerics (word matching).
-fn tokenize(line: &[u8]) -> Vec<&[u8]> {
-    let mut tokens = Vec::new();
-    let mut start = None;
-    for (i, &b) in line.iter().enumerate() {
-        if b.is_ascii_alphanumeric() {
-            start.get_or_insert(i);
-        } else if let Some(s) = start.take() {
-            tokens.push(&line[s..i]);
-        }
-    }
-    if let Some(s) = start {
-        tokens.push(&line[s..]);
-    }
-    tokens
+fn tokenize(line: &[u8]) -> impl Iterator<Item = &[u8]> {
+    line.split(|byte: &u8| !byte.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
 }
 
 /// Tokenize valid UTF-8 into maximal runs of Unicode alphanumerics.
@@ -318,17 +299,48 @@ fn tokenize_utf8(text: &str) -> impl Iterator<Item = &str> {
         .filter(|t| !t.is_empty())
 }
 
-/// Flag `matched[owners[j]]` for every kernel result `row[j]` that `accept`s.
+/// Lines still needing the fuzzy kernel, having survived cheap rejection.
+///
+/// Only exact matches are rejected today, so every remaining line is a candidate
+/// and the kernel sees all of them. A partition filter belongs here: splitting the
+/// needle into `k + 1` pieces, a line holding none of them cannot be within `k`
+/// substitutions, insertions, or deletions.
+fn select_candidates(lines: &[&[u8]], matched: &[bool], candidates: &mut Vec<usize>) {
+    candidates.clear();
+    candidates.extend((0..lines.len()).filter(|&index| !matched[index]));
+}
+
+/// Flag `matched[owners[index]]` for every kernel result `row[index]` that `accept`s.
 fn mark_lines<T: Copy>(
     row: &[T],
     owners: &[usize],
     matched: &mut [bool],
     accept: impl Fn(T) -> bool,
 ) {
-    for (j, &v) in row.iter().enumerate() {
-        if accept(v) {
-            matched[owners[j]] = true;
+    for (index, &value) in row.iter().enumerate() {
+        if accept(value) {
+            matched[owners[index]] = true;
         }
+    }
+}
+
+/// Flag a line when any of its tokens is accepted.
+///
+/// Tokens arrive grouped by line, so the grouping is `runs`, one entry per line
+/// holding its owning line and the token index one past its last. Recording an
+/// owner per token instead would cost one `usize` per token across the file.
+fn mark_lines_by_run<T: Copy>(
+    row: &[T],
+    runs: &[(usize, usize)],
+    matched: &mut [bool],
+    accept: impl Fn(T) -> bool,
+) {
+    let mut start = 0;
+    for &(line, end) in runs {
+        if row[start..end].iter().any(|&value| accept(value)) {
+            matched[line] = true;
+        }
+        start = end;
     }
 }
 
@@ -362,6 +374,9 @@ struct Config {
     count: bool,
     utf8: bool,
     prefix: bool,
+    json: bool,
+    quiet: bool,
+    terminator: Terminator,
 }
 
 /// One prepared query needle.
@@ -387,6 +402,13 @@ fn search_lines<'a>(
     let lines: Vec<&[u8]> = LineIter::new(data, Newlines::from_utf8(cfg.utf8)).collect();
     let mut matched = vec![false; lines.len()];
 
+    // Reused across queries: every one of these is sized by the line count, and
+    // reallocating them per query is pure churn.
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut haystacks: Vec<&[u8]> = Vec::new();
+    let mut token_runs: Vec<(usize, usize)> = Vec::new();
+    let mut tokens: Vec<&[u8]> = Vec::new();
+
     for q in queries {
         let needle = q.bytes.as_slice();
         let len = needle.len();
@@ -402,37 +424,31 @@ fn search_lines<'a>(
             }
         }
 
-        // Candidate lines still needing the fuzzy kernel.
-        let candidates: Vec<usize> = (0..lines.len()).filter(|&i| !matched[i]).collect();
+        select_candidates(&lines, &matched, &mut candidates);
         if candidates.is_empty() {
             continue;
         }
 
         // One query row (the needle) against many candidate columns; `compute`
         // returns a 1×N matrix, so `.row(0)` is the per-candidate score/distance.
-        let query = vec![needle];
+        let query = [needle];
 
         if cfg.word {
             // Gather every token of every candidate, remembering its line. UTF-8
             // mode tokenizes on Unicode alphanumerics; `--utf8` promises
             // well-formed input, so malformed lines only match via exact search.
-            let mut token_line = Vec::new();
-            let mut tokens: Vec<&[u8]> = Vec::new();
-            for &i in &candidates {
+            token_runs.clear();
+            tokens.clear();
+            for &index in &candidates {
                 if cfg.utf8 {
-                    let Ok(text) = std::str::from_utf8(lines[i]) else {
+                    let Ok(text) = std::str::from_utf8(lines[index]) else {
                         continue;
                     };
-                    for tok in tokenize_utf8(text) {
-                        token_line.push(i);
-                        tokens.push(tok.as_bytes());
-                    }
+                    tokens.extend(tokenize_utf8(text).map(|token| token.as_bytes()));
                 } else {
-                    for tok in tokenize(lines[i]) {
-                        token_line.push(i);
-                        tokens.push(tok);
-                    }
+                    tokens.extend(tokenize(lines[index]));
                 }
+                token_runs.push((index, tokens.len()));
             }
             if tokens.is_empty() {
                 continue;
@@ -440,9 +456,9 @@ fn search_lines<'a>(
             if !cfg.cost_is_edit {
                 let scores = eng
                     .sw
-                    .compute(&eng.device, &query, &tokens)
+                    .compute(&eng.device, &query[..], &tokens)
                     .expect("smith-waterman compute failed");
-                mark_lines(scores.row(0), &token_line, &mut matched, |s| s >= thr);
+                mark_lines_by_run(scores.row(0), &token_runs, &mut matched, |score| score >= thr);
             } else if cfg.utf8 {
                 // Code-point-level distances; both sides validated above.
                 let needle = std::str::from_utf8(needle).expect("patterns are UTF-8 arguments");
@@ -454,24 +470,25 @@ fn search_lines<'a>(
                     .lev_utf8
                     .compute(&eng.device, &[needle][..], &tokens[..])
                     .expect("utf8 levenshtein compute failed");
-                mark_lines(dists.row(0), &token_line, &mut matched, |d| {
-                    d <= cfg.max_distance
+                mark_lines_by_run(dists.row(0), &token_runs, &mut matched, |distance| {
+                    distance <= cfg.max_distance
                 });
             } else {
                 let dists = eng
                     .lev
-                    .compute(&eng.device, &query, &tokens)
+                    .compute(&eng.device, &query[..], &tokens)
                     .expect("levenshtein compute failed");
-                mark_lines(dists.row(0), &token_line, &mut matched, |d| {
-                    d <= cfg.max_distance
+                mark_lines_by_run(dists.row(0), &token_runs, &mut matched, |distance| {
+                    distance <= cfg.max_distance
                 });
             }
         } else {
             // Substring: best local alignment of the needle within each line.
-            let haystacks: Vec<&[u8]> = candidates.iter().map(|&i| lines[i]).collect();
+            haystacks.clear();
+            haystacks.extend(candidates.iter().map(|&index| lines[index]));
             let scores = eng
                 .sw
-                .compute(&eng.device, &query, &haystacks)
+                .compute(&eng.device, &query[..], &haystacks)
                 .expect("smith-waterman compute failed");
             mark_lines(scores.row(0), &candidates, &mut matched, |s| s >= thr);
         }
@@ -489,11 +506,10 @@ fn search_lines<'a>(
 #[command(name = "sz-fuzzy-find")]
 #[command(version, about = "SIMD/GPU-accelerated fuzzy substring search", long_about = None)]
 struct Args {
-    /// Substring to search for (approximately)
-    pattern: String,
+    /// Substring to search for (approximately); omit when using -e
+    pattern: Option<String>,
 
     /// Input files (use '-' or omit for stdin)
-    #[arg(default_value = "-")]
     inputs: Vec<String>,
 
     /// Additional query; a line matches if ANY query matches (repeatable)
@@ -547,16 +563,26 @@ struct Args {
     /// Enable UTF-8 mode: Unicode newlines, and code-point edit distances in -w mode
     #[arg(long)]
     utf8: bool,
+
+    /// Emit JSON Lines in the ripgrep-compatible schema
+    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
+    json: bool,
+
+    /// NUL-terminate each output record instead of newline
+    #[arg(short = '0', long, help_heading = "Output Formats")]
+    null: bool,
+
+    /// Suppress all output; exit 0 on any match, 1 on none
+    #[arg(short = 'q', long, conflicts_with_all = ["count", "json", "null", "line_numbers"], help_heading = "Output Formats")]
+    quiet: bool,
 }
 
 fn build_device(args: &Args) -> Result<DeviceScope, String> {
     let result = match args.device.as_str() {
         "gpu" => DeviceScope::gpu_device(args.gpu_id),
         "cpu" => DeviceScope::cpu_cores(args.threads.unwrap_or(0)),
-        _ => match args.threads {
-            Some(t) => DeviceScope::cpu_cores(t),
-            None => DeviceScope::default(),
-        },
+        // `DeviceScope::default()` yields a single core; 0 means every core.
+        _ => DeviceScope::cpu_cores(args.threads.unwrap_or(0)),
     };
     result.map_err(|e| format!("{:?}", e))
 }
@@ -627,8 +653,22 @@ fn main() {
         lev_utf8,
     };
 
-    let mut patterns = vec![args.pattern.clone()];
+    // With -e supplying the queries, a positional is an input path, as in grep.
+    let mut inputs = args.inputs.clone();
+    let mut patterns: Vec<String> = Vec::new();
+    match (&args.pattern, args.extra.is_empty()) {
+        (Some(pattern), true) => patterns.push(pattern.clone()),
+        (Some(path), false) => inputs.insert(0, path.clone()),
+        (None, true) => {
+            eprintln!("Error: no query given; pass a pattern or -e PATTERN");
+            process::exit(ExitCode::Error as i32);
+        }
+        (None, false) => {}
+    }
     patterns.extend(args.extra.iter().cloned());
+    if inputs.is_empty() {
+        inputs.push("-".to_string());
+    }
     let queries: Vec<Query> = patterns
         .into_iter()
         .map(|p| Query {
@@ -645,7 +685,10 @@ fn main() {
         line_numbers: args.line_numbers,
         count: args.count,
         utf8: args.utf8 || args.ignore_case,
-        prefix: args.inputs.len() > 1,
+        prefix: inputs.len() > 1,
+        json: args.json,
+        quiet: args.quiet,
+        terminator: Terminator::from_null(args.null),
     };
 
     let mut output = get_output(None).unwrap_or_else(|e| {
@@ -654,7 +697,7 @@ fn main() {
     });
 
     let mut total = 0usize;
-    for name in &args.inputs {
+    for name in &inputs {
         let input = match get_input(Some(name.as_str())) {
             Ok(input) => input,
             Err(e) => {
@@ -681,7 +724,7 @@ fn main() {
                 process::exit(2);
             }
         }
-        if cfg.count {
+        if cfg.count && !cfg.quiet {
             let _ = if cfg.prefix {
                 writeln!(output, "{}:{}", name, count)
             } else {
@@ -706,6 +749,18 @@ fn write_match(
     line_no: usize,
     line: &[u8],
 ) -> io::Result<()> {
+    if cfg.quiet {
+        return Ok(());
+    }
+    if cfg.json {
+        // Ripgrep's schema, minus `submatches`: fuzzy matching has no exact span.
+        output.write_all(br#"{"type":"match","data":{"path":"#)?;
+        json_text_field_to(output, name.as_bytes())?;
+        output.write_all(br#","lines":"#)?;
+        json_text_field_to(output, line)?;
+        write!(output, r#","line_number":{},"submatches":[]}}}}"#, line_no)?;
+        return output.write_all(b"\n");
+    }
     if cfg.prefix {
         write!(output, "{}:", name)?;
     }
@@ -713,7 +768,7 @@ fn write_match(
         write!(output, "{}:", line_no)?;
     }
     output.write_all(line)?;
-    output.write_all(b"\n")
+    output.write_all(&[cfg.terminator.as_byte()])
 }
 
 // endregion: CLI
@@ -753,16 +808,17 @@ mod tests {
 
     #[test]
     fn tokenizes_on_punctuation() {
-        let toks = tokenize(b"the colour, red!");
-        assert_eq!(toks, vec![b"the".as_slice(), b"colour", b"red"]);
+        let tokens: Vec<&[u8]> = tokenize(b"the colour, red!").collect();
+        assert_eq!(tokens, vec![b"the".as_slice(), b"colour", b"red"]);
     }
 
     #[test]
     fn tokenizes_unicode_words_whole() {
-        let toks: Vec<&str> = tokenize_utf8("café, naïve! 42").collect();
-        assert_eq!(toks, vec!["café", "naïve", "42"]);
+        let tokens: Vec<&str> = tokenize_utf8("café, naïve! 42").collect();
+        assert_eq!(tokens, vec!["café", "naïve", "42"]);
         // The byte tokenizer stops at the first non-ASCII byte instead.
-        assert_eq!(tokenize("café".as_bytes()), vec![b"caf".as_slice()]);
+        let ascii: Vec<&[u8]> = tokenize("café".as_bytes()).collect();
+        assert_eq!(ascii, vec![b"caf".as_slice()]);
     }
 
     #[test]

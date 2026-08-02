@@ -19,10 +19,10 @@ clap = { version = "4.5", features = ["derive"] } # CLI argument parsing
 glob = "0.3" # Glob pattern matching
 ignore = "0.4" # .gitignore support
 memmap2 = "0.9" # Memory-mapped file I/O
+stringtape = "2.4" # Compact (offset, length) storage for line collections
 stringzilla = { version = "5", features = [
     "cpus",
 ] } # SIMD string ops + szs multicore kernels
-walkdir = "2.4" # Directory traversal
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -1271,7 +1271,7 @@ fn main() {
 
     let stats = Stats::default();
     let max_reached = AtomicBool::new(false);
-    let mut output = io::stdout().lock();
+    let mut output = stdout_writer();
     let mut any_match = false;
     let mut file_counts: Vec<(String, usize)> = Vec::new();
 
@@ -1389,9 +1389,10 @@ fn main() {
         print_stats(&stats, start_time.elapsed());
     }
 
-    // Exit with status 1 if no matches found (like grep)
+    // Exit with status 1 if no matches found (like grep). Exiting skips the
+    // buffer's `Drop`, so the flush has to happen first.
     if !any_match && !args.quiet {
-        process::exit(ExitCode::NoResult as i32);
+        ExitCode::NoResult.exit(&mut output);
     }
 }
 

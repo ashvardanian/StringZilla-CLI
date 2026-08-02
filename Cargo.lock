@@ -432,9 +432,9 @@ dependencies = [
  "glob",
  "ignore",
  "memmap2",
+ "stringtape",
  "stringzilla",
  "tempfile",
- "walkdir",
 ]
 
 [[package]]

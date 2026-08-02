@@ -69,31 +69,31 @@ The first is comparably fast, the second one is __orders of magnitude slower__.
 Here's what Unicode compliance on a mixed dataset means for German queries, where the Eszett (ß) character is commonly used, and folds to "ss".
 
 ```bash
-$ rg -c -i "strasse" xlsum.csv # 183 results
-$ sz-find -c -i "strasse" xlsum.csv # 205 results, 22 more
+$ rg      -c -i "strasse" xlsum.csv # ❌ 183 results
+$ sz-find -c -i "strasse" xlsum.csv # ✅ 205 results, +22 more
 
-$ rg -c -i "gross" xlsum.csv # 5412 results
-$ sz-find -c -i "gross" xlsum.csv # 5418 results, +6 more
+$ rg      -c -i "gross" xlsum.csv   # ❌ 5412 results
+$ sz-find -c -i "gross" xlsum.csv   # ✅ 5418 results, +6 more
 
-$ rg -c -i "weiss" xlsum.csv # 350 results
-$ sz-find -c -i "weiss" xlsum.csv # 352 results, +2 more
+$ rg      -c -i "weiss" xlsum.csv   # ❌ 350 results
+$ sz-find -c -i "weiss" xlsum.csv   # ✅ 352 results, +2 more
 ```
 
 Ligatures from PDFs and word processors (ﬁ, ﬂ, ﬀ, ﬃ, ﬄ) are also folded correctly:
 
 ```bash
-$ rg -c -i "fi" xlsum.csv # 464678 results
-$ sz-find -c -i "fi" xlsum.csv # 464699 results, +21 more
+$ rg      -c -i "fi" xlsum.csv  # ❌ 464678 results
+$ sz-find -c -i "fi" xlsum.csv  # ✅ 464699 results, +21 more
 
-$ rg -c -i "ffi" xlsum.csv # 162155 results
-$ sz-find -c -i "ffi" xlsum.csv # 162157 results, +2 more
+$ rg      -c -i "ffi" xlsum.csv # ❌ 162155 results
+$ sz-find -c -i "ffi" xlsum.csv # ✅ 162157 results, +2 more
 ```
 
 Turkish dotted/dotless I (İ/I/i/ı) folding is also a common pitfall:
 
 ```bash
-$ rg -c -i "işi" xlsum.csv # 23957 results
-$ sz-find -c -i "işi" xlsum.csv # 25065 results, +1108 more
+$ rg      -c -i "işi" xlsum.csv # ❌ 23957 results
+$ sz-find -c -i "işi" xlsum.csv # ✅ 25065 results, +1108 more
 ```
 
 The difference becomes significant when searching legal documents, German/Swiss news, Turkish text, PDF-extracted content, or any content with typographic ligatures.
@@ -342,9 +342,9 @@ $ sz-segment --split-whitespaces xlsum.csv | sz-sort -u > /dev/null
 
 | Operation                     | GNU `sort --parallel=1` |           `sz-sort` |
 | ----------------------------- | ----------------------: | ------------------: |
-| Sort                          |         9.45 s, 1509 MB | __5.44 s, 1248 MB__ |
-| Case-insensitive, `-f` / `-i` |        13.38 s, 1509 MB | __8.95 s, 1248 MB__ |
-| Deduplicating, `-u`           |         9.26 s, 1509 MB | __4.99 s, 1248 MB__ |
+| Sort                          |         9.51 s, 1509 MB | __5.35 s, 1248 MB__ |
+| Case-insensitive, `-f` / `-i` |        13.66 s, 1509 MB | __9.12 s, 1248 MB__ |
+| Deduplicating, `-u`           |         9.59 s, 1509 MB | __4.90 s, 1248 MB__ |
 
 ## `sz-dedup`: Deduplicate Lines
 
@@ -381,9 +381,12 @@ $ sz-segment --split-whitespaces xlsum.csv | sz-dedup > /dev/null
 
 ## `sz-fuzzy-find`: Fuzzy Substring Search
 
-`sz-find` matches literally; `sz-fuzzy-find` adds typo tolerance, built on StringZilla's `szs` similarity kernels (CPU multicore by default, GPU optional).
-By default a line matches when some substring of it aligns to the query within `-k` edits, found via Smith-Waterman local alignment.
-The exact substring is checked first via StringZilla's `find`, so only lines without an exact hit reach the kernel.
+`sz-find` matches literally; `sz-fuzzy-find` adds typo tolerance, built on StringZilla's `szs` similarity kernels, multicore by default and GPU-capable.
+Exact hits are claimed first with StringZilla's `find`, so only the remainder reaches the kernel.
+
+Two modes, and they mean different things by `-k`.
+With `-w` the query is compared against each token by Levenshtein, so `-k` is a true edit budget.
+Without it the query is aligned against the whole line by Smith-Waterman and `-k` becomes a score floor — the default cost matrix folds case, so a line differing only in case passes, while a single deletion in the middle of a long line can fall below the floor.
 
 ```bash
 # Find "color" allowing up to 1 edit — also matches "colour", "colur", "kolor"
@@ -398,6 +401,17 @@ $ sz-fuzzy-find -w -k 1 colour file.txt
 # Count matching lines only
 $ sz-fuzzy-find -c -k 1 needle file.txt
 ```
+
+Word mode carries the edit-distance semantics, and agrees with `agrep` line for line.
+Over 50 MB of multilingual news, one query, 225 matching lines:
+
+| Tool                    |       Time | Semantics                                        |
+| ----------------------- | ---------: | ------------------------------------------------ |
+| `tre-agrep -E 1`        |     2.90 s | edit distance                                    |
+| `fzf --filter`          |     0.43 s | subsequence — 3,508 lines, not the same question |
+| `sz-fuzzy-find -w -k 1` | __0.21 s__ | edit distance                                    |
+
+`fzf` is there for scale rather than parity: it matches characters in order with gaps, so it finds `W-a-s-h-i-n-g-t-o-n` and misses `Washigton`.
 
 ### Scoring models (`--cost`)
 
@@ -424,14 +438,12 @@ $ sz-fuzzy-find --device cpu --threads 8 -k 1 needle big.txt   # CPU, 8 threads
 $ sz-fuzzy-find --device gpu -k 1 needle big.txt               # GPU (see build note)
 ```
 
-CPU multicore is the default. The GPU path requires a CUDA build:
+Every core is used unless `--threads` says otherwise. The GPU path requires a CUDA build:
 
 ```bash
 # On systems with gcc > 14 + CUDA 12.x, point nvcc at a supported host compiler:
 $ CUDAHOSTCXX=g++-14 cargo install --git https://github.com/ashvardanian/StringZilla-CLI --features cuda
 ```
-
-With `-k 0`, `sz-fuzzy-find` degrades to exact substring search, matching `sz-find`.
 
 ## `sz-segment`: Unicode Text Segmentation
 

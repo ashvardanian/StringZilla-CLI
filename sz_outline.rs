@@ -31,6 +31,7 @@ use clap::Parser;
 use stringzilla::sz::{find, StringZillableUnary};
 
 mod shared;
+use shared::{exit_with_error, json_text_field_to, stdout_writer};
 
 // region: Data Structures
 
@@ -132,6 +133,10 @@ struct Args {
     /// Enable UTF-8 validation
     #[arg(long)]
     utf8: bool,
+
+    /// Emit JSON Lines, flat records linked by parent_line
+    #[arg(long, help_heading = "Output Formats")]
+    json: bool,
 }
 
 // endregion: CLI Interface
@@ -1028,6 +1033,63 @@ fn trim_trailing_hashes(data: &[u8]) -> &[u8] {
 
 // region: Output Formatting
 
+/// The record kind for one element, matching the human renderer's vocabulary.
+fn element_kind_name(kind: &ElementKind<'_>) -> &'static str {
+    match kind {
+        ElementKind::Heading { .. } => "heading",
+        ElementKind::CodeBlock { .. } => "code_block",
+        ElementKind::Blockquote => "blockquote",
+        ElementKind::Table => "table",
+        ElementKind::Image { .. } => "image",
+        ElementKind::Paragraph => "paragraph",
+        ElementKind::Include { .. } => "include",
+        ElementKind::FunctionDeclaration => "function_declaration",
+        ElementKind::FunctionDefinition => "function_definition",
+    }
+}
+
+/// Write one element as a flat JSON Lines record. Children are emitted as their own
+/// records carrying `parent_line`, rather than nested, which keeps `jq` filters simple.
+fn write_element_json(
+    out: &mut dyn Write,
+    elem: &OutlineElement<'_>,
+    parent_line: Option<usize>,
+) -> io::Result<()> {
+    out.write_all(br#"{"type":"element","data":{"kind":""#)?;
+    out.write_all(element_kind_name(&elem.kind).as_bytes())?;
+    out.write_all(br#"","name":"#)?;
+    json_text_field_to(out, &elem.name)?;
+
+    match &elem.kind {
+        ElementKind::Heading { level } => write!(out, r#","level":{}"#, level)?,
+        ElementKind::CodeBlock { language } => match language {
+            Some(language) => {
+                out.write_all(br#","language":"#)?;
+                json_text_field_to(out, language)?;
+            }
+            None => out.write_all(br#","language":null"#)?,
+        },
+        ElementKind::Include { is_system } => write!(out, r#","is_system":{}"#, is_system)?,
+        _ => {}
+    }
+
+    write!(
+        out,
+        r#","line_number":{},"line_count":{},"byte_offset":{},"byte_length":{}"#,
+        elem.line_number, elem.line_count, elem.byte_offset, elem.byte_length
+    )?;
+    match parent_line {
+        Some(line) => write!(out, r#","parent_line":{}"#, line)?,
+        None => out.write_all(br#","parent_line":null"#)?,
+    }
+    out.write_all(b"}}\n")?;
+
+    for child in &elem.children {
+        write_element_json(out, child, Some(elem.line_number))?;
+    }
+    Ok(())
+}
+
 fn write_element(
     out: &mut dyn Write,
     elem: &OutlineElement<'_>,
@@ -1251,16 +1313,19 @@ fn main() {
     };
 
     // Output
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
+    let mut handle = stdout_writer();
 
     for elem in &elements {
-        if let Err(e) = write_element(&mut handle, elem, verbosity, file_type) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
+        let written = if args.json {
+            write_element_json(&mut handle, elem, None)
+        } else {
+            write_element(&mut handle, elem, verbosity, file_type)
+        };
+        if let Err(error) = written {
+            if error.kind() == io::ErrorKind::BrokenPipe {
                 break;
             }
-            eprintln!("Error writing output: {}", e);
-            process::exit(1);
+            exit_with_error(&mut handle, &error, "Error writing output");
         }
     }
 }
