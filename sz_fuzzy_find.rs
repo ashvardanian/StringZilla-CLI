@@ -285,7 +285,7 @@ fn build_scheme(cost: &Cost, custom_path: Option<&str>) -> io::Result<Scheme> {
 
 // endregion: Scoring Matrices
 
-// region: Matching
+// region: Tokenizing
 
 /// Tokenize a line into maximal runs of ASCII alphanumerics (word matching).
 fn tokenize(line: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -299,30 +299,106 @@ fn tokenize_utf8(text: &str) -> impl Iterator<Item = &str> {
         .filter(|t| !t.is_empty())
 }
 
+// endregion: Tokenizing
+
+// region: Queries
+
+/// One prepared query needle, carrying the state every filter needs so that no
+/// filter has to re-derive anything per line or per token.
+struct Query {
+    bytes: Vec<u8>,
+    /// Which ASCII letters occur, folded; bit 0 is `a`.
+    letters: u32,
+    /// Code points, which is what the UTF-8 kernel counts edits in.
+    chars: usize,
+}
+
+impl Query {
+    fn new(pattern: String) -> Self {
+        let chars = pattern.chars().count();
+        let bytes = pattern.into_bytes();
+        let letters = letter_set(&bytes);
+        Self {
+            bytes,
+            letters,
+            chars,
+        }
+    }
+
+    /// The length the active kernel measures edits against.
+    fn length(&self, utf8: bool) -> usize {
+        if utf8 {
+            self.chars
+        } else {
+            self.bytes.len()
+        }
+    }
+}
+
+/// Bitmap of the ASCII letters present, case-folded. Non-letters are ignored, so
+/// the set is a lower bound on what a match must share.
+fn letter_set(text: &[u8]) -> u32 {
+    let mut set = 0u32;
+    for &byte in text {
+        if byte.is_ascii_alphabetic() {
+            set |= 1 << (byte.to_ascii_lowercase() - b'a');
+        }
+    }
+    set
+}
+
+// endregion: Queries
+
+// region: Filtering
+
+/// Whether a token of `length` can be within `max_distance` edits of the query.
+///
+/// Levenshtein moves one character at a time, so the lengths cannot differ by more
+/// than the budget. Sound: never rejects a true match.
+#[inline]
+fn accepts_length(query: &Query, length: usize, max_distance: usize, utf8: bool) -> bool {
+    query.length(utf8).abs_diff(length) <= max_distance
+}
+
+/// Whether a token sharing `letters` can be within `max_distance` edits.
+///
+/// One substitution can drop a letter from one side and add one to the other, so a
+/// symmetric difference of `d` letters needs at least `d / 2` edits. Sound, and two
+/// instructions once the query's set is precomputed.
+#[inline]
+fn accepts_letters(query: &Query, letters: u32, max_distance: usize) -> bool {
+    (query.letters ^ letters).count_ones() as usize <= 2 * max_distance
+}
+
 /// Lines still needing the fuzzy kernel, having survived cheap rejection.
 ///
-/// Only exact matches are rejected today, so every remaining line is a candidate
-/// and the kernel sees all of them. A partition filter belongs here: splitting the
-/// needle into `k + 1` pieces, a line holding none of them cannot be within `k`
-/// substitutions, insertions, or deletions.
+/// Only exact matches are rejected today, so every remaining line is a candidate.
+/// The partition filter belongs here: splitting the needle into `k + 1` pieces, a
+/// line holding none of them cannot be within `k` edits, because each edit can
+/// damage at most one piece. That bound covers substitutions, insertions, and
+/// deletions, but not transpositions, which touch two adjacent positions and so
+/// need `2k + 1` pieces.
 fn select_candidates(lines: &[&[u8]], matched: &[bool], candidates: &mut Vec<usize>) {
     candidates.clear();
     candidates.extend((0..lines.len()).filter(|&index| !matched[index]));
 }
 
-/// Flag `matched[owners[index]]` for every kernel result `row[index]` that `accept`s.
-fn mark_lines<T: Copy>(
-    row: &[T],
-    owners: &[usize],
-    matched: &mut [bool],
-    accept: impl Fn(T) -> bool,
-) {
-    for (index, &value) in row.iter().enumerate() {
-        if accept(value) {
-            matched[owners[index]] = true;
-        }
-    }
+/// Both cheap bounds, in increasing cost order. Byte length stands in for code
+/// points outside UTF-8 mode, where the kernel counts bytes anyway.
+#[inline]
+fn survives(query: &Query, token: &[u8], max_distance: usize, utf8: bool) -> bool {
+    let length = if utf8 {
+        sz::count_utf8(token)
+    } else {
+        token.len()
+    };
+    accepts_length(query, length, max_distance, utf8)
+        && accepts_letters(query, letter_set(token), max_distance)
 }
+
+// endregion: Filtering
+
+// region: Matching
 
 /// Flag a line when any of its tokens is accepted.
 ///
@@ -364,24 +440,25 @@ fn score_threshold(len: usize, min_similarity: Option<f64>, k: usize) -> isize {
 }
 
 /// Configuration resolved once from CLI args.
-struct Config {
+struct MatchConfig {
     ignore_case: bool,
     word: bool,
     cost_is_edit: bool,
     max_distance: usize,
     min_similarity: Option<f64>,
+    utf8: bool,
+}
+
+/// Everything the writer needs, decided once from `Args`.
+#[derive(Clone, Copy)]
+struct OutputConfig {
     line_numbers: bool,
     count: bool,
-    utf8: bool,
+    /// Prefix each record with its file name, as grep does for multiple inputs.
     prefix: bool,
     json: bool,
     quiet: bool,
     terminator: Terminator,
-}
-
-/// One prepared query needle.
-struct Query {
-    bytes: Vec<u8>,
 }
 
 /// The kernels, built once for the whole run.
@@ -397,7 +474,7 @@ fn search_lines<'a>(
     data: &'a [u8],
     queries: &[Query],
     eng: &Engines,
-    cfg: &Config,
+    cfg: &MatchConfig,
 ) -> (Vec<&'a [u8]>, Vec<bool>) {
     let lines: Vec<&[u8]> = LineIter::new(data, Newlines::from_utf8(cfg.utf8)).collect();
     let mut matched = vec![false; lines.len()];
@@ -437,6 +514,10 @@ fn search_lines<'a>(
             // Gather every token of every candidate, remembering its line. UTF-8
             // mode tokenizes on Unicode alphanumerics; `--utf8` promises
             // well-formed input, so malformed lines only match via exact search.
+            // The length and letter bounds are Levenshtein properties. A score floor
+            // with class costs admits matches they would reject, so they apply only
+            // in edit mode; elsewhere every token reaches the kernel as before.
+            let filtering = cfg.cost_is_edit;
             token_runs.clear();
             tokens.clear();
             for &index in &candidates {
@@ -444,9 +525,17 @@ fn search_lines<'a>(
                     let Ok(text) = std::str::from_utf8(lines[index]) else {
                         continue;
                     };
-                    tokens.extend(tokenize_utf8(text).map(|token| token.as_bytes()));
+                    tokens.extend(
+                        tokenize_utf8(text)
+                            .map(|token| token.as_bytes())
+                            .filter(|token| {
+                                !filtering || survives(q, token, cfg.max_distance, true)
+                            }),
+                    );
                 } else {
-                    tokens.extend(tokenize(lines[index]));
+                    tokens.extend(tokenize(lines[index]).filter(|token| {
+                        !filtering || survives(q, token, cfg.max_distance, false)
+                    }));
                 }
                 token_runs.push((index, tokens.len()));
             }
@@ -486,11 +575,19 @@ fn search_lines<'a>(
             // Substring: best local alignment of the needle within each line.
             haystacks.clear();
             haystacks.extend(candidates.iter().map(|&index| lines[index]));
+            // One line per result, so every run holds a single entry.
+            token_runs.clear();
+            token_runs.extend(
+                candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &line)| (line, position + 1)),
+            );
             let scores = eng
                 .sw
                 .compute(&eng.device, &query[..], &haystacks)
                 .expect("smith-waterman compute failed");
-            mark_lines(scores.row(0), &candidates, &mut matched, |s| s >= thr);
+            mark_lines_by_run(scores.row(0), &token_runs, &mut matched, |score| score >= thr);
         }
     }
 
@@ -669,22 +766,19 @@ fn main() {
     if inputs.is_empty() {
         inputs.push("-".to_string());
     }
-    let queries: Vec<Query> = patterns
-        .into_iter()
-        .map(|p| Query {
-            bytes: p.into_bytes(),
-        })
-        .collect();
+    let queries: Vec<Query> = patterns.into_iter().map(Query::new).collect();
 
-    let cfg = Config {
+    let cfg = MatchConfig {
         ignore_case: args.ignore_case,
         word: args.word,
         cost_is_edit,
         max_distance: args.max_distance,
         min_similarity: args.min_similarity,
+        utf8: args.utf8 || args.ignore_case,
+    };
+    let output_config = OutputConfig {
         line_numbers: args.line_numbers,
         count: args.count,
-        utf8: args.utf8 || args.ignore_case,
         prefix: inputs.len() > 1,
         json: args.json,
         quiet: args.quiet,
@@ -708,24 +802,24 @@ fn main() {
         let (lines, matched) = search_lines(input.as_bytes(), &queries, &engines, &cfg);
 
         let mut count = 0usize;
-        for (i, line) in lines.iter().enumerate() {
-            if !matched[i] {
+        for (index, line) in lines.iter().enumerate() {
+            if !matched[index] {
                 continue;
             }
             count += 1;
-            if cfg.count {
+            if output_config.count {
                 continue;
             }
-            if let Err(e) = write_match(&mut output, &cfg, name, i + 1, line) {
-                if e.kind() == io::ErrorKind::BrokenPipe {
+            if let Err(error) = write_match(&mut output, &output_config, name, index + 1, line) {
+                if error.kind() == io::ErrorKind::BrokenPipe {
                     process::exit(0);
                 }
-                eprintln!("Error writing output: {}", e);
-                process::exit(2);
+                eprintln!("Error writing output: {}", error);
+                process::exit(ExitCode::Error as i32);
             }
         }
-        if cfg.count && !cfg.quiet {
-            let _ = if cfg.prefix {
+        if output_config.count && !output_config.quiet {
+            let _ = if output_config.prefix {
                 writeln!(output, "{}:{}", name, count)
             } else {
                 writeln!(output, "{}", count)
@@ -744,7 +838,7 @@ fn main() {
 
 fn write_match(
     output: &mut dyn Write,
-    cfg: &Config,
+    cfg: &OutputConfig,
     name: &str,
     line_no: usize,
     line: &[u8],

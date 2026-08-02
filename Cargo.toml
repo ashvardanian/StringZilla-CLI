@@ -13,6 +13,7 @@ version = "0.1.0"
 [features]
 cuda = ["stringzilla/cuda"]
 default = []
+fuzzy-find = [] # Pre-production, opt-in: `sz-fuzzy-find` is being reimplemented
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] } # CLI argument parsing 
@@ -72,6 +73,7 @@ path = "sz_sort.rs"
 [[bin]]
 name = "sz-fuzzy-find"
 path = "sz_fuzzy_find.rs"
+required-features = ["fuzzy-find"]
 
 [[bin]]
 name = "sz-segment"
