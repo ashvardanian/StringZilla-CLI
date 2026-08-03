@@ -1,0 +1,97 @@
+name: Pre-Release
+
+on:
+  push:
+    branches: ["main-dev"]
+  pull_request:
+    branches: ["main*"]
+
+# Folds a branch and its open PRs into one group; only PR runs are cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  versioning:
+    name: Update Version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Run TinySemVer
+        uses: ashvardanian/tinysemver@v3
+        with:
+          verbose: "true"
+          version-file: "VERSION"
+          update-version-in: |
+            Cargo.toml:^version = "(\d+\.\d+\.\d+)"
+            Cargo.lock:name = "stringzilla-cli"\nversion = "(\d+\.\d+\.\d+)"
+            README.md:--tag v(\d+\.\d+\.\d+)
+          dry-run: "true"
+
+  lint_workflows:
+    name: Lint Workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      # Pinned: unpinned, an upstream lint rule reddens an untouched branch.
+      - name: Run actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          bash <(curl -sSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "${ACTIONLINT_VERSION}"
+          ./actionlint -color
+
+  lint_rust:
+    name: Lint Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (outline)
+        run: cargo clippy --all-targets --features outline -- -D warnings
+      # Mid-rewrite; only has to compile.
+      - name: Clippy (fuzzy-find, warnings allowed)
+        run: cargo clippy --all-targets --features fuzzy-find
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --release
+      # Feature-gated binaries carry unit tests the default run never builds.
+      - name: Test the opt-in tools
+        run: |
+          cargo test --release --features outline
+          cargo test --release --features fuzzy-find

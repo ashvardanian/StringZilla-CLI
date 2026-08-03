@@ -7,8 +7,9 @@ This utility is written in Rust, leveraging StringZilla for both pipe and file-b
 Install it straight from the GitHub repository:
 
 ```bash
-cargo install --git https://github.com/ashvardanian/StringZilla-CLI # install from GitHub
-cargo install --path . --force                                      # or install from local clone
+cargo install --git https://github.com/ashvardanian/StringZilla-CLI --tag v0.1.0 # pinned release
+cargo install --git https://github.com/ashvardanian/StringZilla-CLI              # or the tip of main
+cargo install --path . --force                                                   # or a local clone
 ```
 
 It provides the following subcommands:
