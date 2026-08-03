@@ -29,7 +29,6 @@ use std::path::Path;
 use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz::{find, StringZillableUnary};
 
-mod shared;
 use shared::*;
 
 // region: Data Structures
@@ -1121,16 +1120,17 @@ fn write_c_element(
 
 // region: Main
 
-/// Report a constraint clap cannot express, rendered as clap renders its own.
-fn reject(message: &str) -> clap::Error {
-    Args::command().error(clap::error::ErrorKind::InvalidValue, message)
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
 }
 
 /// Every constraint that depends on an argument's *value*, which clap cannot declare.
 fn validate(args: &Args) -> Result<(), clap::Error> {
     let path = args.input.as_deref().unwrap_or("-");
     if args.language.or_else(|| detect_language(path)).is_none() {
-        return Err(reject(&format!(
+        return Err(reject(format!(
             "cannot outline '{}', use --language (md, c, h)",
             path
         )));
@@ -1138,21 +1138,15 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     Ok(())
 }
 
-fn main() {
-    let mut stdout = io::stdout();
-    match run() {
-        Ok(code) => code.exit(&mut stdout),
-        Err(error) => exit_on_write_error(&mut stdout, &error, "sz-outline"),
-    }
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
+    let mut output = stdout_writer();
+    report("sz-outline", run(&args, &mut output))
 }
 
-fn run() -> io::Result<ExitCode> {
-    let args = Args::parse();
-    if let Err(error) = validate(&args) {
-        error.exit();
-    }
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
 
-    let mut handle = stdout_writer();
     let path = args.input.as_deref().unwrap_or("-");
     let language = args
         .language
@@ -1160,8 +1154,7 @@ fn run() -> io::Result<ExitCode> {
         .expect("validated");
 
     // The mmap is borrowed, not copied.
-    let input = get_input(Some(path))
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {}", path, error)))?;
+    let input = get_input(Some(path)).at(path)?;
     let newlines = Newlines::from_utf8(args.utf8);
     let elements = match language {
         Language::Md => parse_markdown(input.as_bytes(), newlines),
@@ -1174,23 +1167,21 @@ fn run() -> io::Result<ExitCode> {
         .iter()
         .filter(|element| selects(&element.kind, args.detail));
     if args.quiet {
-        return Ok(ExitCode::from_found(outlined.count() > 0));
+        return Ok(Status::from_found(outlined.count() > 0));
     }
 
     let column = detail_column(&elements, args.detail);
     let mut emitted = false;
     for element in outlined {
         emitted = true;
-        let written = match args.format {
-            Format::Json => write_element_json(&mut handle, element, None, args.detail),
-            Format::Text => write_element(&mut handle, element, args.detail, language, column),
-        };
-        if let Err(error) = written {
-            exit_on_write_error(&mut handle, &error, "sz-outline");
+        match args.format {
+            Format::Json => write_element_json(output, element, None, args.detail),
+            Format::Text => write_element(output, element, args.detail, language, column),
         }
+        .at("-")?;
     }
-    handle.flush()?;
-    Ok(ExitCode::from_found(emitted))
+    output.flush().at("-")?;
+    Ok(Status::from_found(emitted))
 }
 
 // endregion: Main

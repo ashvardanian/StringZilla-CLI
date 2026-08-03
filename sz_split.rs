@@ -19,11 +19,11 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 
 use clap::{CommandFactory, Parser};
 use stringzilla::sz;
 
-mod shared;
 use shared::*;
 
 /// Split files into smaller chunks
@@ -357,25 +357,12 @@ struct SplitState {
 
 /// The error a chunk index outgrowing its suffix width raises, naming the flag to raise
 /// and the chunk that has nowhere to go.
-fn suffix_exhausted(chunk_number: usize, suffix_length: usize) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!(
-            "Output file suffixes exhausted: chunk {} does not fit a {}-character --suffix-length",
-            chunk_number, suffix_length
-        ),
-    )
-}
-
-/// Create one chunk file, naming it in any failure the caller reports.
-fn create_chunk(filename: &str) -> io::Result<BufWriter<File>> {
-    let file = File::create(filename).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("Failed to create output file '{}': {}", filename, error),
-        )
-    })?;
-    Ok(BufWriter::new(file))
+fn suffix_exhausted(chunk_number: usize, suffix_length: usize) -> Failure {
+    reject(format!(
+        "Output file suffixes exhausted: chunk {} does not fit a {}-character --suffix-length",
+        chunk_number, suffix_length
+    ))
+    .into()
 }
 
 /// Flush the open chunk and record it in the manifest, readying `state` for the next one.
@@ -384,11 +371,11 @@ fn close_chunk(
     state: &mut SplitState,
     config: &SplitConfig,
     manifest: &mut dyn Write,
-) -> io::Result<()> {
+) -> Result<(), Failure> {
     let Some(mut chunk) = state.open.take() else {
         return Ok(());
     };
-    chunk.file.flush()?;
+    chunk.file.flush().at(&chunk.name)?;
     // The manifest reports the file as it is on disk, header included.
     write_manifest_entry(
         manifest,
@@ -398,6 +385,7 @@ fn close_chunk(
         chunk.bytes,
         chunk.header_lines,
     )
+    .at("-")
 }
 
 /// The chunk being filled, opening the next one when none is. GNU `split` stops rather
@@ -405,16 +393,16 @@ fn close_chunk(
 fn open_chunk<'a>(
     state: &'a mut SplitState,
     config: &SplitConfig,
-) -> io::Result<&'a mut OpenChunk> {
+) -> Result<&'a mut OpenChunk, Failure> {
     if state.open.is_none() {
         let width = config.suffix_length.get();
         let suffix = generate_suffix(state.file_index, width)
             .ok_or_else(|| suffix_exhausted(state.file_index + 1, width))?;
         let name = format!("{}{}", config.prefix, suffix);
-        let mut file = create_chunk(&name)?;
+        let mut file = BufWriter::new(File::create(&name).at(&name)?);
         // The header is part of the chunk, so it is written and tallied here rather than
         // treated as free: under a byte budget it has to count, or the budget is not one.
-        file.write_all(config.header)?;
+        file.write_all(config.header).at(&name)?;
         state.file_index += 1;
         state.open = Some(OpenChunk {
             name,
@@ -505,8 +493,8 @@ fn span_within_budget(data: &[u8], room: usize, chunk_is_empty: bool, newlines: 
 /// The span goes to the kernel in one call however large it is. Feeding it in fixed pieces
 /// was measurably faster once and is not any more — over the 5 GB corpus, 800 MB chunks
 /// write in the same 0.69 s either way — so the loop that did it is gone.
-fn write_span(chunk: &mut OpenChunk, span: &[u8], lines: usize) -> io::Result<()> {
-    chunk.file.write_all(span)?;
+fn write_span(chunk: &mut OpenChunk, span: &[u8], lines: usize) -> Result<(), Failure> {
+    chunk.file.write_all(span).at(&chunk.name)?;
     chunk.lines += lines;
     chunk.bytes += span.len();
     // An empty span is not data: a pattern chunk closing at offset 0 writes nothing, and
@@ -522,7 +510,7 @@ fn split_by_ranges(
     state: &mut SplitState,
     config: &SplitConfig,
     manifest: &mut dyn Write,
-) -> io::Result<()> {
+) -> Result<(), Failure> {
     let mut rest = data;
     while !rest.is_empty() {
         // The borrow of the open chunk ends with this block, so `close_chunk` can take
@@ -548,14 +536,12 @@ fn split_by_ranges(
 
 /// The error an unmeetable `--chunk-count` raises: every chunk needs a byte of its own, so a
 /// count past the input's size can never be honoured, however the boundaries are placed.
-fn chunk_count_exceeds_input(wanted: NonZeroUsize, total: usize) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!(
-            "--chunk-count {} exceeds the input's {} bytes, which cannot yield that many chunks",
-            wanted, total
-        ),
-    )
+fn chunk_count_exceeds_input(wanted: NonZeroUsize, total: usize) -> Failure {
+    reject(format!(
+        "--chunk-count {} exceeds the input's {} bytes, which cannot yield that many chunks",
+        wanted, total
+    ))
+    .into()
 }
 
 /// Where to cut `total` bytes into `wanted` chunks of near-equal size, snapped forward to
@@ -572,7 +558,7 @@ fn plan_equal_chunks(
     data: &[u8],
     wanted: NonZeroUsize,
     newlines: Newlines,
-) -> io::Result<Vec<usize>> {
+) -> Result<Vec<usize>, Failure> {
     let total = data.len();
     if wanted.get() > total {
         return Err(chunk_count_exceeds_input(wanted, total));
@@ -598,7 +584,7 @@ fn split_at_offsets(
     cuts: &[usize],
     config: &SplitConfig,
     manifest: &mut dyn Write,
-) -> io::Result<usize> {
+) -> Result<usize, Failure> {
     let mut state = SplitState::default();
     let written = write_ranges(data, cuts, &mut state, config, manifest);
     finish(written, &mut state, config, manifest)
@@ -610,7 +596,7 @@ fn write_ranges(
     state: &mut SplitState,
     config: &SplitConfig,
     manifest: &mut dyn Write,
-) -> io::Result<()> {
+) -> Result<(), Failure> {
     let mut start = 0;
     for end in cuts.iter().copied().chain([data.len()]) {
         let span = &data[start.min(data.len())..end.min(data.len())];
@@ -626,11 +612,11 @@ fn write_ranges(
 /// chunk files it wrote. A failed run closes its chunk before its error surfaces, so the
 /// bytes already accepted reach the disk rather than dying in a buffer.
 fn finish(
-    result: io::Result<()>,
+    result: Result<(), Failure>,
     state: &mut SplitState,
     config: &SplitConfig,
     manifest: &mut dyn Write,
-) -> io::Result<usize> {
+) -> Result<usize, Failure> {
     let closed = close_chunk(state, config, manifest);
     result.and(closed).map(|()| state.file_index)
 }
@@ -642,14 +628,12 @@ const MAX_HEADER_BYTES: usize = 8 << 20;
 
 /// The error a header too large for its budget raises. Emitting header-only chunks instead
 /// would fill the disk without ever making progress.
-fn header_exceeds_budget(header: usize, budget: usize) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!(
-            "The {}-byte header does not leave room for data in a {}-byte --chunk-bytes budget",
-            header, budget
-        ),
-    )
+fn header_exceeds_budget(header: usize, budget: usize) -> Failure {
+    reject(format!(
+        "The {}-byte header does not leave room for data in a {}-byte --chunk-bytes budget",
+        header, budget
+    ))
+    .into()
 }
 
 /// The first records of an input, taken off before splitting begins.
@@ -682,12 +666,12 @@ fn take_header_streaming<R: Read>(
     refill: &mut Refill<R>,
     lines: NonZeroUsize,
     newlines: Newlines,
-) -> io::Result<(Vec<u8>, usize)> {
+) -> Result<(Vec<u8>, usize), Failure> {
     loop {
         // A fresh window holds nothing, and an empty buffer looks like a single
         // unterminated line to the line counter, so fill before asking.
         if !refill.at_eof() && refill.filled().len() < refill.capacity() {
-            refill.advance(0)?;
+            refill.advance(0).at("-")?;
         }
         let filled = refill.filled();
         let header = take_header(filled, lines, newlines);
@@ -700,25 +684,27 @@ fn take_header_streaming<R: Read>(
         let consumed = filled.len() - header.rest.len();
         let (bytes, taken) = (header.bytes, header.lines);
         if complete {
-            refill.advance(consumed)?;
+            refill.advance(consumed).at("-")?;
             return Ok((bytes, taken));
         }
         if refill.filled().len() >= MAX_HEADER_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "The first {} lines exceed the {} MiB a streamed --repeat-header may buffer",
-                    lines.get(),
-                    MAX_HEADER_BYTES >> 20
-                ),
-            ));
+            return Err(reject(format!(
+                "The first {} lines exceed the {} MiB a streamed --repeat-header may buffer",
+                lines.get(),
+                MAX_HEADER_BYTES >> 20
+            ))
+            .into());
         }
-        refill.grow()?;
+        refill.grow().at("-")?;
     }
 }
 
 /// Split a whole buffer, closing the chunk left open at the end.
-fn split_buffer(data: &[u8], config: &SplitConfig, manifest: &mut dyn Write) -> io::Result<usize> {
+fn split_buffer(
+    data: &[u8],
+    config: &SplitConfig,
+    manifest: &mut dyn Write,
+) -> Result<usize, Failure> {
     let mut state = SplitState::default();
     let written = split_by_ranges(data, &mut state, config, manifest);
     finish(written, &mut state, config, manifest)
@@ -732,12 +718,19 @@ fn stream_split<R: Read>(
     refill: &mut Refill<R>,
     config: &SplitConfig,
     manifest: &mut dyn Write,
-) -> io::Result<usize> {
+) -> Result<usize, Failure> {
     let mut state = SplitState::default();
-    let written = refill.for_each_window(config.newlines.into(), |window| {
-        split_by_ranges(window, &mut state, config, manifest)
+    // A `Failure` cannot travel through the window loop's `io::Result`, so a window that
+    // fails breaks the loop and hands its error back here.
+    let mut written = Ok(());
+    let read = refill.try_for_each_window(config.newlines.into(), |window| {
+        written = split_by_ranges(window, &mut state, config, manifest);
+        Ok(match written {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(_) => ControlFlow::Break(()),
+        })
     });
-    finish(written, &mut state, config, manifest)
+    finish(read.at("-").and(written), &mut state, config, manifest)
 }
 
 // endregion: Streaming
@@ -770,8 +763,9 @@ fn write_manifest_entry(
     )
 }
 
-/// Report a constraint clap cannot express, rendered as clap renders its own.
-fn reject(message: String) -> clap::Error {
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
     Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
 }
 
@@ -783,8 +777,7 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     // naming rather than a flag that quietly does nothing.
     if args.ignore_case && args.chunk_pattern.is_none() {
         return Err(reject(
-            "--ignore-case folds the --chunk-pattern match, so it needs a --chunk-pattern to fold"
-                .to_string(),
+            "--ignore-case folds the --chunk-pattern match, so it needs a --chunk-pattern to fold",
         ));
     }
     if let Some(wanted) = args.chunk_count {
@@ -805,27 +798,21 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
 
 /// The error a `--repeat-header` swallowing the whole input raises: every line became header,
 /// so there is nothing left to head.
-fn header_exceeds_input(lines: NonZeroUsize) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!(
-            "--repeat-header={} takes the whole input as header, leaving no data to split",
-            lines
-        ),
-    )
+fn header_exceeds_input(lines: NonZeroUsize) -> Failure {
+    reject(format!(
+        "--repeat-header={} takes the whole input as header, leaving no data to split",
+        lines
+    ))
+    .into()
 }
 
 /// Split the input, answering how the process should exit. Every failure returns rather than
 /// exiting, so the open chunk and the manifest are both flushed before the status is set.
-fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
-    let args = Args::parse();
-    if let Err(error) = validate(&args) {
-        error.exit();
-    }
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
 
     let named = args.input.as_deref().unwrap_or("-");
-    let input = get_input_streaming(args.input.as_deref())
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {}", named, error)))?;
+    let input = get_input_streaming(args.input.as_deref()).at(named)?;
 
     // The delimiter outlives the config that borrows it.
     let pattern = args.chunk_pattern.clone().unwrap_or_default();
@@ -905,29 +892,25 @@ fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
             }
             InputWindow::Stream(mut refill) => match args.chunk_count {
                 // Only a genuine pipe lands here: a `< file` redirect is mapped above.
-                Some(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                Some(_) => Err(reject(
                     "--chunk-count needs the input's size, which a pipe does not report; \
                      redirect from a file (sz-split --chunk-count N < file), name the file, \
                      or use --chunk-bytes",
-                )),
+                )
+                .into()),
                 None => stream_split(&mut refill, &config, manifest),
             },
         }?
     };
 
-    output.flush()?;
-    Ok(ExitCode::from_found(written > 0))
+    output.flush().at("-")?;
+    Ok(Status::from_found(written > 0))
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
     let mut output = stdout_writer();
-    match run(&mut output) {
-        Ok(code) => code.exit(&mut output),
-        // A downstream `head` closing the manifest is a normal end, not a failure; a chunk
-        // file that cannot be written is the failure, and only that one exits 2.
-        Err(error) => exit_on_write_error(&mut output, &error, "sz-split"),
-    }
+    report("sz-split", run(&args, &mut output))
 }
 
 #[cfg(test)]

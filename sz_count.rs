@@ -42,7 +42,6 @@ use ignore::{Walk, WalkBuilder};
 use stringzilla::sz;
 use stringzilla::sz::StringZillableUnary;
 
-mod shared;
 use shared::*;
 
 // region: CLI
@@ -1090,48 +1089,44 @@ fn gather(args: &Args, counter: Counter, failures: &mut usize) -> Report {
 
 /// The status a finished run reports. Nothing readable did not complete; nothing
 /// counted completed and found nothing.
-fn outcome(report: &Report, failures: usize) -> ExitCode {
+fn outcome(report: &Report, failures: usize) -> Status {
     if !report.rows.is_empty() {
-        ExitCode::Success
+        Status::Success
     } else if failures > 0 {
-        ExitCode::Error
+        Status::Error
     } else {
-        ExitCode::NoResult
+        Status::NoResult
     }
 }
 
 // endregion: Input Processing
 
-fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
-    let args = Args::parse();
-    if let Err(error) = validate(&args) {
-        error.exit();
-    }
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
 
     let mode = Mode::from_args(args.posix, args.utf8);
     let fields = Fields::from_selection(&args.fields);
     let counter = Counter::new(mode, fields);
 
     let mut failures = 0;
-    let report = gather(&args, counter, &mut failures);
-    let code = outcome(&report, failures);
+    let counted = gather(args, counter, &mut failures);
+    let status = outcome(&counted, failures);
 
-    if code == ExitCode::Success && !args.quiet {
+    if status == Status::Success && !args.quiet {
         let config = RenderConfig {
             fields,
             format: args.format,
         };
-        render(output, &report, &config)?;
+        render(output, &counted, &config).at("-")?;
     }
-    Ok(code)
+    output.flush().at("-")?;
+    Ok(status)
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
     let mut output = stdout_writer();
-    match run(&mut output) {
-        Ok(code) => code.exit(&mut output),
-        Err(error) => exit_on_write_error(&mut output, &error, "sz-count"),
-    }
+    report("sz-count", run(&args, &mut output))
 }
 
 #[cfg(test)]
@@ -1470,7 +1465,7 @@ mod tests {
         // An empty directory completed and found nothing.
         let mut failures = 0;
         let report = counted(&["sz-count", "--quiet", directory_path], &mut failures);
-        assert!(outcome(&report, failures) == ExitCode::NoResult);
+        assert!(outcome(&report, failures) == Status::NoResult);
 
         // A readable file found something, however quiet the run.
         let file = directory.path().join("a.txt");
@@ -1480,7 +1475,7 @@ mod tests {
             &["sz-count", "--quiet", file.to_str().unwrap()],
             &mut failures,
         );
-        assert!(outcome(&report, failures) == ExitCode::Success);
+        assert!(outcome(&report, failures) == Status::Success);
 
         // A missing input warns and still counts its neighbour, so only the run that
         // read nothing at all is incomplete.
@@ -1495,11 +1490,11 @@ mod tests {
             &mut failures,
         );
         assert_eq!(report.rows.len(), 1);
-        assert!(outcome(&report, failures) == ExitCode::Success);
+        assert!(outcome(&report, failures) == Status::Success);
 
         let mut failures = 0;
         let report = counted(&["sz-count", "--quiet", "no-such-file"], &mut failures);
-        assert!(outcome(&report, failures) == ExitCode::Error);
+        assert!(outcome(&report, failures) == Status::Error);
     }
 
     #[test]

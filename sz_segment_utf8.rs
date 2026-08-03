@@ -27,14 +27,13 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum};
 use ignore::WalkBuilder;
 use stringzilla::sz::{
     StringZillableUnary, Utf8Graphemes, Utf8Linebreaks, Utf8Segments, Utf8Sentences,
     Utf8SplitDelimiters, Utf8SplitNewlines, Utf8SplitWhitespaces, Utf8Wordbreaks,
 };
 
-mod shared;
 use shared::*;
 
 // region: CLI
@@ -147,9 +146,10 @@ enum Format {
     Json,
 }
 
-/// Report a constraint clap cannot express, rendered as clap renders its own.
-fn reject(message: &str) -> clap::Error {
-    Args::command().error(ErrorKind::ArgumentConflict, message)
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
 }
 
 /// Reject the combinations clap cannot, because they turn on a value rather than a flag.
@@ -670,23 +670,20 @@ fn resolve_inputs(args: &Args) -> Vec<String> {
 
 /// The status a finished run reports. Named inputs that all failed to read did not
 /// complete; a filter that selected nothing completed and found nothing.
-fn outcome(inputs: usize, readable: usize, records: usize) -> ExitCode {
+fn outcome(inputs: usize, readable: usize, records: usize) -> Status {
     if inputs > 0 && readable == 0 {
-        ExitCode::Error
+        Status::Error
     } else {
-        ExitCode::from_found(records > 0)
+        Status::from_found(records > 0)
     }
 }
 
-fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
-    let args = Args::parse();
-    if let Err(error) = validate(&args) {
-        error.exit();
-    }
-    let segmentation = Segmentation::from_args(&args);
-    let config = OutputConfig::from_args(&args);
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
+    let segmentation = Segmentation::from_args(args);
+    let config = OutputConfig::from_args(args);
 
-    let inputs = resolve_inputs(&args);
+    let inputs = resolve_inputs(args);
     let mut records = 0;
     let mut readable = 0;
 
@@ -697,23 +694,19 @@ fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
                 records += count;
                 readable += 1;
             }
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                return Ok(ExitCode::Success)
-            }
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Err(error).at(input),
             Err(error) => eprintln!("sz-segment-utf8: {}: {}", input, error),
         }
     }
 
-    output.flush()?;
+    output.flush().at("-")?;
     Ok(outcome(inputs.len(), readable, records))
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
     let mut output = stdout_writer();
-    match run(&mut output) {
-        Ok(code) => code.exit(&mut output),
-        Err(error) => exit_on_write_error(&mut output, &error, "sz-segment-utf8"),
-    }
+    report("sz-segment-utf8", run(&args, &mut output))
 }
 
 #[cfg(test)]
@@ -1089,10 +1082,10 @@ mod tests {
     #[test]
     fn separates_an_empty_filter_from_an_unreadable_input() {
         // A `--glob` that matched nothing used to exit 2 with no message at all.
-        assert!(outcome(0, 0, 0) == ExitCode::NoResult);
-        assert!(outcome(2, 0, 0) == ExitCode::Error);
-        assert!(outcome(2, 1, 0) == ExitCode::NoResult);
-        assert!(outcome(2, 1, 5) == ExitCode::Success);
+        assert!(outcome(0, 0, 0) == Status::NoResult);
+        assert!(outcome(2, 0, 0) == Status::Error);
+        assert!(outcome(2, 1, 0) == Status::NoResult);
+        assert!(outcome(2, 1, 5) == Status::Success);
     }
 
     #[test]

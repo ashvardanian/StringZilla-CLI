@@ -1,10 +1,6 @@
-//! Shared utilities for sz-cli tools
-//!
-//! Provides common functionality for all sz-* command-line utilities including
-//! input/output handling, UTF-8 validation, and line iteration.
-//!
-//! Note: Not all functions are used by every binary. The #[allow(dead_code)]
-//! attributes prevent warnings for legitimately shared code.
+//! Primitives shared by every `sz-*` binary: input sources and windows, line and
+//! segment iteration, output terminators, argument parsers, and the error type each
+//! tool forwards to `main`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, Write};
@@ -21,7 +17,6 @@ use stringzilla::sz::{FindSplits, StringZillableBinary, StringZillableUnary, Utf
 // region: Input Sources
 
 /// Represents the input source - either a memory-mapped file or buffered stdin
-#[allow(dead_code)]
 pub enum InputSource {
     /// Memory-mapped file for zero-copy access (read-only)
     MappedFile(Mmap),
@@ -33,7 +28,6 @@ pub enum InputSource {
 }
 
 /// The two shapes an input takes: one whole slice, or a window to refill.
-#[allow(dead_code)]
 pub enum InputWindow {
     /// A source that hands over all of its bytes at once.
     Whole(InputSource),
@@ -41,7 +35,6 @@ pub enum InputWindow {
     Stream(Refill<io::StdinLock<'static>>),
 }
 
-#[allow(dead_code)]
 impl InputSource {
     /// Get the input data as a byte slice
     pub fn as_bytes(&self) -> &[u8] {
@@ -70,7 +63,6 @@ impl InputSource {
 
 /// Read from a file path or stdin. Only regular files are mapped; pipes and
 /// character devices, which `<(cmd)` and `/dev/stdin` resolve to, are buffered.
-#[allow(dead_code)]
 pub fn get_input(path: Option<&str>) -> io::Result<InputSource> {
     let Some(path) = path.filter(|path| *path != "-") else {
         // A redirect resolves to a regular file; only true pipes need buffering.
@@ -87,7 +79,6 @@ pub fn get_input(path: Option<&str>) -> io::Result<InputSource> {
 /// Read from a file path or stdin, leaving a true pipe undrained for [`Refill`].
 /// Every other source maps or buffers exactly as [`get_input`] does, so a caller
 /// branches once on [`InputSource::into_window`] and streams only the pipe.
-#[allow(dead_code)]
 pub fn get_input_streaming(path: Option<&str>) -> io::Result<InputSource> {
     let Some(path) = path.filter(|path| *path != "-") else {
         // A redirect resolves to a regular file; only true pipes need streaming.
@@ -160,7 +151,6 @@ fn widen_stdin_pipe() {
 fn widen_stdin_pipe() {}
 
 /// Map `path` for zero-copy access, buffering it when that is not possible.
-#[allow(dead_code)]
 pub fn open_input(path: &Path) -> io::Result<InputSource> {
     let mut file = File::open(path)?;
     if file.metadata().is_ok_and(|metadata| metadata.is_file()) {
@@ -177,7 +167,6 @@ pub fn open_input(path: &Path) -> io::Result<InputSource> {
 
 /// Whether a walked entry should be read: any regular file, plus explicitly named
 /// non-directories, which is what lets `<(cmd)` and `/dev/stdin` through.
-#[allow(dead_code)]
 pub fn is_readable_entry(entry: &ignore::DirEntry) -> bool {
     match entry.file_type() {
         Some(kind) if kind.is_file() => true,
@@ -193,7 +182,6 @@ pub fn is_readable_entry(entry: &ignore::DirEntry) -> bool {
 /// hardlink, so a file carrying more than one link is instead copied back over the original
 /// inode — preserving the link at the cost of a window where the file is neither version.
 /// Symlinks survive either way, since `path` is resolved before anything is written.
-#[allow(dead_code)]
 pub fn write_replacing<T>(
     tool: &str,
     path: &str,
@@ -312,7 +300,6 @@ fn create_temporary(directory: &Path) -> io::Result<(File, std::path::PathBuf)> 
 }
 
 /// Create an output writer from either a file path or stdout
-#[allow(dead_code)]
 pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
     match path {
         None | Some("-") => Ok(Box::new(stdout_writer())),
@@ -325,8 +312,7 @@ pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
 
 /// Buffered, locked stdout. `io::Stdout` is line-buffered, costing a syscall per record.
 ///
-/// `process::exit` skips the buffer's `Drop`, so exit through [`ExitCode::exit`].
-#[allow(dead_code)]
+/// `Drop` discards its flush error, so a run must flush explicitly before returning.
 pub fn stdout_writer() -> BufWriter<io::StdoutLock<'static>> {
     BufWriter::new(io::stdout().lock())
 }
@@ -337,7 +323,6 @@ pub fn stdout_writer() -> BufWriter<io::StdoutLock<'static>> {
 
 /// Which newline set [`LineIter`] splits on.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Newlines {
     /// Byte-level: only LF (`\n`).
     Lf,
@@ -346,7 +331,6 @@ pub enum Newlines {
     Unicode,
 }
 
-#[allow(dead_code)]
 impl Newlines {
     /// Map a `--utf8` flag to the newline set (LF-only when `false`).
     #[inline]
@@ -369,13 +353,12 @@ impl Newlines {
 // Boxing the larger variant would add heap indirection on every `next()`; the
 // iterator is built once per file (not per line), so the size gap is a one-time
 // stack cost, not a hot-path allocation.
-#[allow(dead_code, clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)]
 pub enum LineIter<'a> {
     Byte(std::iter::Peekable<FindSplits<'a>>),
     Utf8(std::iter::Peekable<Utf8SplitNewlines<'a>>),
 }
 
-#[allow(dead_code)]
 impl<'a> LineIter<'a> {
     /// Create a line iterator over the chosen [`Newlines`] set.
     pub fn new(data: &'a [u8], newlines: Newlines) -> Self {
@@ -414,7 +397,6 @@ fn drop_trailing_empty<'a, I: Iterator<Item = &'a [u8]>>(
 
 /// A byte range, in the coordinates of the buffer it was found in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
 pub struct Span {
     pub offset: usize,
     pub length: usize,
@@ -426,14 +408,12 @@ pub struct Span {
 /// input: CRLF, NEL, LS and PS all become whatever the caller writes back. Each span here
 /// runs from a line's first byte to the first byte of the next line, so concatenating every
 /// span reproduces the input exactly.
-#[allow(dead_code)]
 pub struct LineSpans<'a> {
     data: &'a [u8],
     lines: LineIter<'a>,
     pending: Option<&'a [u8]>,
 }
 
-#[allow(dead_code)]
 impl<'a> LineSpans<'a> {
     pub fn new(data: &'a [u8], newlines: Newlines) -> Self {
         let mut lines = LineIter::new(data, newlines);
@@ -469,7 +449,6 @@ impl Iterator for LineSpans<'_> {
 
 /// Byte offset of `segment` within `data`. Segmenters yield borrowed subslices and
 /// expose no offsets accessor, so the pointer difference is the offset.
-#[allow(dead_code)]
 #[inline]
 pub fn offset_within(data: &[u8], segment: &[u8]) -> usize {
     let bounds = data.as_ptr_range();
@@ -486,7 +465,6 @@ pub fn offset_within(data: &[u8], segment: &[u8]) -> usize {
 
 /// Starting [`Refill`] capacity: large enough to amortize the read syscall, small enough
 /// that the filled window stays in L2 between the read and the scan.
-#[allow(dead_code)]
 pub const DEFAULT_WINDOW_BYTES: usize = 256 << 10;
 
 /// A caller-driven byte window over a reader: one allocation per run, reused for the
@@ -496,7 +474,6 @@ pub const DEFAULT_WINDOW_BYTES: usize = 256 << 10;
 /// guarantee__ — it may hand back four bytes and offers no way to demand more.
 /// [`Refill::advance`] fills to capacity or EOF, so a caller can demand a whole record
 /// and get one.
-#[allow(dead_code)]
 pub struct Refill<R> {
     reader: R,
     buffer: Box<[u8]>,
@@ -504,7 +481,6 @@ pub struct Refill<R> {
     reached_eof: bool,
 }
 
-#[allow(dead_code)]
 impl<R: Read> Refill<R> {
     /// Window `reader` through `capacity` bytes, rounded up to one byte. `reader` should be
     /// the raw stream: a `BufReader` under it would stage every byte a second time.
@@ -635,7 +611,6 @@ impl<R: Read> Refill<R> {
 /// consumer that reads bytes one at a time cuts anywhere, and each one below reads
 /// further ahead than the last.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
 pub enum CutAfter {
     /// Every byte, so the window is consumed whole and nothing carries.
     Anywhere,
@@ -666,7 +641,6 @@ impl From<Newlines> for CutAfter {
 ///
 /// A trailing bare CR is never reported: its LF may arrive in the next window, and cutting
 /// between them would yield one extra record.
-#[allow(dead_code)]
 pub fn last_cut(data: &[u8], cut: CutAfter) -> Option<usize> {
     match cut {
         CutAfter::Anywhere => (!data.is_empty()).then_some(data.len()),
@@ -731,7 +705,6 @@ fn last_unicode_cut(data: &[u8], tails: sz::Byteset) -> Option<usize> {
 
 /// What terminates each output record.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Terminator {
     /// A newline, which is lossy for records that contain one.
     Newline,
@@ -739,7 +712,6 @@ pub enum Terminator {
     Null,
 }
 
-#[allow(dead_code)]
 impl Terminator {
     /// Map a `-0` flag to the terminator (newline when `false`).
     #[inline]
@@ -764,7 +736,6 @@ impl Terminator {
 /// Trim `line` to at most `max_bytes`, returning the kept prefix and whether
 /// anything was dropped. Lands on a codepoint boundary, so combining marks and
 /// emoji sequences can still be split.
-#[allow(dead_code)]
 pub fn truncate_at_character(line: &[u8], max_bytes: usize) -> (&[u8], bool) {
     if line.len() <= max_bytes {
         return (line, false);
@@ -793,7 +764,6 @@ fn json_escape_byteset() -> sz::Byteset {
 
 /// Write JSON-escaped bytes, bulk-writing the run between escapes. Bytes at or
 /// above 0x80 pass through, so the result is valid JSON only for valid UTF-8.
-#[allow(dead_code)]
 pub fn json_escape_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let escapes = json_escape_byteset();
@@ -828,7 +798,6 @@ pub fn json_escape_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
 ///
 /// Passing invalid bytes through raw would emit JSON no decoder accepts, and text tools do
 /// meet non-UTF-8 input. The two-arm shape is ripgrep's, which this envelope already follows.
-#[allow(dead_code)]
 pub fn json_text_field_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
     if std::str::from_utf8(data).is_err() {
         output.write_all(br#"{"bytes":""#)?;
@@ -862,7 +831,6 @@ fn base64_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
 
 /// Render `value` with `,` between thousands groups. `usize::MAX` is 20 digits
 /// plus 6 separators, exactly `buffer`'s length.
-#[allow(dead_code)]
 pub fn format_grouped_number(buffer: &mut [u8; 26], value: usize) -> &str {
     let mut written = buffer.len();
     let mut digits_in_group = 0;
@@ -892,7 +860,6 @@ pub fn format_grouped_number(buffer: &mut [u8; 26], value: usize) -> &str {
 /// Parse a count that has to be at least 1. Clap's stock [`NonZeroUsize`] parser answers
 /// "number would be zero for non-zero type", naming a Rust type where the bound belongs.
 /// Every other input keeps the stock wording, so only the zero case reads differently.
-#[allow(dead_code)]
 pub fn parse_at_least_one(value: &str) -> Result<NonZeroUsize, String> {
     let count: usize = value
         .parse()
@@ -907,7 +874,6 @@ pub fn parse_at_least_one(value: &str) -> Result<NonZeroUsize, String> {
 /// Zero shares [`parse_at_least_one`]'s wording, since a budget of nothing is unsatisfiable
 /// for the same reason a count of nothing is. Overflow is reported rather than saturated:
 /// silently clamping `99E` to one chunk would look like it worked.
-#[allow(dead_code)]
 pub fn parse_size(value: &str) -> Result<NonZeroUsize, String> {
     let trimmed = value.trim();
     let digits_len = trimmed
@@ -950,62 +916,111 @@ pub fn parse_size(value: &str) -> Result<NonZeroUsize, String> {
 
 // endregion: Argument Parsing
 
-// region: Process Exit Conventions
+// region: Failure and Exit Conventions
 
 /// Process exit status, on `grep`'s model.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum ExitCode {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Status {
     Success = 0,  // Ran, and produced a result
     NoResult = 1, // Ran, but found nothing
     Error = 2,    // Did not run to completion
 }
 
-#[allow(dead_code)]
-impl ExitCode {
+impl Status {
     /// Map a "found something" flag to the success/no-result pair.
     #[inline]
     pub fn from_found(found: bool) -> Self {
         if found {
-            ExitCode::Success
+            Status::Success
         } else {
-            ExitCode::NoResult
+            Status::NoResult
         }
     }
+}
 
-    /// Flush `output` and terminate the process with this status.
-    /// `process::exit` skips `BufWriter`'s `Drop`, so the flush is not optional.
-    pub fn exit(self, output: &mut dyn Write) -> ! {
-        let _ = output.flush();
-        process::exit(self as i32)
+/// Anything that ends a run early.
+///
+/// There is deliberately no broken-pipe variant: keeping the [`io::ErrorKind`] intact lets
+/// [`report`] recognise a closed downstream in one place instead of at every write site.
+pub enum Failure {
+    /// An I/O failure, naming the path it happened to.
+    Io { path: String, source: io::Error },
+    /// A usage error, already rendered by clap so it matches a parse failure exactly.
+    Usage(clap::Error),
+}
+
+impl From<clap::Error> for Failure {
+    fn from(error: clap::Error) -> Self {
+        Failure::Usage(error)
     }
 }
 
-/// Report a write failure and terminate. A broken pipe is a normal downstream
-/// close, so it exits successfully; anything else exits [`ExitCode::Error`].
-#[allow(dead_code)]
-pub fn exit_on_write_error(output: &mut dyn Write, error: &io::Error, message: &str) -> ! {
-    if error.kind() == io::ErrorKind::BrokenPipe {
-        ExitCode::Success.exit(output);
+// Deferring `Debug` to `Display` keeps `unwrap()` in tests readable: `io::Error`'s own
+// `Debug` prints a struct dump where the message is what the caller wants to see.
+impl std::fmt::Debug for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
     }
-    eprintln!("{}: {}", message, error);
-    ExitCode::Error.exit(output);
 }
 
-/// Report a fatal error and terminate with [`ExitCode::Error`].
-#[allow(dead_code)]
-pub fn exit_with_error(output: &mut dyn Write, error: &io::Error, message: &str) -> ! {
-    eprintln!("{}: {}", message, error);
-    ExitCode::Error.exit(output);
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Io { path, source } => write!(formatter, "{path}: {source}"),
+            Failure::Usage(error) => write!(formatter, "{error}"),
+        }
+    }
 }
 
-// endregion: Process Exit Conventions
+/// Attach the path an [`io::Result`] failed on.
+///
+/// There is no blanket `From<io::Error> for Failure`, so a bare `?` on an I/O call will not
+/// compile — which is what makes every failure name its file.
+pub trait At<T> {
+    fn at(self, path: impl Into<String>) -> Result<T, Failure>;
+}
+
+impl<T> At<T> for io::Result<T> {
+    #[inline]
+    fn at(self, path: impl Into<String>) -> Result<T, Failure> {
+        self.map_err(|source| Failure::Io {
+            path: path.into(),
+            source,
+        })
+    }
+}
+
+/// Turn a finished run into the process's exit status.
+///
+/// The one place that decides what a closed downstream means, and the only place that knows
+/// the mapping from [`Status`] to a number.
+pub fn report(tool: &str, outcome: Result<Status, Failure>) -> process::ExitCode {
+    match outcome {
+        Ok(status) => process::ExitCode::from(status as u8),
+        // A downstream that closed early is a normal end, not a failure.
+        Err(Failure::Io { source, .. }) if source.kind() == io::ErrorKind::BrokenPipe => {
+            process::ExitCode::SUCCESS
+        }
+        // clap picks the stream and the code: 0 for `--help`, 2 for a real usage error.
+        Err(Failure::Usage(error)) => {
+            let _ = error.print();
+            process::ExitCode::from(error.exit_code() as u8)
+        }
+        Err(failure) => {
+            eprintln!("{tool}: {failure}");
+            process::ExitCode::from(Status::Error as u8)
+        }
+    }
+}
+
+// endregion: Failure and Exit Conventions
 
 // region: Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn lines(data: &[u8], utf8: bool) -> Vec<&[u8]> {
         LineIter::new(data, Newlines::from_utf8(utf8)).collect()
@@ -1070,6 +1085,70 @@ mod tests {
         // Valid UTF-8 stays verbatim, matching the existing `sz-find --json` behavior.
         assert_eq!(escaped("é".as_bytes()), "é");
         assert_eq!(escaped(b""), "");
+    }
+
+    #[test]
+    fn rewrites_the_input_through_a_temporary_file() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("lines.txt");
+        fs::write(&path, b"b\na\n").unwrap();
+
+        write_replacing("sz-test", path.to_str().unwrap(), |output| {
+            output.write_all(b"a\nb\n")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"a\nb\n");
+        let leftovers: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, ["lines.txt"]);
+    }
+    #[test]
+    fn swaps_by_rename_but_keeps_a_hardlinked_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::TempDir::new().unwrap();
+
+        // Unlinked: the swap is a rename, so the path gets a new inode and the replacement
+        // is atomic.
+        let plain = directory.path().join("plain.txt");
+        fs::write(&plain, b"b\na\n").unwrap();
+        let before = fs::metadata(&plain).unwrap().ino();
+        write_replacing("sz-test", plain.to_str().unwrap(), |output| {
+            output.write_all(b"a\nb\n")
+        })
+        .unwrap();
+        assert_ne!(fs::metadata(&plain).unwrap().ino(), before);
+
+        // Hardlinked: renaming would strand the other name on the old content, so the inode
+        // is rewritten instead and both names see the result.
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        fs::write(&first, b"b\na\n").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+        let before = fs::metadata(&first).unwrap().ino();
+        write_replacing("sz-test", first.to_str().unwrap(), |output| {
+            output.write_all(b"a\nb\n")
+        })
+        .unwrap();
+        assert_eq!(fs::metadata(&first).unwrap().ino(), before);
+        assert_eq!(fs::read(&second).unwrap(), b"a\nb\n");
+    }
+    #[test]
+    fn leaves_the_input_untouched_when_the_rewrite_fails() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("lines.txt");
+        fs::write(&path, b"original\n").unwrap();
+
+        let failed: io::Result<()> = write_replacing("sz-test", path.to_str().unwrap(), |output| {
+            output.write_all(b"partial\n")?;
+            Err(io::Error::other("interrupted"))
+        });
+
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original\n");
     }
 
     #[test]

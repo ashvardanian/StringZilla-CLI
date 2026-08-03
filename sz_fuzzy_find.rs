@@ -41,7 +41,6 @@
 
 use std::borrow::Cow;
 use std::io::{self, Write};
-use std::process;
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz;
@@ -49,7 +48,6 @@ use stringzilla::szs::{
     DeviceScope, LevenshteinDistances, LevenshteinDistancesUtf8, SmithWatermanScores,
 };
 
-mod shared;
 use shared::*;
 
 // region: Scoring Matrices
@@ -270,9 +268,9 @@ fn load_custom_scheme(path: &str) -> io::Result<Scheme> {
     })
 }
 
-fn build_scheme(cost: Cost, custom_path: Option<&str>) -> io::Result<Scheme> {
+fn build_scheme(cost: Cost, custom_path: Option<&str>) -> Result<Scheme, Failure> {
     match custom_path {
-        Some(path) => load_custom_scheme(path),
+        Some(path) => load_custom_scheme(path).at(path),
         None => Ok(match cost {
             Cost::Edit => edit_scheme(),
             Cost::Keyboard => keyboard_scheme(),
@@ -778,8 +776,9 @@ fn parse_similarity(text: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-/// Report a constraint clap cannot express, rendered as clap renders its own.
-fn reject(message: &str) -> clap::Error {
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
     Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
 }
 
@@ -814,30 +813,27 @@ fn build_device(args: &Args) -> Result<DeviceScope, String> {
     result.map_err(|e| format!("{:?}", e))
 }
 
-fn main() {
-    match run() {
-        Ok(code) => process::exit(code as i32),
-        Err(error) => {
-            eprintln!("sz-fuzzy-find: {}", error);
-            process::exit(ExitCode::Error as i32);
-        }
-    }
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
-}
-
-fn run() -> io::Result<ExitCode> {
+fn main() -> std::process::ExitCode {
     let args = Args::parse();
-    if let Err(error) = validate(&args) {
-        error.exit();
+    let mut output = stdout_writer();
+    report("sz-fuzzy-find", run(&args, &mut output))
+}
+
+/// An engine fails to build on allocation or a device fault, never on a bad argument.
+fn engine_failure(engine: &str, error: impl std::fmt::Debug) -> Failure {
+    Failure::Io {
+        path: engine.to_string(),
+        source: io::Error::other(format!("init failed: {:?}", error)),
     }
+}
+
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
 
     let cost = args.cost.unwrap_or(Cost::Edit);
     let cost_is_edit = args.cost_matrix.is_none() && cost == Cost::Edit;
 
-    let device = build_device(&args).map_err(invalid)?;
+    let device = build_device(args).map_err(|message| reject(&message))?;
     let scheme = build_scheme(cost, args.cost_matrix.as_deref())?;
     let sw = SmithWatermanScores::new(
         &device,
@@ -846,13 +842,13 @@ fn run() -> io::Result<ExitCode> {
         scheme.gap_open,
         scheme.gap_extend,
     )
-    .map_err(|e| invalid(format!("Smith-Waterman init failed: {:?}", e)))?;
+    .map_err(|error| engine_failure("Smith-Waterman", error))?;
 
     // Standard unit-cost Levenshtein for word edit mode, byte- and code-point-level.
     let lev = LevenshteinDistances::new(&device, 0, 1, 1, 1)
-        .map_err(|e| invalid(format!("Levenshtein init failed: {:?}", e)))?;
+        .map_err(|error| engine_failure("Levenshtein", error))?;
     let lev_utf8 = LevenshteinDistancesUtf8::new(&device, 0, 1, 1, 1)
-        .map_err(|e| invalid(format!("UTF-8 Levenshtein init failed: {:?}", e)))?;
+        .map_err(|error| engine_failure("UTF-8 Levenshtein", error))?;
 
     let engines = Engines {
         device,
@@ -861,8 +857,7 @@ fn run() -> io::Result<ExitCode> {
         lev_utf8,
     };
 
-    let (patterns, inputs) =
-        resolve_positionals(&args).unwrap_or_else(|message| reject(&message).exit());
+    let (patterns, inputs) = resolve_positionals(args).map_err(|message| reject(&message))?;
     let queries: Vec<Query> = patterns
         .into_iter()
         .map(|pattern| Query::new(pattern, args.ignore_case))
@@ -886,26 +881,15 @@ fn run() -> io::Result<ExitCode> {
         terminator: Terminator::from_null(args.null),
     };
 
-    let mut output = get_output(None)?;
-    let outcome = match search_inputs(
-        &mut output,
-        &inputs,
-        &queries,
-        &engines,
-        &cfg,
-        &output_config,
-    ) {
-        Ok(outcome) => outcome,
-        // The only exit that can fire with matches still buffered, so it flushes first.
-        Err(error) => exit_on_write_error(&mut output, &error, "Error writing output"),
-    };
+    let outcome =
+        search_inputs(output, &inputs, &queries, &engines, &cfg, &output_config).at("-")?;
 
-    let code = if outcome.readable == 0 {
-        ExitCode::Error
+    output.flush().at("-")?;
+    if outcome.readable == 0 {
+        Ok(Status::Error)
     } else {
-        ExitCode::from_found(outcome.total > 0)
-    };
-    code.exit(&mut output)
+        Ok(Status::from_found(outcome.total > 0))
+    }
 }
 
 /// What the whole run found, for the exit code and `--summary`.

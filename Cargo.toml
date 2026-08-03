@@ -29,6 +29,11 @@ stringzilla = { version = "5", features = [
 [dev-dependencies]
 tempfile = "3.10"
 
+# Compiled once and linked into every binary, rather than `mod shared;`-included eleven times.
+[lib]
+name = "shared"
+path = "shared.rs"
+
 [profile.release]
 codegen-units = 1 # Better optimization, slower compile
 lto = true        # Link-time optimization

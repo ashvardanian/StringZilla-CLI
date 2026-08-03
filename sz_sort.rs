@@ -43,7 +43,6 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use stringtape::{BytesCowsAuto, StringTapeError};
 use stringzilla::sz;
 
-mod shared;
 use shared::*;
 
 // region: Sorting
@@ -293,14 +292,10 @@ struct Args {
     quiet: bool,
 }
 
-/// Report a constraint clap cannot express, rendered as clap renders its own.
-fn reject(message: &str) -> clap::Error {
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
     Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
-}
-
-/// Name the file a failure happened on, so every diagnostic reads `sz-sort: <path>: <error>`.
-fn at_path(path: &str) -> impl Fn(io::Error) -> io::Error + '_ {
-    move |error| io::Error::new(error.kind(), format!("{}: {}", path, error))
 }
 
 /// Every constraint that depends on an argument's *value*, which clap cannot declare.
@@ -321,22 +316,18 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     Ok(())
 }
 
-fn main() {
-    let mut stdout = io::stdout();
-    match run() {
-        Ok(code) => code.exit(&mut stdout),
-        Err(error) => exit_on_write_error(&mut stdout, &error, "sz-sort"),
-    }
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
+    // Every byte this run prints goes here, so the records stay in one order.
+    let mut output = stdout_writer();
+    report("sz-sort", run(&args, &mut output))
 }
 
-fn run() -> io::Result<ExitCode> {
-    let args = Args::parse();
-    if let Err(error) = validate(&args) {
-        error.exit();
-    }
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
 
     let name = args.input.as_deref().unwrap_or("-");
-    let input = get_input(args.input.as_deref()).map_err(at_path(name))?;
+    let input = get_input(args.input.as_deref()).at(name)?;
     let data = input.as_bytes();
 
     let order = SortOrder {
@@ -346,22 +337,24 @@ fn run() -> io::Result<ExitCode> {
     // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
     let newlines = Newlines::from_utf8(args.utf8 || args.ignore_case);
     let lines = collect_lines(data, newlines)
-        .map_err(|error| io::Error::other(format!("indexing lines: {:?}", error)))?;
+        .map_err(|error| io::Error::other(format!("indexing lines: {:?}", error)))
+        .at(name)?;
 
     if args.check {
         return Ok(match check_sorted(&lines, order) {
-            None => ExitCode::Success,
+            None => Status::Success,
             Some(line_number) => {
                 if !args.quiet {
                     eprintln!("sz-sort: {}:{}: disorder", name, line_number);
                 }
-                ExitCode::NoResult
+                Status::NoResult
             }
         });
     }
 
     let permutation = sorted_order(&lines, order)
-        .map_err(|status| io::Error::other(format!("sorting: {:?}", status)))?;
+        .map_err(|status| io::Error::other(format!("sorting: {:?}", status)))
+        .at(name)?;
     let config = OutputConfig {
         format: args.format,
         unique: args.unique,
@@ -370,28 +363,36 @@ fn run() -> io::Result<ExitCode> {
     };
 
     let written = if args.dry_run || args.quiet {
-        write_sorted(&lines, &permutation, order, &config, &mut io::sink())?
+        write_sorted(&lines, &permutation, order, &config, &mut io::sink()).at(name)?
     } else if args.in_place {
         let path = args.input.as_deref().expect("validated");
         write_replacing("sz-sort", path, |output| {
             write_sorted(&lines, &permutation, order, &config, output)
         })
-        .map_err(at_path(path))?
+        .at(path)?
     } else {
         let target = args.output.as_deref().unwrap_or("-");
-        let mut output = get_output(args.output.as_deref()).map_err(at_path(target))?;
-        write_sorted(&lines, &permutation, order, &config, &mut output).map_err(at_path(target))?
+        let mut opened;
+        let destination: &mut dyn Write = match target {
+            "-" => &mut *output,
+            path => {
+                opened = get_output(Some(path)).at(path)?;
+                &mut *opened
+            }
+        };
+        write_sorted(&lines, &permutation, order, &config, destination).at(target)?
     };
 
     if args.format == Format::Json {
         // The record stream went to a sink, so its closing summary still owes stdout.
         if args.dry_run {
-            write_summary_json(&mut io::stdout(), name, lines.len(), written)?;
+            write_summary_json(output, name, lines.len(), written).at("-")?;
         }
     } else if args.summary || args.dry_run {
         println!("{} lines read, {} written", lines.len(), written);
     }
-    Ok(ExitCode::from_found(written > 0))
+    output.flush().at("-")?;
+    Ok(Status::from_found(written > 0))
 }
 
 // endregion: CLI
@@ -401,7 +402,6 @@ fn run() -> io::Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     fn text_config(unique: bool) -> OutputConfig<'static> {
         OutputConfig {
@@ -675,72 +675,6 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert!(records[2].contains(r#""type":"summary""#));
         assert!(records[2].contains(r#""written_lines":2,"total_lines":2"#));
-    }
-
-    #[test]
-    fn rewrites_the_input_through_a_temporary_file() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("lines.txt");
-        fs::write(&path, b"b\na\n").unwrap();
-
-        write_replacing("sz-sort", path.to_str().unwrap(), |output| {
-            output.write_all(b"a\nb\n")
-        })
-        .unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"a\nb\n");
-        let leftovers: Vec<_> = fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(leftovers, ["lines.txt"]);
-    }
-
-    #[test]
-    fn swaps_by_rename_but_keeps_a_hardlinked_inode() {
-        use std::os::unix::fs::MetadataExt;
-
-        let directory = tempfile::TempDir::new().unwrap();
-
-        // Unlinked: the swap is a rename, so the path gets a new inode and the replacement
-        // is atomic.
-        let plain = directory.path().join("plain.txt");
-        fs::write(&plain, b"b\na\n").unwrap();
-        let before = fs::metadata(&plain).unwrap().ino();
-        write_replacing("sz-sort", plain.to_str().unwrap(), |output| {
-            output.write_all(b"a\nb\n")
-        })
-        .unwrap();
-        assert_ne!(fs::metadata(&plain).unwrap().ino(), before);
-
-        // Hardlinked: renaming would strand the other name on the old content, so the inode
-        // is rewritten instead and both names see the result.
-        let first = directory.path().join("first.txt");
-        let second = directory.path().join("second.txt");
-        fs::write(&first, b"b\na\n").unwrap();
-        fs::hard_link(&first, &second).unwrap();
-        let before = fs::metadata(&first).unwrap().ino();
-        write_replacing("sz-sort", first.to_str().unwrap(), |output| {
-            output.write_all(b"a\nb\n")
-        })
-        .unwrap();
-        assert_eq!(fs::metadata(&first).unwrap().ino(), before);
-        assert_eq!(fs::read(&second).unwrap(), b"a\nb\n");
-    }
-
-    #[test]
-    fn leaves_the_input_untouched_when_the_rewrite_fails() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("lines.txt");
-        fs::write(&path, b"original\n").unwrap();
-
-        let failed: io::Result<()> = write_replacing("sz-sort", path.to_str().unwrap(), |output| {
-            output.write_all(b"partial\n")?;
-            Err(io::Error::other("interrupted"))
-        });
-
-        assert!(failed.is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"original\n");
     }
 }
 

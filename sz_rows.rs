@@ -36,7 +36,6 @@ use std::ops::ControlFlow;
 use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
 use stringzilla::sz;
 
-mod shared;
 use shared::*;
 
 /// Extract rows from text files
@@ -94,14 +93,10 @@ enum Format {
     Json,
 }
 
-/// Report a constraint clap cannot express, rendered as clap renders its own.
-fn reject(message: &str) -> clap::Error {
-    Args::command().error(ErrorKind::ArgumentConflict, message)
-}
-
-/// Name the file a failure happened on, so every diagnostic reads `sz-rows: <path>: <error>`.
-fn at_path(path: &str) -> impl Fn(io::Error) -> io::Error + '_ {
-    move |error| io::Error::new(error.kind(), format!("{}: {}", path, error))
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
 }
 
 /// The constraints clap cannot express: `conflicts_with` fires on a flag's presence,
@@ -527,18 +522,12 @@ fn stream_rows<R: Read>(
 
 // endregion: Streaming
 
-fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
-    let args = Args::parse();
-    if let Err(error) = validate(&args) {
-        error.exit();
-    }
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
 
     let selector = if let Some(rows) = &args.rows {
-        parse_rows(rows).unwrap_or_else(|message| {
-            Args::command()
-                .error(ErrorKind::ValueValidation, message)
-                .exit()
-        })
+        parse_rows(rows)
+            .map_err(|message| Args::command().error(ErrorKind::ValueValidation, message))?
     } else if let Some(wanted) = args.tail {
         RowSelector::Tail(wanted)
     } else {
@@ -546,7 +535,7 @@ fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
     };
 
     let name = args.input.as_deref().unwrap_or("-");
-    let input = get_input_streaming(args.input.as_deref()).map_err(at_path(name))?;
+    let input = get_input_streaming(args.input.as_deref()).at(name)?;
 
     let config = OutputConfig {
         json: args.format == Format::Json,
@@ -557,27 +546,32 @@ fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
 
     // A quiet run still extracts, so the row count that answers it stays honest.
     let mut discard = io::sink();
-    let output: &mut dyn Write = if args.quiet { &mut discard } else { output };
+    let writer: &mut dyn Write = if args.quiet {
+        &mut discard
+    } else {
+        &mut *output
+    };
 
     let newlines = Newlines::from_utf8(args.utf8);
+    // Only a pipe streams, so both the reader and the writer of either arm are `-`.
     let emitted = match input.into_window(DEFAULT_WINDOW_BYTES) {
         InputWindow::Whole(source) => {
-            extract_rows_by_selector(source.as_bytes(), &selector, newlines, &config, output)?
+            extract_rows_by_selector(source.as_bytes(), &selector, newlines, &config, writer)
+                .at("-")?
         }
         InputWindow::Stream(mut refill) => {
-            stream_rows(&mut refill, &selector, newlines, &config, output)?
+            stream_rows(&mut refill, &selector, newlines, &config, writer).at("-")?
         }
     };
 
-    Ok(ExitCode::from_found(emitted > 0))
+    output.flush().at("-")?;
+    Ok(Status::from_found(emitted > 0))
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
     let mut output = stdout_writer();
-    match run(&mut output) {
-        Ok(code) => code.exit(&mut output),
-        Err(error) => exit_on_write_error(&mut output, &error, "sz-rows"),
-    }
+    report("sz-rows", run(&args, &mut output))
 }
 
 #[cfg(test)]
@@ -663,7 +657,7 @@ mod tests {
             &mut discard,
         )
         .unwrap();
-        assert!(ExitCode::from_found(emitted > 0) == ExitCode::Success);
+        assert!(Status::from_found(emitted > 0) == Status::Success);
 
         let emitted = extract_rows_by_selector(
             data,
@@ -673,7 +667,7 @@ mod tests {
             &mut discard,
         )
         .unwrap();
-        assert!(ExitCode::from_found(emitted > 0) == ExitCode::NoResult);
+        assert!(Status::from_found(emitted > 0) == Status::NoResult);
     }
 
     #[test]
@@ -740,8 +734,15 @@ mod tests {
     #[test]
     fn names_the_path_a_failure_happened_on() {
         // A missing input used to report `Error reading input: …`, naming nothing.
-        let error = at_path("missing.txt")(io::Error::from(io::ErrorKind::NotFound));
-        assert!(error.to_string().starts_with("missing.txt: "), "{}", error);
+        let args = Args::parse_from(["sz-rows", "--rows", "1", "missing.txt"]);
+        let Err(failure) = run(&args, &mut io::sink()) else {
+            panic!("a missing input must fail");
+        };
+        assert!(
+            failure.to_string().starts_with("missing.txt: "),
+            "{}",
+            failure
+        );
     }
 
     #[test]

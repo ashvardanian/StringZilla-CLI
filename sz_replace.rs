@@ -27,7 +27,6 @@ use std::io::{self, Write};
 use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz::{find, utf8_uncased_search};
 
-mod shared;
 use shared::*;
 
 /// How records are rendered.
@@ -80,14 +79,10 @@ struct Args {
     quiet: bool,
 }
 
-/// Report a constraint clap cannot express, rendered as clap renders its own.
-fn reject(message: &str) -> clap::Error {
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
     Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
-}
-
-/// Name the file a failure happened on, so every diagnostic reads `sz-replace: <path>: <error>`.
-fn at_path(path: &str) -> impl Fn(io::Error) -> io::Error + '_ {
-    move |error| io::Error::new(error.kind(), format!("{}: {}", path, error))
 }
 
 /// Every constraint that depends on an argument's *value*, which clap cannot declare.
@@ -173,22 +168,18 @@ fn write_summary_json(
     )
 }
 
-fn main() {
-    let mut stdout = io::stdout();
-    match run() {
-        Ok(code) => code.exit(&mut stdout),
-        Err(error) => exit_on_write_error(&mut stdout, &error, "sz-replace"),
-    }
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
+    // Every byte this run prints goes here, so the records stay in one order.
+    let mut output = stdout_writer();
+    report("sz-replace", run(&args, &mut output))
 }
 
-fn run() -> io::Result<ExitCode> {
-    let args = Args::parse();
-    if let Err(error) = validate(&args) {
-        error.exit();
-    }
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
 
     let name = args.input.as_deref().unwrap_or("-");
-    let input = get_input(args.input.as_deref()).map_err(at_path(name))?;
+    let input = get_input(args.input.as_deref()).at(name)?;
 
     let data = input.as_bytes();
     let pattern = args.pattern.as_bytes();
@@ -209,20 +200,27 @@ fn run() -> io::Result<ExitCode> {
         write_replacing("sz-replace", path, |output| {
             replace_all_to(data, pattern, replacement, args.ignore_case, output)
         })
-        .map_err(at_path(path))?
+        .at(path)?
     } else {
         // Stream directly to stdout / --output — no full-output buffer. A pipe closing
         // during the flush ends the run where one closing during the write does.
         let target = args.output.as_deref().unwrap_or("-");
-        let mut output = get_output(args.output.as_deref()).map_err(at_path(target))?;
-        let count = replace_all_to(data, pattern, replacement, args.ignore_case, &mut *output)
-            .map_err(at_path(target))?;
-        output.flush().map_err(at_path(target))?;
+        let mut opened;
+        let destination: &mut dyn Write = match target {
+            "-" => &mut *output,
+            path => {
+                opened = get_output(Some(path)).at(path)?;
+                &mut *opened
+            }
+        };
+        let count =
+            replace_all_to(data, pattern, replacement, args.ignore_case, destination).at(target)?;
+        destination.flush().at(target)?;
         count
     };
 
     if args.format == Format::Json {
-        write_summary_json(&mut io::stdout(), name, count, args.dry_run)?;
+        write_summary_json(output, name, count, args.dry_run).at("-")?;
     } else if args.summary || args.dry_run {
         let verb = if args.dry_run {
             "Would replace"
@@ -232,8 +230,10 @@ fn run() -> io::Result<ExitCode> {
         println!("{} {} occurrence(s)", verb, count);
     }
 
+    output.flush().at("-")?;
+
     // The stream was produced whether or not it changed; counting alone reports matches.
-    Ok(ExitCode::from_found(if counting_only {
+    Ok(Status::from_found(if counting_only {
         count > 0
     } else {
         !data.is_empty()
@@ -243,7 +243,6 @@ fn run() -> io::Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     /// Test helper: run the streaming replace into a buffer and return it.
     fn replace_all(
@@ -433,42 +432,6 @@ mod tests {
             accepts(&["--format", "json", "--output", "o", "--summary"]),
             "--summary names the record json already emits"
         );
-    }
-
-    #[test]
-    fn rewrites_the_input_through_a_temporary_file() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("text.txt");
-        fs::write(&path, b"hello hello").unwrap();
-
-        let count = write_replacing("sz-replace", path.to_str().unwrap(), |output| {
-            replace_all_to(b"hello hello", b"hello", b"hi", false, output)
-        })
-        .unwrap();
-
-        assert_eq!(count, 2);
-        assert_eq!(fs::read(&path).unwrap(), b"hi hi");
-        let leftovers: Vec<_> = fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(leftovers, ["text.txt"]);
-    }
-
-    #[test]
-    fn leaves_the_input_untouched_when_the_rewrite_fails() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("text.txt");
-        fs::write(&path, b"original").unwrap();
-
-        let failed: io::Result<()> =
-            write_replacing("sz-replace", path.to_str().unwrap(), |output| {
-                output.write_all(b"partial")?;
-                Err(io::Error::other("interrupted"))
-            });
-
-        assert!(failed.is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"original");
     }
 
     #[test]

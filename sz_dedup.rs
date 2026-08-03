@@ -72,7 +72,6 @@ use std::io::{self, Write};
 use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz;
 
-mod shared;
 use shared::*;
 
 // region: AppendOnlyFlatHashSet
@@ -419,14 +418,10 @@ struct Args {
     quiet: bool,
 }
 
-/// Report a constraint clap cannot express, rendered as clap renders its own.
-fn reject(message: &str) -> clap::Error {
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
     Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
-}
-
-/// Name the file a failure happened on, so every diagnostic reads `sz-dedup: <path>: <error>`.
-fn at_path(path: &str) -> impl Fn(io::Error) -> io::Error + '_ {
-    move |error| io::Error::new(error.kind(), format!("{}: {}", path, error))
 }
 
 /// Every constraint that depends on an argument's *value*, which clap cannot declare.
@@ -447,25 +442,21 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     Ok(())
 }
 
-fn main() {
-    let mut stdout = io::stdout();
-    match run() {
-        Ok(code) => code.exit(&mut stdout),
-        Err(error) => exit_on_write_error(&mut stdout, &error, "sz-dedup"),
-    }
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
+    // Every byte this run prints goes here, so the records stay in one order.
+    let mut output = stdout_writer();
+    report("sz-dedup", run(&args, &mut output))
 }
 
-fn run() -> io::Result<ExitCode> {
-    let args = Args::parse();
-    if let Err(error) = validate(&args) {
-        error.exit();
-    }
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
 
     // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
     let utf8_mode = args.utf8 || args.ignore_case;
     let name = args.input.as_deref().unwrap_or("-");
 
-    let input = get_input(args.input.as_deref()).map_err(at_path(name))?;
+    let input = get_input(args.input.as_deref()).at(name)?;
     let data = input.as_bytes();
 
     // In-place is opt-in: the default writes to stdout like every other binary,
@@ -479,13 +470,13 @@ fn run() -> io::Result<ExitCode> {
         write_replacing("sz-dedup", path, |output| {
             dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
         })
-        .map_err(at_path(path))?
+        .at(path)?
     } else if args.dry_run || args.quiet {
         let config = OutputConfig {
             rendering: Rendering::Terminated(Terminator::from_null(args.null)),
             path: name,
         };
-        dedup_to_writer(data, &mut io::sink(), args.ignore_case, utf8_mode, &config)?
+        dedup_to_writer(data, &mut io::sink(), args.ignore_case, utf8_mode, &config).at(name)?
     } else {
         let config = OutputConfig {
             rendering: match args.format {
@@ -495,24 +486,31 @@ fn run() -> io::Result<ExitCode> {
             path: name,
         };
         let target = args.output.as_deref().unwrap_or("-");
-        let mut output = get_output(args.output.as_deref()).map_err(at_path(target))?;
-        dedup_to_writer(data, &mut output, args.ignore_case, utf8_mode, &config)
-            .map_err(at_path(target))?
+        let mut opened;
+        let destination: &mut dyn Write = match target {
+            "-" => &mut *output,
+            path => {
+                opened = get_output(Some(path)).at(path)?;
+                &mut *opened
+            }
+        };
+        dedup_to_writer(data, destination, args.ignore_case, utf8_mode, &config).at(target)?
     };
 
     if args.format == Format::Json {
         // A run with no record stream still owes its one summary record.
         if args.in_place || args.dry_run {
-            write_summary_json(&mut io::stdout(), name, counts)?;
+            write_summary_json(output, name, counts).at("-")?;
         }
     } else if args.summary || args.dry_run {
         println!("{} unique lines of {}", counts.unique, counts.total);
     }
+    output.flush().at("-")?;
 
     Ok(if args.quiet {
-        ExitCode::from_found(counts.dropped_any())
+        Status::from_found(counts.dropped_any())
     } else {
-        ExitCode::from_found(counts.unique > 0)
+        Status::from_found(counts.unique > 0)
     })
 }
 
@@ -721,42 +719,6 @@ mod tests {
             let args = Args::try_parse_from(&arguments).unwrap();
             assert!(validate(&args).is_err(), "expected {:?} to fail", arguments);
         }
-    }
-
-    #[test]
-    fn rewrites_the_input_through_a_temporary_file() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("lines.txt");
-        fs::write(&path, b"a\nb\na\n").unwrap();
-        let config = verbatim_config();
-
-        write_replacing("sz-dedup", path.to_str().unwrap(), |output| {
-            dedup_to_writer(&fs::read(&path).unwrap(), output, false, false, &config)
-        })
-        .unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"a\nb\n");
-        let leftovers: Vec<_> = fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(leftovers, ["lines.txt"]);
-    }
-
-    #[test]
-    fn leaves_the_input_untouched_when_the_rewrite_fails() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("lines.txt");
-        fs::write(&path, b"original\n").unwrap();
-
-        let failed: io::Result<()> =
-            write_replacing("sz-dedup", path.to_str().unwrap(), |output| {
-                output.write_all(b"partial\n")?;
-                Err(io::Error::other("interrupted"))
-            });
-
-        assert!(failed.is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"original\n");
     }
 
     #[test]

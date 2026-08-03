@@ -58,7 +58,6 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use ignore::WalkBuilder;
 use stringzilla::sz::{find, rfind, utf8_uncased_search, StringZillableBinary, Utf8UncasedNeedle};
 
-mod shared;
 use shared::*;
 
 // region: CLI
@@ -1377,9 +1376,9 @@ impl Emitter<'_, '_> {
             }
             OutputFormat::Json => {
                 self.output
-                    .write_all(br#"{"type":"begin","data":{"path":{"text":""#)?;
-                json_escape_to(self.output, filename.as_bytes())?;
-                self.output.write_all(b"\"}}}\n")?;
+                    .write_all(br#"{"type":"begin","data":{"path":"#)?;
+                json_text_field_to(self.output, filename.as_bytes())?;
+                self.output.write_all(b"}}\n")?;
                 *printed = true;
             }
             OutputFormat::Standard | OutputFormat::Vimgrep => {}
@@ -1506,38 +1505,38 @@ impl Emitter<'_, '_> {
         let (filename, search, printer) = (self.filename, self.search, self.printer);
         if !record.is_match {
             self.output
-                .write_all(br#"{"type":"context","data":{"path":{"text":""#)?;
-            json_escape_to(self.output, filename.as_bytes())?;
-            self.output.write_all(br#""},"lines":{"text":""#)?;
-            json_escape_to(self.output, record.line)?;
+                .write_all(br#"{"type":"context","data":{"path":"#)?;
+            json_text_field_to(self.output, filename.as_bytes())?;
+            self.output.write_all(br#","lines":"#)?;
+            json_text_field_to(self.output, record.line)?;
             write!(
                 self.output,
-                r#""}},"line_number":{},"absolute_offset":{}}}}}"#,
+                r#","line_number":{},"absolute_offset":{}}}}}"#,
                 record.line_number, record.byte_offset
             )?;
             self.output.write_all(b"\n")
         } else if !printer.locates_matches {
             // An inverted match holds no position, so it carries no submatches.
             self.output
-                .write_all(br#"{"type":"match","data":{"path":{"text":""#)?;
-            json_escape_to(self.output, filename.as_bytes())?;
-            self.output.write_all(br#""},"lines":{"text":""#)?;
-            json_escape_to(self.output, record.line)?;
+                .write_all(br#"{"type":"match","data":{"path":"#)?;
+            json_text_field_to(self.output, filename.as_bytes())?;
+            self.output.write_all(br#","lines":"#)?;
+            json_text_field_to(self.output, record.line)?;
             write!(
                 self.output,
-                r#""}},"line_number":{},"absolute_offset":{},"submatches":[]}}}}"#,
+                r#","line_number":{},"absolute_offset":{},"submatches":[]}}}}"#,
                 record.line_number, record.byte_offset
             )?;
             self.output.write_all(b"\n")
         } else {
             self.output
-                .write_all(br#"{"type":"match","data":{"path":{"text":""#)?;
-            json_escape_to(self.output, filename.as_bytes())?;
-            self.output.write_all(br#""},"lines":{"text":""#)?;
-            json_escape_to(self.output, record.line)?;
+                .write_all(br#"{"type":"match","data":{"path":"#)?;
+            json_text_field_to(self.output, filename.as_bytes())?;
+            self.output.write_all(br#","lines":"#)?;
+            json_text_field_to(self.output, record.line)?;
             write!(
                 self.output,
-                r#""}},"line_number":{},"absolute_offset":{},"submatches":["#,
+                r#","line_number":{},"absolute_offset":{},"submatches":["#,
                 record.line_number, record.byte_offset
             )?;
 
@@ -1545,11 +1544,11 @@ impl Emitter<'_, '_> {
                 if index > 0 {
                     self.output.write_all(b",")?;
                 }
-                self.output.write_all(br#"{"match":{"text":""#)?;
-                json_escape_to(self.output, found.text(record.line))?;
+                self.output.write_all(br#"{"match":"#)?;
+                json_text_field_to(self.output, found.text(record.line))?;
                 write!(
                     self.output,
-                    r#""}},"start":{},"end":{}}}"#,
+                    r#","start":{},"end":{}}}"#,
                     found.offset,
                     found.offset + found.length
                 )?;
@@ -1655,11 +1654,11 @@ fn print_json_end(
     if printer.output_format != OutputFormat::Json || !progress.printed_heading {
         return Ok(());
     }
-    output.write_all(br#"{"type":"end","data":{"path":{"text":""#)?;
-    json_escape_to(output, filename.as_bytes())?;
+    output.write_all(br#"{"type":"end","data":{"path":"#)?;
+    json_text_field_to(output, filename.as_bytes())?;
     write!(
         output,
-        r#""}},"stats":{{"matches":{},"lines_searched":{}}}}}}}"#,
+        r#","stats":{{"matches":{},"lines_searched":{}}}}}}}"#,
         progress.match_count, progress.lines_searched
     )?;
     output.write_all(b"\n")
@@ -1753,9 +1752,9 @@ impl Session<'_> {
     /// Emit one input's matching-line count.
     fn write_count(&self, output: &mut dyn Write, filename: &str, count: usize) -> io::Result<()> {
         if self.format == Format::Json {
-            output.write_all(br#"{"type":"count","data":{"path":{"text":""#)?;
-            json_escape_to(output, filename.as_bytes())?;
-            return writeln!(output, r#""}},"count":{}}}}}"#, count);
+            output.write_all(br#"{"type":"count","data":{"path":"#)?;
+            json_text_field_to(output, filename.as_bytes())?;
+            return writeln!(output, r#","count":{}}}}}"#, count);
         }
         if self.named {
             write!(output, "{}:{}", filename, count)?;
@@ -1768,9 +1767,9 @@ impl Session<'_> {
     /// Emit one input's name.
     fn write_path(&self, output: &mut dyn Write, filename: &str) -> io::Result<()> {
         if self.format == Format::Json {
-            output.write_all(br#"{"type":"file","data":{"path":{"text":""#)?;
-            json_escape_to(output, filename.as_bytes())?;
-            return output.write_all(b"\"}}}\n");
+            output.write_all(br#"{"type":"file","data":{"path":"#)?;
+            json_text_field_to(output, filename.as_bytes())?;
+            return output.write_all(b"}}\n");
         }
         output.write_all(filename.as_bytes())?;
         output.write_all(&[self.terminator])
@@ -1997,28 +1996,16 @@ fn print_summary(
 
 // endregion: Input Processing
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let args = Args::parse();
     // Every byte this run prints goes here, so the records stay in one order.
     let mut output = stdout_writer();
-    let code = match run(&args, &mut output) {
-        Ok(code) => code,
-        // A closed downstream is a normal end, not a failure.
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::Success,
-        Err(error) => {
-            eprintln!("Error: {}", error);
-            ExitCode::Error
-        }
-    };
-    code.exit(&mut output);
+    report("sz-find", run(&args, &mut output))
 }
 
 /// Search every input in turn and answer with the status the run earned.
-fn run(args: &Args, output: &mut dyn Write) -> io::Result<ExitCode> {
-    if let Err(error) = validate(args) {
-        error.print()?;
-        return Ok(ExitCode::Error);
-    }
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
     let started = std::time::Instant::now();
     let show = args.show.unwrap_or_default();
 
@@ -2085,8 +2072,10 @@ fn run(args: &Args, output: &mut dyn Write) -> io::Result<ExitCode> {
         if outcome.max_reached {
             break;
         }
+        // Only reads of stdin and writes of stdout reach here, both named `-`; a file that
+        // failed to open was already reported and folded into `outcome`.
         if input == "-" {
-            search_stdin(&session, output, &mut outcome)?;
+            search_stdin(&session, output, &mut outcome).at(STDIN_NAME)?;
         } else {
             search_tree(
                 &session,
@@ -2095,19 +2084,21 @@ fn run(args: &Args, output: &mut dyn Write) -> io::Result<ExitCode> {
                 input,
                 output,
                 &mut outcome,
-            )?;
+            )
+            .at(STDIN_NAME)?;
         }
     }
 
     if args.summary {
-        print_summary(output, args.format, &outcome.summary, started.elapsed())?;
+        print_summary(output, args.format, &outcome.summary, started.elapsed()).at(STDIN_NAME)?;
     }
+    output.flush().at(STDIN_NAME)?;
 
     // Every input failed to open, so the run did not complete.
     if outcome.failed_any && !outcome.read_any {
-        return Ok(ExitCode::Error);
+        return Ok(Status::Error);
     }
-    Ok(ExitCode::from_found(outcome.found))
+    Ok(Status::from_found(outcome.found))
 }
 
 // region: Tests
@@ -2375,10 +2366,7 @@ mod tests {
         assert!(validate(&args).is_ok());
 
         let mut printed = Vec::new();
-        assert!(matches!(
-            run(&args, &mut printed).unwrap(),
-            ExitCode::Success
-        ));
+        assert!(matches!(run(&args, &mut printed), Ok(Status::Success)));
         let printed = String::from_utf8(printed).unwrap();
         assert!(printed.contains("Matches found:  2"), "{}", printed);
     }
@@ -2519,16 +2507,10 @@ mod tests {
             present.to_str().unwrap(),
         ])
         .unwrap();
-        assert!(matches!(
-            run(&args, &mut output).unwrap(),
-            ExitCode::Success
-        ));
+        assert!(matches!(run(&args, &mut output), Ok(Status::Success)));
 
         let args = Args::try_parse_from(["sz-find", "error", missing.to_str().unwrap()]).unwrap();
-        assert!(matches!(
-            run(&args, &mut io::sink()).unwrap(),
-            ExitCode::Error
-        ));
+        assert!(matches!(run(&args, &mut io::sink()), Ok(Status::Error)));
     }
 
     #[test]
