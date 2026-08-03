@@ -1128,11 +1128,11 @@ fn reject(message: impl std::fmt::Display) -> clap::Error {
 
 /// Every constraint that depends on an argument's *value*, which clap cannot declare.
 fn validate(args: &Args) -> Result<(), clap::Error> {
-    let path = args.input.as_deref().unwrap_or("-");
-    if args.language.or_else(|| detect_language(path)).is_none() {
+    let name = args.input.as_deref().unwrap_or("-");
+    if args.language.or_else(|| detect_language(name)).is_none() {
         return Err(reject(format!(
             "cannot outline '{}', use --language (md, c, h)",
-            path
+            name
         )));
     }
     Ok(())
@@ -1147,14 +1147,14 @@ fn main() -> std::process::ExitCode {
 fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
-    let path = args.input.as_deref().unwrap_or("-");
+    let name = args.input.as_deref().unwrap_or("-");
     let language = args
         .language
-        .or_else(|| detect_language(path))
+        .or_else(|| detect_language(name))
         .expect("validated");
 
     // The mmap is borrowed, not copied.
-    let input = get_input(Some(path)).at(path)?;
+    let input = get_input(Some(name)).at(name)?;
     let newlines = Newlines::from_utf8(args.utf8);
     let elements = match language {
         Language::Md => parse_markdown(input.as_bytes(), newlines),

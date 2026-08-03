@@ -55,7 +55,6 @@ use std::path::Path;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, ValueEnum};
-use ignore::WalkBuilder;
 use stringzilla::sz::{find, rfind, utf8_uncased_search, StringZillableBinary, Utf8UncasedNeedle};
 
 use shared::*;
@@ -348,7 +347,7 @@ impl std::str::FromStr for ColorChoice {
 /// ANSI color codes
 #[derive(Clone, Copy)]
 struct Colors {
-    filename: &'static str,
+    name: &'static str,
     line_number: &'static str,
     column: &'static str,
     byte_offset: &'static str,
@@ -360,7 +359,7 @@ struct Colors {
 impl Colors {
     fn enabled() -> Self {
         Self {
-            filename: "\x1b[1;35m",        // Bold Magenta
+            name: "\x1b[1;35m",            // Bold Magenta
             line_number: "\x1b[32m",       // Green
             column: "\x1b[32m",            // Green (same as line number)
             byte_offset: "\x1b[36m",       // Cyan
@@ -372,7 +371,7 @@ impl Colors {
 
     fn disabled() -> Self {
         Self {
-            filename: "",
+            name: "",
             line_number: "",
             column: "",
             byte_offset: "",
@@ -395,10 +394,10 @@ enum OutputFormat {
 /// Everything the line emitters read, resolved once from the flags.
 /// Only the printing paths hold one; [`SearchPath::Tally`] has no emitter.
 #[derive(Clone, Copy)]
-struct Printer {
+struct OutputConfig {
     output_format: OutputFormat,
     colors: Colors,
-    show_filename: bool,
+    show_name: bool,
     line_numbers: bool,
     column_numbers: bool,
     byte_offsets: bool,
@@ -415,9 +414,10 @@ struct Printer {
     highlight: bool,
 }
 
-impl Printer {
-    /// Collapse the output flags into the form every emitter reads.
-    fn new(args: &Args, show: Show, multiple_inputs: bool) -> Self {
+impl OutputConfig {
+    /// Collapse the output flags into the form every emitter reads. `is_terminal` answers
+    /// what `--color auto` asks of the destination, which only `main` can see.
+    fn new(args: &Args, show: Show, multiple_inputs: bool, is_terminal: bool) -> Self {
         let output_format = match args.format {
             Format::Json => OutputFormat::Json,
             Format::Vimgrep => OutputFormat::Vimgrep,
@@ -426,11 +426,11 @@ impl Printer {
         };
 
         // JSON carries its own structure, so escape codes would corrupt it. `--quiet` and
-        // the tallying selectors need no test here: they never build a `Printer`.
+        // the tallying selectors need no test here: they never build an `OutputConfig`.
         let use_color = match args.color {
             ColorChoice::Always => true,
             ColorChoice::Never => false,
-            ColorChoice::Auto => io::stdout().is_terminal() && output_format != OutputFormat::Json,
+            ColorChoice::Auto => is_terminal && output_format != OutputFormat::Json,
         };
         let colors = if use_color {
             Colors::enabled()
@@ -442,14 +442,14 @@ impl Printer {
         Self {
             output_format,
             colors,
-            show_filename: multiple_inputs && output_format != OutputFormat::Heading,
+            show_name: multiple_inputs && output_format != OutputFormat::Heading,
             // Vimgrep implies line numbers and columns.
             line_numbers: args.line_numbers || output_format == OutputFormat::Vimgrep,
             column_numbers: args.column_numbers || output_format == OutputFormat::Vimgrep,
             byte_offsets: args.byte_offsets,
             only_matches,
             max_line_length: args.max_line_length.map(NonZeroUsize::get),
-            character_units: uses_unicode(args),
+            character_units: uses_unicode(args.utf8, args.ignore_case),
             terminator: Terminator::from_null(args.null).as_byte(),
             locates_matches: !args.invert_match,
             // `--show matches`, JSON and vimgrep reproduce the match text themselves,
@@ -480,8 +480,8 @@ struct Summary {
 /// Whether the Unicode rules — the newline set, word boundaries and character
 /// units — are in force. `--ignore-case` folds by Unicode, so it turns them on too.
 #[inline]
-fn uses_unicode(args: &Args) -> bool {
-    args.utf8 || args.ignore_case
+fn uses_unicode(utf8: bool, ignore_case: bool) -> bool {
+    utf8 || ignore_case
 }
 
 /// Check if byte is a word boundary character
@@ -727,14 +727,20 @@ enum SearchPath {
     /// Two counters. Serves `--quiet` and the three record kinds that name no line.
     Tally { stop_at_first: bool },
     /// Counters plus a heading bit. Serves every format without context lines.
-    Print(Printer),
+    Print(OutputConfig),
     /// Counters, heading, a look-behind ring and group separators. Serves the context flags.
-    PrintContext(Printer, Context),
+    PrintContext(OutputConfig, Context),
 }
 
 impl SearchPath {
     /// Pick the path: existence only, plain printing, or printing with context.
-    fn choose(args: &Args, show: Show, context: Context, multiple_inputs: bool) -> Self {
+    fn choose(
+        args: &Args,
+        show: Show,
+        context: Context,
+        multiple_inputs: bool,
+        is_terminal: bool,
+    ) -> Self {
         // `--show count` must see every line. Existence answers need only one hit — except
         // under `--summary`, whose totals would otherwise describe a prefix of the file.
         let tally = |stop_at_first: bool| SearchPath::Tally {
@@ -747,11 +753,11 @@ impl SearchPath {
             Show::Count => tally(false),
             Show::Files | Show::FilesWithout => tally(true),
             Show::Lines | Show::Matches => {
-                let printer = Printer::new(args, show, multiple_inputs);
+                let config = OutputConfig::new(args, show, multiple_inputs, is_terminal);
                 if context.before == 0 && context.after == 0 {
-                    SearchPath::Print(printer)
+                    SearchPath::Print(config)
                 } else {
-                    SearchPath::PrintContext(printer, context)
+                    SearchPath::PrintContext(config, context)
                 }
             }
         }
@@ -759,10 +765,10 @@ impl SearchPath {
 
     /// The emitter this path prints through, absent for the tally.
     #[inline]
-    fn printer(&self) -> Option<&Printer> {
+    fn config(&self) -> Option<&OutputConfig> {
         match self {
             SearchPath::Tally { .. } => None,
-            SearchPath::Print(printer) | SearchPath::PrintContext(printer, _) => Some(printer),
+            SearchPath::Print(config) | SearchPath::PrintContext(config, _) => Some(config),
         }
     }
 
@@ -834,7 +840,7 @@ impl ContextState {
 
 /// What a search path remembers between lines, and between windows once the input
 /// streams: the counters, the once-per-file heading bit and the context ring.
-struct Progress {
+struct FindState {
     match_count: usize,
     lines_searched: usize,
     /// Offset of the current window's first byte within the whole input, which keeps
@@ -846,10 +852,10 @@ struct Progress {
     context: ContextState,
 }
 
-impl Progress {
+impl FindState {
     /// Start a file at line zero, byte zero, with nothing printed yet.
     fn new(lines: Context) -> Self {
-        Progress {
+        FindState {
             match_count: 0,
             lines_searched: 0,
             window_base: 0,
@@ -878,40 +884,32 @@ impl Progress {
 }
 
 /// Search one whole slice, which is the shape a mapped or buffered input already has.
-fn search_slice(
+fn search_data(
     data: &[u8],
-    filename: &str,
+    name: &str,
     search: &Search,
     path: &SearchPath,
     output: &mut dyn Write,
     max_reached: &mut bool,
 ) -> io::Result<FileResult> {
     if search.multiline {
-        return search_multiline(data, filename, search, path, output, max_reached);
+        return search_multiline(data, name, search, path, output, max_reached);
     }
-    let mut progress = Progress::new(path.context());
+    let mut state = FindState::new(path.context());
     // One window spans the whole input, so there is nothing left to stop for.
-    let _ = search_window(
-        data,
-        filename,
-        search,
-        path,
-        &mut progress,
-        output,
-        max_reached,
-    )?;
-    print_json_end(output, filename, path, &progress)?;
-    Ok(progress.result(data.len()))
+    let _ = search_window(data, name, search, path, &mut state, output, max_reached)?;
+    print_json_end(output, name, path, &state)?;
+    Ok(state.result(data.len()))
 }
 
-/// Run one window through the chosen path, folding its lines into `progress`.
+/// Run one window through the chosen path, folding its lines into `state`.
 /// Breaks once the path has reported everything it will, which ends a streamed read.
 fn search_window(
     window: &[u8],
-    filename: &str,
+    name: &str,
     search: &Search,
     path: &SearchPath,
-    progress: &mut Progress,
+    state: &mut FindState,
     output: &mut dyn Write,
     max_reached: &mut bool,
 ) -> io::Result<ControlFlow<()>> {
@@ -920,27 +918,15 @@ fn search_window(
             window,
             search,
             *stop_at_first,
-            progress,
+            state,
             max_reached,
         )),
-        SearchPath::Print(printer) => print_window(
-            window,
-            filename,
-            search,
-            printer,
-            progress,
-            output,
-            max_reached,
-        ),
-        SearchPath::PrintContext(printer, _) => print_context_window(
-            window,
-            filename,
-            search,
-            printer,
-            progress,
-            output,
-            max_reached,
-        ),
+        SearchPath::Print(config) => {
+            print_window(window, name, search, config, state, output, max_reached)
+        }
+        SearchPath::PrintContext(config, _) => {
+            print_context_window(window, name, search, config, state, output, max_reached)
+        }
     }
 }
 
@@ -950,19 +936,19 @@ fn tally_window(
     window: &[u8],
     search: &Search,
     stop_at_first: bool,
-    progress: &mut Progress,
+    state: &mut FindState,
     max_reached: &mut bool,
 ) -> ControlFlow<()> {
     for line in LineIter::new(window, search.newlines) {
         // Counted before the limit is tested, so `--summary` includes the line that trips the cap.
-        progress.lines_searched += 1;
-        if progress.exhausted(search) {
+        state.lines_searched += 1;
+        if state.exhausted(search) {
             *max_reached = true;
             return ControlFlow::Break(());
         }
 
         if search.selects(line) {
-            progress.match_count += 1;
+            state.match_count += 1;
             if stop_at_first {
                 return ControlFlow::Break(());
             }
@@ -974,23 +960,23 @@ fn tally_window(
 /// Print matching lines, carrying counters and the once-per-file heading bit.
 fn print_window(
     window: &[u8],
-    filename: &str,
+    name: &str,
     search: &Search,
-    printer: &Printer,
-    progress: &mut Progress,
+    config: &OutputConfig,
+    state: &mut FindState,
     output: &mut dyn Write,
     max_reached: &mut bool,
 ) -> io::Result<ControlFlow<()>> {
     let mut emitter = Emitter {
         output,
-        filename,
+        name,
         search,
-        printer,
+        config,
     };
     for line in LineIter::new(window, search.newlines) {
         // Counted before the limit is tested, so `--summary` includes the line that trips the cap.
-        progress.lines_searched += 1;
-        if progress.exhausted(search) {
+        state.lines_searched += 1;
+        if state.exhausted(search) {
             *max_reached = true;
             return Ok(ControlFlow::Break(()));
         }
@@ -998,18 +984,18 @@ fn print_window(
         if !search.selects(line) {
             continue;
         }
-        progress.match_count += 1;
+        state.match_count += 1;
 
         let record = LineRecord {
             line,
-            line_number: progress.lines_searched,
+            line_number: state.lines_searched,
             // Taken from the slice itself. Accumulating `line.len() + 1` assumes a
             // one-byte terminator and is wrong by one per CR, two per LS or PS.
-            byte_offset: progress.window_base + offset_within(window, line),
+            byte_offset: state.window_base + offset_within(window, line),
             is_match: true,
         };
-        emitter.file_heading(&mut progress.printed_heading)?;
-        emitter.match_line(record, &mut progress.highlight_buffer)?;
+        emitter.file_heading(&mut state.printed_heading)?;
+        emitter.match_line(record, &mut state.highlight_buffer)?;
     }
     Ok(ControlFlow::Continue(()))
 }
@@ -1018,46 +1004,46 @@ fn print_window(
 /// of window offsets, the pending after-context count, and separators.
 fn print_context_window(
     window: &[u8],
-    filename: &str,
+    name: &str,
     search: &Search,
-    printer: &Printer,
-    progress: &mut Progress,
+    config: &OutputConfig,
+    state: &mut FindState,
     output: &mut dyn Write,
     max_reached: &mut bool,
 ) -> io::Result<ControlFlow<()>> {
     let mut emitter = Emitter {
         output,
-        filename,
+        name,
         search,
-        printer,
+        config,
     };
     for line in LineIter::new(window, search.newlines) {
         // Counted before the limit is tested, so `--summary` includes the line that trips the cap.
-        progress.lines_searched += 1;
-        if progress.exhausted(search) {
+        state.lines_searched += 1;
+        if state.exhausted(search) {
             *max_reached = true;
             return Ok(ControlFlow::Break(()));
         }
 
-        let line_number = progress.lines_searched;
+        let line_number = state.lines_searched;
         // Taken from the slice itself. Accumulating `line.len() + 1` assumes a
         // one-byte terminator and is wrong by one per CR, two per LS or PS.
         let line_start = offset_within(window, line);
-        let byte_offset = progress.window_base + line_start;
+        let byte_offset = state.window_base + line_start;
 
         if search.selects(line) {
-            progress.match_count += 1;
-            emitter.file_heading(&mut progress.printed_heading)?;
+            state.match_count += 1;
+            emitter.file_heading(&mut state.printed_heading)?;
 
             // The group opens at its own first line — the oldest look-behind line still
             // unprinted, or the matching line when the ring holds none — and a gap
             // between that line and the last printed one divides the two with `--`,
             // which is where `grep -C` writes its divider.
-            let group_start = progress
+            let group_start = state
                 .context
                 .first_unprinted_behind()
                 .unwrap_or(line_number);
-            let follows_a_gap = progress
+            let follows_a_gap = state
                 .context
                 .last_printed_line
                 .is_some_and(|last| group_start > last + 1);
@@ -1066,15 +1052,15 @@ fn print_context_window(
             }
 
             // Print the buffered look-behind lines, sliced from the current window.
-            for buffered in progress.context.behind.iter() {
-                if progress.context.is_unprinted(buffered.line_number) {
+            for buffered in state.context.behind.iter() {
+                if state.context.is_unprinted(buffered.line_number) {
                     emitter.line(LineRecord {
                         line: &window[buffered.span.start..buffered.span.end],
                         line_number: buffered.line_number,
-                        byte_offset: progress.window_base + buffered.span.start,
+                        byte_offset: state.window_base + buffered.span.start,
                         is_match: false,
                     })?;
-                    progress.context.last_printed_line = Some(buffered.line_number);
+                    state.context.last_printed_line = Some(buffered.line_number);
                 }
             }
 
@@ -1085,27 +1071,27 @@ fn print_context_window(
                     byte_offset,
                     is_match: true,
                 },
-                &mut progress.highlight_buffer,
+                &mut state.highlight_buffer,
             )?;
-            progress.context.last_printed_line = Some(line_number);
-            progress.context.pending_after = progress.context.lines.after;
-        } else if progress.context.pending_after > 0 {
+            state.context.last_printed_line = Some(line_number);
+            state.context.pending_after = state.context.lines.after;
+        } else if state.context.pending_after > 0 {
             emitter.line(LineRecord {
                 line,
                 line_number,
                 byte_offset,
                 is_match: false,
             })?;
-            progress.context.last_printed_line = Some(line_number);
-            progress.context.pending_after -= 1;
+            state.context.last_printed_line = Some(line_number);
+            state.context.pending_after -= 1;
         }
 
         // Maintain the rolling look-behind ring.
-        if progress.context.lines.before > 0 {
-            if progress.context.behind.len() >= progress.context.lines.before {
-                progress.context.behind.pop_front();
+        if state.context.lines.before > 0 {
+            if state.context.behind.len() >= state.context.lines.before {
+                state.context.behind.pop_front();
             }
-            progress.context.behind.push_back(ContextLine {
+            state.context.behind.push_back(ContextLine {
                 line_number,
                 span: line_start..line_start + line.len(),
             });
@@ -1142,7 +1128,7 @@ impl LineCursor {
 /// Search using multi-line matching (whole buffer search)
 fn search_multiline(
     data: &[u8],
-    filename: &str,
+    name: &str,
     search: &Search,
     path: &SearchPath,
     output: &mut dyn Write,
@@ -1160,17 +1146,17 @@ fn search_multiline(
     let separates_groups = context.before > 0 || context.after > 0;
     // Reborrowed rather than moved, so the sink is still reachable for the closing
     // JSON record once every region is printed.
-    let mut emitter = path.printer().map(|printer| Emitter {
+    let mut emitter = path.config().map(|config| Emitter {
         output: &mut *output,
-        filename,
+        name,
         search,
-        printer,
+        config,
     });
 
     // Each region carries its own surrounding lines, so this path keeps no look-behind
     // ring, and the whole file is one window that counts its lines up front.
-    let mut progress = Progress::new(Context::none());
-    progress.lines_searched = data.sz_matches(b"\n").count() + 1;
+    let mut state = FindState::new(Context::none());
+    state.lines_searched = data.sz_matches(b"\n").count() + 1;
     let mut scanned_through = 0;
     // One past the terminator of the last printed region, absent until one is printed.
     let mut last_printed_end: Option<usize> = None;
@@ -1178,10 +1164,10 @@ fn search_multiline(
     let mut line_numbers = LineCursor::default();
 
     for found in search.matcher.matches(data) {
-        if progress.exhausted(search) {
+        if state.exhausted(search) {
             break;
         }
-        progress.match_count += 1;
+        state.match_count += 1;
         let match_end = found.offset + found.length;
         scanned_through = match_end;
 
@@ -1193,7 +1179,7 @@ fn search_multiline(
         };
         // The same once-per-file header line mode writes, so `--heading` names the file
         // and `--format json` opens the record a `{"type":"end"}` will close.
-        emitter.file_heading(&mut progress.printed_heading)?;
+        emitter.file_heading(&mut state.printed_heading)?;
 
         // Find line boundaries around the match
         let line_start = rfind(&data[..found.offset], b"\n").map_or(0, |offset| offset + 1);
@@ -1250,9 +1236,9 @@ fn search_multiline(
             }
 
             let region = &data[actual_start..region_end];
-            if emitter.printer.line_numbers
-                || emitter.printer.byte_offsets
-                || emitter.printer.output_format != OutputFormat::Standard
+            if emitter.config.line_numbers
+                || emitter.config.byte_offsets
+                || emitter.config.output_format != OutputFormat::Standard
             {
                 let line_number = line_numbers.line_at(data, actual_start);
                 for (index, line) in LineIter::new(region, Newlines::Lf).enumerate() {
@@ -1270,15 +1256,15 @@ fn search_multiline(
         }
     }
 
-    print_json_end(output, filename, path, &progress)?;
+    print_json_end(output, name, path, &state)?;
 
     // `--max-matches` caps this file, and reaching the cap ends the walk over the rest —
     // but only with input still unread, which is where the line paths stop as well.
-    if progress.exhausted(search) && scanned_through < data.len() {
+    if state.exhausted(search) && scanned_through < data.len() {
         *max_reached = true;
     }
 
-    Ok(progress.result(data.len()))
+    Ok(state.result(data.len()))
 }
 
 // endregion: Line Loops
@@ -1305,7 +1291,7 @@ fn can_stream(search: &Search, path: &SearchPath) -> bool {
 /// match does cross, and it never reaches this driver.
 fn search_stream<R: Read>(
     refill: &mut Refill<R>,
-    filename: &str,
+    name: &str,
     search: &Search,
     path: &SearchPath,
     output: &mut dyn Write,
@@ -1313,26 +1299,18 @@ fn search_stream<R: Read>(
 ) -> io::Result<FileResult> {
     debug_assert!(can_stream(search, path), "this path reads earlier lines");
 
-    let mut progress = Progress::new(path.context());
+    let mut state = FindState::new(path.context());
     refill.try_for_each_window(search.newlines.into(), |window| {
-        let flow = search_window(
-            window,
-            filename,
-            search,
-            path,
-            &mut progress,
-            output,
-            max_reached,
-        )?;
+        let flow = search_window(window, name, search, path, &mut state, output, max_reached)?;
         // Counted before the flow is honoured, so a stop still reports the window it read.
-        progress.window_base += window.len();
+        state.window_base += window.len();
         Ok(flow)
     })?;
 
-    print_json_end(output, filename, path, &progress)?;
+    print_json_end(output, name, path, &state)?;
     // An early stop leaves the rest of the pipe unread, so the total describes what
     // was searched rather than what the writer still holds.
-    Ok(progress.result(progress.window_base))
+    Ok(state.result(state.window_base))
 }
 
 // endregion: Streaming
@@ -1353,9 +1331,9 @@ struct LineRecord<'a> {
 /// from, the pattern its matches are resolved against, and the resolved output flags.
 struct Emitter<'a, 'p> {
     output: &'a mut dyn Write,
-    filename: &'a str,
+    name: &'a str,
     search: &'a Search<'p>,
-    printer: &'a Printer,
+    config: &'a OutputConfig,
 }
 
 impl Emitter<'_, '_> {
@@ -1364,20 +1342,20 @@ impl Emitter<'_, '_> {
         if *printed {
             return Ok(());
         }
-        let (filename, printer) = (self.filename, self.printer);
-        match printer.output_format {
+        let (name, config) = (self.name, self.config);
+        match config.output_format {
             OutputFormat::Heading => {
                 writeln!(
                     self.output,
                     "{}{}{}",
-                    printer.colors.filename, filename, printer.colors.reset
+                    config.colors.name, name, config.colors.reset
                 )?;
                 *printed = true;
             }
             OutputFormat::Json => {
                 self.output
                     .write_all(br#"{"type":"begin","data":{"path":"#)?;
-                json_text_field_to(self.output, filename.as_bytes())?;
+                json_text_field_to(self.output, name.as_bytes())?;
                 self.output.write_all(b"}}\n")?;
                 *printed = true;
             }
@@ -1389,23 +1367,23 @@ impl Emitter<'_, '_> {
     /// The `--` divider `grep -C` writes between groups of lines that do not adjoin.
     /// JSON Lines has no such record, and every line it emits carries its own number.
     fn group_separator(&mut self) -> io::Result<()> {
-        let printer = self.printer;
-        if printer.output_format == OutputFormat::Json {
+        let config = self.config;
+        if config.output_format == OutputFormat::Json {
             return Ok(());
         }
         writeln!(
             self.output,
             "{}--{}",
-            printer.colors.separator, printer.colors.reset
+            config.colors.separator, config.colors.reset
         )
     }
 
     /// Print a matching line, coloring its matches where the format allows.
     fn match_line(&mut self, record: LineRecord, highlight_buffer: &mut Vec<u8>) -> io::Result<()> {
-        let (search, printer) = (self.search, self.printer);
-        let highlighted = printer
+        let (search, config) = (self.search, self.config);
+        let highlighted = config
             .highlight
-            .then(|| highlight_line(record.line, search, printer, highlight_buffer))
+            .then(|| highlight_line(record.line, search, config, highlight_buffer))
             .flatten();
         // The colored bytes travel beside the record rather than inside it: the column
         // resolves against the line as it was found, and an escape code spliced in ahead
@@ -1421,13 +1399,13 @@ impl Emitter<'_, '_> {
     /// Print `body` — the line itself, or its highlighted form — behind the prefixes the
     /// format asks for, resolving every position against `record.line`.
     fn write_line(&mut self, record: LineRecord, body: &[u8]) -> io::Result<()> {
-        let (filename, search, printer) = (self.filename, self.search, self.printer);
-        let colors = printer.colors;
+        let (name, search, config) = (self.name, self.search, self.config);
+        let colors = config.colors;
         // A context line is set off by `-` where a matching line uses `:`.
         let separator = if record.is_match { ":" } else { "-" };
-        let locates_matches = record.is_match && printer.locates_matches;
+        let locates_matches = record.is_match && config.locates_matches;
 
-        match printer.output_format {
+        match config.output_format {
             OutputFormat::Json => self.json_line(record),
             OutputFormat::Vimgrep => {
                 // Vimgrep puts every match on its own `file:line:column:text` line.
@@ -1436,57 +1414,55 @@ impl Emitter<'_, '_> {
                         write!(
                             self.output,
                             "{}:{}:{}:",
-                            filename,
+                            name,
                             record.line_number,
-                            found.column(record.line, printer.character_units)
+                            found.column(record.line, config.character_units)
                         )?;
-                        if printer.only_matches {
+                        if config.only_matches {
                             self.output.write_all(found.text(record.line))?;
                         } else {
                             self.write_trimmed(body)?;
                         }
-                        self.output.write_all(&[printer.terminator])?;
+                        self.output.write_all(&[config.terminator])?;
                     }
                 } else if record.is_match {
                     // An inverted match holds no position, so the line prints at column one.
-                    write!(self.output, "{}:{}:1:", filename, record.line_number)?;
+                    write!(self.output, "{}:{}:1:", name, record.line_number)?;
                     self.write_trimmed(body)?;
-                    self.output.write_all(&[printer.terminator])?;
+                    self.output.write_all(&[config.terminator])?;
                 }
                 Ok(())
             }
-            // `Printer::new` clears `show_filename` under `--heading`, where the name is a
+            // `OutputConfig::new` clears `show_name` under `--heading`, where the name is a
             // header rather than a per-line prefix, so both formats print the same line.
             OutputFormat::Standard | OutputFormat::Heading => {
-                if printer.show_filename {
+                if config.show_name {
                     write!(
                         self.output,
                         "{}{}{}{}",
-                        colors.filename, filename, colors.reset, separator
+                        colors.name, name, colors.reset, separator
                     )?;
                 }
-                if printer.line_numbers {
+                if config.line_numbers {
                     write!(
                         self.output,
                         "{}{}{}{}",
                         colors.line_number, record.line_number, colors.reset, separator
                     )?;
                 }
-                if printer.column_numbers && locates_matches {
+                if config.column_numbers && locates_matches {
                     let column = search
                         .matcher
                         .matches(record.line)
                         .next()
-                        .map_or(1, |found| {
-                            found.column(record.line, printer.character_units)
-                        });
+                        .map_or(1, |found| found.column(record.line, config.character_units));
                     write!(
                         self.output,
                         "{}{}{}{}",
                         colors.column, column, colors.reset, separator
                     )?;
                 }
-                if printer.byte_offsets {
+                if config.byte_offsets {
                     write!(
                         self.output,
                         "{}{}{}{}",
@@ -1494,7 +1470,7 @@ impl Emitter<'_, '_> {
                     )?;
                 }
                 self.write_content(record, body)?;
-                self.output.write_all(&[printer.terminator])
+                self.output.write_all(&[config.terminator])
             }
         }
     }
@@ -1502,11 +1478,11 @@ impl Emitter<'_, '_> {
     /// Print one line in JSON Lines format (ripgrep-compatible), writing straight to the
     /// sink so that no record is staged in a `String` first.
     fn json_line(&mut self, record: LineRecord) -> io::Result<()> {
-        let (filename, search, printer) = (self.filename, self.search, self.printer);
+        let (name, search, config) = (self.name, self.search, self.config);
         if !record.is_match {
             self.output
                 .write_all(br#"{"type":"context","data":{"path":"#)?;
-            json_text_field_to(self.output, filename.as_bytes())?;
+            json_text_field_to(self.output, name.as_bytes())?;
             self.output.write_all(br#","lines":"#)?;
             json_text_field_to(self.output, record.line)?;
             write!(
@@ -1515,11 +1491,11 @@ impl Emitter<'_, '_> {
                 record.line_number, record.byte_offset
             )?;
             self.output.write_all(b"\n")
-        } else if !printer.locates_matches {
+        } else if !config.locates_matches {
             // An inverted match holds no position, so it carries no submatches.
             self.output
                 .write_all(br#"{"type":"match","data":{"path":"#)?;
-            json_text_field_to(self.output, filename.as_bytes())?;
+            json_text_field_to(self.output, name.as_bytes())?;
             self.output.write_all(br#","lines":"#)?;
             json_text_field_to(self.output, record.line)?;
             write!(
@@ -1531,7 +1507,7 @@ impl Emitter<'_, '_> {
         } else {
             self.output
                 .write_all(br#"{"type":"match","data":{"path":"#)?;
-            json_text_field_to(self.output, filename.as_bytes())?;
+            json_text_field_to(self.output, name.as_bytes())?;
             self.output.write_all(br#","lines":"#)?;
             json_text_field_to(self.output, record.line)?;
             write!(
@@ -1560,21 +1536,21 @@ impl Emitter<'_, '_> {
 
     /// Write a line's content, reduced to the matches themselves under `--show matches`.
     fn write_content(&mut self, record: LineRecord, body: &[u8]) -> io::Result<()> {
-        let (search, printer) = (self.search, self.printer);
-        if !(printer.only_matches && record.is_match && printer.locates_matches) {
+        let (search, config) = (self.search, self.config);
+        if !(config.only_matches && record.is_match && config.locates_matches) {
             return self.write_trimmed(body);
         }
         for (index, found) in search.matcher.matches(record.line).enumerate() {
             if index > 0 {
-                self.output.write_all(&[printer.terminator])?;
+                self.output.write_all(&[config.terminator])?;
             }
-            if !printer.colors.match_highlight.is_empty() {
+            if !config.colors.match_highlight.is_empty() {
                 self.output
-                    .write_all(printer.colors.match_highlight.as_bytes())?;
+                    .write_all(config.colors.match_highlight.as_bytes())?;
             }
             self.output.write_all(found.text(record.line))?;
-            if !printer.colors.reset.is_empty() {
-                self.output.write_all(printer.colors.reset.as_bytes())?;
+            if !config.colors.reset.is_empty() {
+                self.output.write_all(config.colors.reset.as_bytes())?;
             }
         }
         Ok(())
@@ -1583,10 +1559,10 @@ impl Emitter<'_, '_> {
     /// Write a whole line, trimmed to `--max-line-length` on a character boundary.
     /// One long minified line would otherwise flood a terminal or a context window.
     fn write_trimmed(&mut self, line: &[u8]) -> io::Result<()> {
-        let Some(limit) = self.printer.max_line_length else {
+        let Some(limit) = self.config.max_line_length else {
             return self.output.write_all(line);
         };
-        let (kept, trimmed) = trim_to_limit(line, limit, self.printer.character_units);
+        let (kept, trimmed) = trim_to_limit(line, limit, self.config.character_units);
         self.output.write_all(kept)?;
         if trimmed {
             self.output.write_all(b" [...]")?;
@@ -1597,18 +1573,18 @@ impl Emitter<'_, '_> {
     /// Write a whole multi-line region verbatim, which is what `--multiline` prints when
     /// no per-line prefix is asked for.
     fn region(&mut self, region: &[u8]) -> io::Result<()> {
-        let (filename, printer) = (self.filename, self.printer);
-        if printer.show_filename {
+        let (name, config) = (self.name, self.config);
+        if config.show_name {
             write!(
                 self.output,
                 "{}{}{}:",
-                printer.colors.filename, filename, printer.colors.reset
+                config.colors.name, name, config.colors.reset
             )?;
         }
         self.output.write_all(region)?;
         // An input whose last line is unterminated still prints as a whole line.
         if !region.ends_with(b"\n") {
-            self.output.write_all(&[printer.terminator])?;
+            self.output.write_all(&[config.terminator])?;
         }
         Ok(())
     }
@@ -1619,7 +1595,7 @@ impl Emitter<'_, '_> {
 fn highlight_line<'b>(
     line: &[u8],
     search: &Search,
-    printer: &Printer,
+    config: &OutputConfig,
     buffer: &'b mut Vec<u8>,
 ) -> Option<&'b [u8]> {
     // Peeked before the buffer is touched: a line with no match is printed as it stands.
@@ -1632,9 +1608,9 @@ fn highlight_line<'b>(
     let mut last_end = 0;
     for found in matches {
         buffer.extend_from_slice(&line[last_end..found.offset]);
-        buffer.extend_from_slice(printer.colors.match_highlight.as_bytes());
+        buffer.extend_from_slice(config.colors.match_highlight.as_bytes());
         buffer.extend_from_slice(found.text(line));
-        buffer.extend_from_slice(printer.colors.reset.as_bytes());
+        buffer.extend_from_slice(config.colors.reset.as_bytes());
         last_end = found.offset + found.length;
     }
     buffer.extend_from_slice(&line[last_end..]);
@@ -1644,22 +1620,22 @@ fn highlight_line<'b>(
 /// Close the JSON Lines record for a file that opened one, once every window is done.
 fn print_json_end(
     output: &mut dyn Write,
-    filename: &str,
+    name: &str,
     path: &SearchPath,
-    progress: &Progress,
+    state: &FindState,
 ) -> io::Result<()> {
-    let Some(printer) = path.printer() else {
+    let Some(config) = path.config() else {
         return Ok(());
     };
-    if printer.output_format != OutputFormat::Json || !progress.printed_heading {
+    if config.output_format != OutputFormat::Json || !state.printed_heading {
         return Ok(());
     }
     output.write_all(br#"{"type":"end","data":{"path":"#)?;
-    json_text_field_to(output, filename.as_bytes())?;
+    json_text_field_to(output, name.as_bytes())?;
     write!(
         output,
         r#","stats":{{"matches":{},"lines_searched":{}}}}}}}"#,
-        progress.match_count, progress.lines_searched
+        state.match_count, state.lines_searched
     )?;
     output.write_all(b"\n")
 }
@@ -1683,7 +1659,7 @@ struct Outcome {
     summary: Summary,
     max_reached: bool,
     /// Whether the run produced the thing `--show` asks for.
-    found: bool,
+    emitted: bool,
     read_any: bool,
     failed_any: bool,
 }
@@ -1711,7 +1687,7 @@ impl Session<'_> {
     fn report(
         &self,
         output: &mut dyn Write,
-        filename: &str,
+        name: &str,
         result: &FileResult,
         outcome: &mut Outcome,
     ) -> io::Result<()> {
@@ -1724,25 +1700,25 @@ impl Session<'_> {
         }
 
         match self.show {
-            Show::Lines | Show::Matches => outcome.found |= matched,
+            Show::Lines | Show::Matches => outcome.emitted |= matched,
             Show::Count => {
-                outcome.found |= matched;
+                outcome.emitted |= matched;
                 // Only files with matches are reported over a walk, as `grep -c` and
                 // `rg -c` do: listing every `path:0` buries the answer.
                 if matched || !self.named {
-                    self.write_count(output, filename, result.match_count)?;
+                    self.write_count(output, name, result.match_count)?;
                 }
             }
             Show::Files => {
-                outcome.found |= matched;
+                outcome.emitted |= matched;
                 if matched {
-                    self.write_path(output, filename)?;
+                    self.write_path(output, name)?;
                 }
             }
             Show::FilesWithout => {
                 if !matched {
-                    outcome.found = true;
-                    self.write_path(output, filename)?;
+                    outcome.emitted = true;
+                    self.write_path(output, name)?;
                 }
             }
         }
@@ -1750,14 +1726,14 @@ impl Session<'_> {
     }
 
     /// Emit one input's matching-line count.
-    fn write_count(&self, output: &mut dyn Write, filename: &str, count: usize) -> io::Result<()> {
+    fn write_count(&self, output: &mut dyn Write, name: &str, count: usize) -> io::Result<()> {
         if self.format == Format::Json {
             output.write_all(br#"{"type":"count","data":{"path":"#)?;
-            json_text_field_to(output, filename.as_bytes())?;
+            json_text_field_to(output, name.as_bytes())?;
             return writeln!(output, r#","count":{}}}}}"#, count);
         }
         if self.named {
-            write!(output, "{}:{}", filename, count)?;
+            write!(output, "{}:{}", name, count)?;
         } else {
             write!(output, "{}", count)?;
         }
@@ -1765,13 +1741,13 @@ impl Session<'_> {
     }
 
     /// Emit one input's name.
-    fn write_path(&self, output: &mut dyn Write, filename: &str) -> io::Result<()> {
+    fn write_path(&self, output: &mut dyn Write, name: &str) -> io::Result<()> {
         if self.format == Format::Json {
             output.write_all(br#"{"type":"file","data":{"path":"#)?;
-            json_text_field_to(output, filename.as_bytes())?;
+            json_text_field_to(output, name.as_bytes())?;
             return output.write_all(b"}}\n");
         }
-        output.write_all(filename.as_bytes())?;
+        output.write_all(name.as_bytes())?;
         output.write_all(&[self.terminator])
     }
 }
@@ -1807,7 +1783,7 @@ fn search_stdin(
             if session.skips(data) {
                 return Ok(());
             }
-            search_slice(
+            search_data(
                 data,
                 STDIN_NAME,
                 search,
@@ -1841,7 +1817,7 @@ fn search_stdin(
 /// Search every file one input names, which is the input itself when it is a file.
 fn search_tree(
     session: &Session,
-    args: &Args,
+    traversal: &TraversalOptions<'_>,
     globs: Option<&[glob::Pattern]>,
     input: &str,
     output: &mut dyn Write,
@@ -1854,7 +1830,7 @@ fn search_tree(
         return Ok(());
     }
 
-    for entry in build_walker(input, args) {
+    for entry in walker(Path::new(input), traversal, "sz-find") {
         if outcome.max_reached {
             break;
         }
@@ -1898,56 +1874,18 @@ fn search_tree(
             continue;
         }
 
-        let filename = entry.path().to_string_lossy();
-        let result = search_slice(
+        let name = entry.path().to_string_lossy();
+        let result = search_data(
             data,
-            &filename,
+            &name,
             &session.search,
             &session.path,
             output,
             &mut outcome.max_reached,
         )?;
-        session.report(output, &filename, &result, outcome)?;
+        session.report(output, &name, &result, outcome)?;
     }
     Ok(())
-}
-
-/// Build the directory walker with all filters
-fn build_walker(input: &str, args: &Args) -> ignore::Walk {
-    let mut builder = WalkBuilder::new(input);
-
-    builder
-        .hidden(!args.hidden)
-        .git_ignore(!args.no_ignore)
-        .git_global(!args.no_ignore)
-        .git_exclude(!args.no_ignore)
-        .follow_links(args.follow);
-
-    if let Some(depth) = args.max_depth {
-        builder.max_depth(Some(depth));
-    }
-
-    // Add file type filters
-    if let Some(ref types) = args.file_type {
-        let mut types_builder = ignore::types::TypesBuilder::new();
-        types_builder.add_defaults();
-        for t in types {
-            types_builder.select(t);
-        }
-        match types_builder.build() {
-            Ok(types_matcher) => {
-                builder.types(types_matcher);
-            }
-            Err(e) => {
-                eprintln!("sz-find: warning: invalid file type filter: {}", e);
-            }
-        }
-    }
-
-    // Note: glob filtering is handled manually in the main loop
-    // since WalkBuilder doesn't have a direct glob filter API
-
-    builder.build()
 }
 
 /// Report the run's totals, on stdout beside the records they describe. Under
@@ -2029,7 +1967,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
             .any(|input| input != "-" && Path::new(input).is_dir());
 
     let pattern = args.pattern.as_bytes();
-    let unicode = uses_unicode(args);
+    let unicode = uses_unicode(args.utf8, args.ignore_case);
     let session = Session {
         search: Search {
             matcher: Matcher {
@@ -2044,7 +1982,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
             max_matches: args.max_matches.map(NonZeroUsize::get),
         },
         // One dispatch decision for the whole run: what the per-line loop remembers.
-        path: SearchPath::choose(args, show, context, named),
+        path: SearchPath::choose(args, show, context, named, io::stdout().is_terminal()),
         show,
         format: args.format,
         terminator: Terminator::from_null(args.null).as_byte(),
@@ -2067,6 +2005,14 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
             .collect::<Vec<_>>()
     });
 
+    let traversal = TraversalOptions {
+        hidden: args.hidden,
+        no_ignore: args.no_ignore,
+        follow: args.follow,
+        max_depth: args.max_depth,
+        file_type: args.file_type.as_deref(),
+    };
+
     let mut outcome = Outcome::default();
     for input in &args.inputs {
         if outcome.max_reached {
@@ -2079,7 +2025,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         } else {
             search_tree(
                 &session,
-                args,
+                &traversal,
                 globs.as_deref(),
                 input,
                 output,
@@ -2098,7 +2044,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     if outcome.failed_any && !outcome.read_any {
         return Ok(Status::Error);
     }
-    Ok(Status::from_found(outcome.found))
+    Ok(Status::from_found(outcome.emitted))
 }
 
 // region: Tests
@@ -2123,11 +2069,11 @@ mod tests {
         }
     }
 
-    fn make_printer() -> Printer {
-        Printer {
+    fn make_config() -> OutputConfig {
+        OutputConfig {
             output_format: OutputFormat::Standard,
             colors: Colors::disabled(),
-            show_filename: false,
+            show_name: false,
             line_numbers: false,
             column_numbers: false,
             byte_offsets: false,
@@ -2144,7 +2090,7 @@ mod tests {
     fn search_whole(data: &[u8], search: &Search, path: &SearchPath) -> (Vec<u8>, usize, usize) {
         let mut output = Vec::new();
         let mut max_reached = false;
-        let result = search_slice(
+        let result = search_data(
             data,
             "test.txt",
             search,
@@ -2398,14 +2344,14 @@ mod tests {
     #[test]
     fn tallies_silently_under_quiet() {
         let args = Args::try_parse_from(["sz-find", "--quiet", "error", "log.txt"]).unwrap();
-        let path = SearchPath::choose(&args, Show::Lines, Context::none(), false);
+        let path = SearchPath::choose(&args, Show::Lines, Context::none(), false, false);
         assert!(matches!(
             path,
             SearchPath::Tally {
                 stop_at_first: true
             }
         ));
-        assert!(path.printer().is_none());
+        assert!(path.config().is_none());
     }
 
     /// A session reporting `show` records in `format`, over a single unnamed input.
@@ -2435,7 +2381,7 @@ mod tests {
             .report(&mut output, "log.txt", &result, &mut outcome)
             .unwrap();
         assert_eq!(
-            outcome.found,
+            outcome.emitted,
             match_count > 0 || session.show == Show::FilesWithout
         );
         output
@@ -2472,12 +2418,12 @@ mod tests {
         );
 
         // `--null` reaches the printed lines too, where grep's `-Z` stops at file names.
-        let mut printer = make_printer();
-        printer.terminator = 0;
+        let mut config = make_config();
+        config.terminator = 0;
         let (printed, ..) = search_whole(
             b"error one\nplain\nerror two\n",
             &make_search(b"error"),
-            &SearchPath::Print(printer),
+            &SearchPath::Print(config),
         );
         assert_eq!(printed, b"error one\0error two\0");
     }
@@ -2586,11 +2532,11 @@ mod tests {
     fn reports_matching_line() {
         let data = b"line1\nerror here\nline3\n";
         let search = make_search(b"error");
-        let path = SearchPath::Print(make_printer());
+        let path = SearchPath::Print(make_config());
         let mut max_reached = false;
         let mut output = Vec::new();
 
-        let result = search_slice(
+        let result = search_data(
             data,
             "test.txt",
             &search,
@@ -2613,11 +2559,11 @@ mod tests {
             before: 1,
             after: 1,
         };
-        let path = SearchPath::PrintContext(make_printer(), context);
+        let path = SearchPath::PrintContext(make_config(), context);
         let mut max_reached = false;
         let mut output = Vec::new();
 
-        search_slice(
+        search_data(
             data,
             "test.txt",
             &search,
@@ -2638,11 +2584,11 @@ mod tests {
         let data = b"error1\nerror2\nerror3\nerror4\n";
         let mut search = make_search(b"error");
         search.max_matches = Some(2);
-        let path = SearchPath::Print(make_printer());
+        let path = SearchPath::Print(make_config());
         let mut max_reached = false;
         let mut output = Vec::new();
 
-        let result = search_slice(
+        let result = search_data(
             data,
             "test.txt",
             &search,
@@ -2666,7 +2612,7 @@ mod tests {
         let mut max_reached = false;
         let mut output = Vec::new();
 
-        let result = search_slice(
+        let result = search_data(
             data,
             "test.txt",
             &search,
@@ -2691,7 +2637,7 @@ mod tests {
         let mut max_reached = false;
         let mut output = Vec::new();
 
-        let result = search_slice(
+        let result = search_data(
             data,
             "test.txt",
             &search,
@@ -2714,11 +2660,11 @@ mod tests {
                 stop_at_first: true
             }
         ));
-        assert!(can_stream(&search, &SearchPath::Print(make_printer())));
+        assert!(can_stream(&search, &SearchPath::Print(make_config())));
         assert!(can_stream(
             &search,
             &SearchPath::PrintContext(
-                make_printer(),
+                make_config(),
                 Context {
                     before: 0,
                     after: 3
@@ -2728,7 +2674,7 @@ mod tests {
         assert!(!can_stream(
             &search,
             &SearchPath::PrintContext(
-                make_printer(),
+                make_config(),
                 Context {
                     before: 1,
                     after: 0
@@ -2741,19 +2687,19 @@ mod tests {
     fn wraps_matches_in_color_codes() {
         let line = b"hello world hello";
         let search = make_search(b"hello");
-        let mut printer = make_printer();
-        printer.colors = Colors::enabled();
-        printer.highlight = true;
+        let mut config = make_config();
+        config.colors = Colors::enabled();
+        config.highlight = true;
 
         let mut buffer = Vec::new();
-        let highlighted = highlight_line(line, &search, &printer, &mut buffer).unwrap();
+        let highlighted = highlight_line(line, &search, &config, &mut buffer).unwrap();
         let result = String::from_utf8(highlighted.to_vec()).unwrap();
 
         assert!(result.contains("\x1b[1;31m")); // Contains highlight
         assert!(result.contains("\x1b[0m")); // Contains reset
 
         // A line without a match leaves the buffer alone, so the caller prints the line.
-        assert!(highlight_line(b"nothing here", &search, &printer, &mut buffer).is_none());
+        assert!(highlight_line(b"nothing here", &search, &config, &mut buffer).is_none());
     }
 
     #[test]
@@ -2762,15 +2708,15 @@ mod tests {
         // each. `grep -bo` puts the first at byte 5, which is column 6.
         let data = b"lead error one error two\n";
         let search = make_search(b"error");
-        let mut printer = make_printer();
-        printer.column_numbers = true;
+        let mut config = make_config();
+        config.column_numbers = true;
 
-        let (plain, ..) = search_whole(data, &search, &SearchPath::Print(printer));
+        let (plain, ..) = search_whole(data, &search, &SearchPath::Print(config));
         assert_eq!(plain, b"6:lead error one error two\n");
 
-        printer.colors = Colors::enabled();
-        printer.highlight = true;
-        let (colored, ..) = search_whole(data, &search, &SearchPath::Print(printer));
+        config.colors = Colors::enabled();
+        config.highlight = true;
+        let (colored, ..) = search_whole(data, &search, &SearchPath::Print(config));
         let colored = String::from_utf8(colored).unwrap();
         assert!(
             colored.starts_with("\x1b[32m6\x1b[0m:"),
@@ -2784,11 +2730,11 @@ mod tests {
         let data = b"hello\nworld\nfoo bar\n";
         let mut search = make_search(b"hello\nworld");
         search.multiline = true;
-        let path = SearchPath::Print(make_printer());
+        let path = SearchPath::Print(make_config());
         let mut max_reached = false;
         let mut output = Vec::new();
 
-        let result = search_slice(
+        let result = search_data(
             data,
             "test.txt",
             &search,
@@ -2812,13 +2758,13 @@ mod tests {
             after: 1,
         };
 
-        let path = SearchPath::PrintContext(make_printer(), context);
+        let path = SearchPath::PrintContext(make_config(), context);
         let (printed, ..) = search_whole(data, &search, &path);
         assert_eq!(printed, b"\nbeta MATCH here\n\n");
 
-        let mut printer = make_printer();
-        printer.line_numbers = true;
-        let path = SearchPath::PrintContext(printer, context);
+        let mut config = make_config();
+        config.line_numbers = true;
+        let path = SearchPath::PrintContext(config, context);
         let (numbered, ..) = search_whole(data, &search, &path);
         assert_eq!(numbered, b"2:\n3:beta MATCH here\n4:\n");
     }
@@ -2830,7 +2776,7 @@ mod tests {
         let data = b"MATCH l1\nl2\nl3\nl4\nl5 MATCH\nl6\n";
         let mut search = make_search(b"MATCH");
         search.multiline = true;
-        let path = SearchPath::Print(make_printer());
+        let path = SearchPath::Print(make_config());
 
         let (printed, ..) = search_whole(data, &search, &path);
         assert_eq!(printed, b"MATCH l1\nl5 MATCH\n");
@@ -2847,7 +2793,7 @@ mod tests {
             before: 1,
             after: 1,
         };
-        let path = SearchPath::PrintContext(make_printer(), context);
+        let path = SearchPath::PrintContext(make_config(), context);
 
         let (printed, ..) = search_whole(data, &search, &path);
         assert_eq!(printed, b"MATCH one\n\n\nMATCH two\n");
@@ -2863,7 +2809,7 @@ mod tests {
             before: 1,
             after: 1,
         };
-        let path = SearchPath::PrintContext(make_printer(), context);
+        let path = SearchPath::PrintContext(make_config(), context);
 
         let (by_line, ..) = search_whole(data, &search, &path);
         search.multiline = true;
@@ -2886,7 +2832,7 @@ mod tests {
             before: 1,
             after: 1,
         };
-        let path = SearchPath::PrintContext(make_printer(), context);
+        let path = SearchPath::PrintContext(make_config(), context);
 
         let (by_line, ..) = search_whole(data, &search, &path);
         search.multiline = true;
@@ -2957,7 +2903,7 @@ mod tests {
 
         for (data, before, after, expected) in cases {
             let search = make_search(b"MATCH");
-            let path = SearchPath::PrintContext(make_printer(), Context { before, after });
+            let path = SearchPath::PrintContext(make_config(), Context { before, after });
             let (printed, ..) = search_whole(data, &search, &path);
             assert_eq!(
                 String::from_utf8_lossy(&printed),
@@ -2975,7 +2921,7 @@ mod tests {
         let data = b"alpha\nbeta MATCH one\ngamma\ndelta\nepsilon\nzeta MATCH two\neta\n";
         let mut search = make_search(b"MATCH");
         search.multiline = true;
-        let path = SearchPath::Print(make_printer());
+        let path = SearchPath::Print(make_config());
 
         let (printed, ..) = search_whole(data, &search, &path);
         assert_eq!(printed, b"beta MATCH one\nzeta MATCH two\n");
@@ -3009,9 +2955,9 @@ mod tests {
         }
         let mut search = make_search(b"MATCH");
         search.multiline = true;
-        let mut printer = make_printer();
-        printer.line_numbers = true;
-        let path = SearchPath::Print(printer);
+        let mut config = make_config();
+        config.line_numbers = true;
+        let path = SearchPath::Print(config);
 
         let (printed, matches, _) = search_whole(&data, &search, &path);
         assert_eq!(matches, 200);
@@ -3028,7 +2974,7 @@ mod tests {
     #[test]
     fn never_streams_a_multiline_search() {
         let mut search = make_search(b"error");
-        let path = SearchPath::Print(make_printer());
+        let path = SearchPath::Print(make_config());
         assert!(can_stream(&search, &path));
 
         search.multiline = true;
@@ -3037,14 +2983,14 @@ mod tests {
 
     #[test]
     fn streams_the_same_output_at_tiny_capacities() {
-        let printer = make_printer();
+        let config = make_config();
         let paths = [
             SearchPath::Tally {
                 stop_at_first: false,
             },
-            SearchPath::Print(printer),
+            SearchPath::Print(config),
             SearchPath::PrintContext(
-                printer,
+                config,
                 Context {
                     before: 0,
                     after: 2,
@@ -3067,11 +3013,11 @@ mod tests {
 
     #[test]
     fn keeps_line_numbers_and_offsets_absolute_across_windows() {
-        let mut printer = make_printer();
-        printer.line_numbers = true;
-        printer.byte_offsets = true;
-        printer.column_numbers = true;
-        let path = SearchPath::Print(printer);
+        let mut config = make_config();
+        config.line_numbers = true;
+        config.byte_offsets = true;
+        config.column_numbers = true;
+        let path = SearchPath::Print(config);
         let search = make_search(b"error");
 
         let (expected, ..) = search_whole(SEAM_CORPUS, &search, &path);
@@ -3089,9 +3035,9 @@ mod tests {
 
     #[test]
     fn opens_and_closes_one_json_record_per_streamed_file() {
-        let mut printer = make_printer();
-        printer.output_format = OutputFormat::Json;
-        let path = SearchPath::Print(printer);
+        let mut config = make_config();
+        config.output_format = OutputFormat::Json;
+        let path = SearchPath::Print(config);
         let search = make_search(b"error");
 
         let (streamed, ..) = search_streamed(SEAM_CORPUS, 7, &search, &path);
@@ -3104,9 +3050,9 @@ mod tests {
     fn opens_and_closes_one_json_record_per_multiline_file() {
         // A JSON consumer reads one record shape, whether or not `--multiline` was given.
         let data = b"alpha\nbeta MATCH one\ngamma\ndelta MATCH two\n";
-        let mut printer = make_printer();
-        printer.output_format = OutputFormat::Json;
-        let path = SearchPath::Print(printer);
+        let mut config = make_config();
+        config.output_format = OutputFormat::Json;
+        let path = SearchPath::Print(config);
         let mut search = make_search(b"MATCH");
 
         let record_types = |printed: Vec<u8>| -> Vec<String> {
@@ -3129,9 +3075,9 @@ mod tests {
         // `--heading` prints the name as a header rather than as a per-line prefix, and
         // multiline mode reads the same writer, so the header appears there too.
         let data = b"alpha\nbeta MATCH one\ngamma\ndelta MATCH two\n";
-        let mut printer = make_printer();
-        printer.output_format = OutputFormat::Heading;
-        let path = SearchPath::Print(printer);
+        let mut config = make_config();
+        config.output_format = OutputFormat::Heading;
+        let path = SearchPath::Print(config);
         let mut search = make_search(b"MATCH");
         search.multiline = true;
 
@@ -3175,7 +3121,7 @@ mod tests {
         let data = b"error one\nerror two\nerror three\nerror four\n";
         let mut search = make_search(b"error");
         search.max_matches = Some(1);
-        let path = SearchPath::Print(make_printer());
+        let path = SearchPath::Print(make_config());
         // Two lines fit the budget: the second is where the max-count test fires.
         let reader = BudgetedReader {
             data,

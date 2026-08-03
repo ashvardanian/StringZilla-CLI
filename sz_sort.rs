@@ -160,12 +160,7 @@ fn write_line(
     position: usize,
 ) -> io::Result<()> {
     if config.format == Format::Json {
-        output.write_all(br#"{"type":"line","data":{"path":"#)?;
-        json_text_field_to(output, config.path.as_bytes())?;
-        output.write_all(br#","text":"#)?;
-        json_text_field_to(output, line)?;
-        write!(output, r#","line_number":{}}}}}"#, position + 1)?;
-        return output.write_all(b"\n");
+        return write_line_record(output, config.path, line, position);
     }
     output.write_all(line)?;
     output.write_all(&[config.terminator.as_byte()])
@@ -197,7 +192,7 @@ fn write_sorted(
     output: &mut dyn Write,
 ) -> io::Result<usize> {
     let mut previous: Option<&[u8]> = None;
-    let mut written = 0;
+    let mut emitted = 0;
     for &index in permutation {
         let line = line_at(lines, index);
         if config.unique
@@ -206,14 +201,14 @@ fn write_sorted(
             continue;
         }
         previous = Some(line);
-        write_line(output, config, line, written)?;
-        written += 1;
+        write_line(output, config, line, emitted)?;
+        emitted += 1;
     }
     if config.format == Format::Json {
-        write_summary_json(output, config.path, lines.len(), written)?;
+        write_summary_json(output, config.path, lines.len(), emitted)?;
     }
     output.flush()?;
-    Ok(written)
+    Ok(emitted)
 }
 
 /// Check whether `lines` are already in sorted order. Returns the 1-based index
@@ -362,7 +357,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         path: name,
     };
 
-    let written = if args.dry_run || args.quiet {
+    let emitted = if args.dry_run || args.quiet {
         write_sorted(&lines, &permutation, order, &config, &mut io::sink()).at(name)?
     } else if args.in_place {
         let path = args.input.as_deref().expect("validated");
@@ -386,13 +381,13 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     if args.format == Format::Json {
         // The record stream went to a sink, so its closing summary still owes stdout.
         if args.dry_run {
-            write_summary_json(output, name, lines.len(), written).at("-")?;
+            write_summary_json(output, name, lines.len(), emitted).at("-")?;
         }
     } else if args.summary || args.dry_run {
-        println!("{} lines read, {} written", lines.len(), written);
+        println!("{} lines read, {} written", lines.len(), emitted);
     }
     output.flush().at("-")?;
-    Ok(Status::from_found(written > 0))
+    Ok(Status::from_found(emitted > 0))
 }
 
 // endregion: CLI

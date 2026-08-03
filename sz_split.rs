@@ -586,8 +586,8 @@ fn split_at_offsets(
     manifest: &mut dyn Write,
 ) -> Result<usize, Failure> {
     let mut state = SplitState::default();
-    let written = write_ranges(data, cuts, &mut state, config, manifest);
-    finish(written, &mut state, config, manifest)
+    let result = write_ranges(data, cuts, &mut state, config, manifest);
+    finish(result, &mut state, config, manifest)
 }
 
 fn write_ranges(
@@ -700,21 +700,21 @@ fn take_header_streaming<R: Read>(
 }
 
 /// Split a whole buffer, closing the chunk left open at the end.
-fn split_buffer(
+fn split_data(
     data: &[u8],
     config: &SplitConfig,
     manifest: &mut dyn Write,
 ) -> Result<usize, Failure> {
     let mut state = SplitState::default();
-    let written = split_by_ranges(data, &mut state, config, manifest);
-    finish(written, &mut state, config, manifest)
+    let result = split_by_ranges(data, &mut state, config, manifest);
+    finish(result, &mut state, config, manifest)
 }
 
 // region: Streaming
 
 /// Drive [`split_by_ranges`] over a reader, handing it whole-line prefixes of one reused
 /// window so that a pipe costs bounded memory rather than the input's size.
-fn stream_split<R: Read>(
+fn split_stream<R: Read>(
     refill: &mut Refill<R>,
     config: &SplitConfig,
     manifest: &mut dyn Write,
@@ -722,15 +722,15 @@ fn stream_split<R: Read>(
     let mut state = SplitState::default();
     // A `Failure` cannot travel through the window loop's `io::Result`, so a window that
     // fails breaks the loop and hands its error back here.
-    let mut written = Ok(());
+    let mut result = Ok(());
     let read = refill.try_for_each_window(config.newlines.into(), |window| {
-        written = split_by_ranges(window, &mut state, config, manifest);
-        Ok(match written {
+        result = split_by_ranges(window, &mut state, config, manifest);
+        Ok(match result {
             Ok(()) => ControlFlow::Continue(()),
             Err(_) => ControlFlow::Break(()),
         })
     });
-    finish(read.at("-").and(written), &mut state, config, manifest)
+    finish(read.at("-").and(result), &mut state, config, manifest)
 }
 
 // endregion: Streaming
@@ -811,8 +811,8 @@ fn header_exceeds_input(lines: NonZeroUsize) -> Failure {
 fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
-    let named = args.input.as_deref().unwrap_or("-");
-    let input = get_input_streaming(args.input.as_deref()).at(named)?;
+    let name = args.input.as_deref().unwrap_or("-");
+    let input = get_input_streaming(args.input.as_deref()).at(name)?;
 
     // The delimiter outlives the config that borrows it.
     let pattern = args.chunk_pattern.clone().unwrap_or_default();
@@ -831,7 +831,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
 
     // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
     let newlines = Newlines::from_utf8(args.utf8 || args.ignore_case);
-    let written = {
+    let emitted = {
         let mut discarded = io::sink();
         let manifest: &mut dyn Write = match args.manifest {
             Manifest::None => &mut discarded,
@@ -887,7 +887,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
                         let cuts = plan_equal_chunks(data, wanted, newlines)?;
                         split_at_offsets(data, &cuts, &config, manifest)
                     }
-                    None => split_buffer(data, &config, manifest),
+                    None => split_data(data, &config, manifest),
                 }
             }
             InputWindow::Stream(mut refill) => match args.chunk_count {
@@ -898,13 +898,13 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
                      or use --chunk-bytes",
                 )
                 .into()),
-                None => stream_split(&mut refill, &config, manifest),
+                None => split_stream(&mut refill, &config, manifest),
             },
         }?
     };
 
     output.flush().at("-")?;
-    Ok(Status::from_found(written > 0))
+    Ok(Status::from_found(emitted > 0))
 }
 
 fn main() -> std::process::ExitCode {
@@ -1069,7 +1069,7 @@ mod tests {
         };
         // Four-byte lines: two fit the budget exactly, and the tail is its own chunk.
         let data = b"aaa\nbbb\nccc\nddd\neee\n";
-        split_buffer(data, &config, &mut io::sink()).unwrap();
+        split_data(data, &config, &mut io::sink()).unwrap();
         assert_eq!(
             read_chunks(&prefix),
             vec!["aaa\nbbb\n", "ccc\nddd\n", "eee\n"]
@@ -1090,7 +1090,7 @@ mod tests {
             header_lines: 0,
         };
         let data = b"ab\nTHIS-LINE-IS-FAR-TOO-LONG\ncd\n";
-        split_buffer(data, &config, &mut io::sink()).unwrap();
+        split_data(data, &config, &mut io::sink()).unwrap();
         let chunks = read_chunks(&prefix);
         // The long line is over budget and alone, rather than cut in half.
         assert_eq!(chunks[1], "THIS-LINE-IS-FAR-TOO-LONG\n");
@@ -1148,7 +1148,7 @@ mod tests {
         };
         // `--chunk-lines 2` promises two lines of data, so the header rides on top rather
         // than counting as one of them.
-        split_buffer(b"1,a\n2,b\n3,c\n4,d\n", &config, &mut io::sink()).unwrap();
+        split_data(b"1,a\n2,b\n3,c\n4,d\n", &config, &mut io::sink()).unwrap();
         assert_eq!(
             read_chunks(&prefix),
             vec!["id,name\n1,a\n2,b\n", "id,name\n3,c\n4,d\n"]
@@ -1233,7 +1233,7 @@ mod tests {
             needle: Literal::new(b">", false),
         };
         let data = b">seq1\nACGT\n>seq2\nTTTT\n";
-        split_buffer(data, &pattern_config(&prefix, &delimiter), &mut io::sink()).unwrap();
+        split_data(data, &pattern_config(&prefix, &delimiter), &mut io::sink()).unwrap();
         let chunks = read_chunks(&prefix);
         // The delimiter opens its chunk, and the newline before it closes the previous one.
         assert_eq!(chunks, vec![">seq1\nACGT\n", ">seq2\nTTTT\n"]);
@@ -1249,7 +1249,7 @@ mod tests {
         };
         // The `>` inside `x>y` is not a record start, and an unanchored search would split
         // there. Input beginning with the pattern needs no cut, so no empty chunk opens.
-        split_buffer(
+        split_data(
             b">a\nx>y\n>b\n",
             &pattern_config(&prefix, &delimiter),
             &mut io::sink(),
@@ -1268,7 +1268,7 @@ mod tests {
             let delimiter = Delimiter {
                 needle: Literal::new("from ".as_bytes(), ignore_case),
             };
-            split_buffer(data, &pattern_config(&prefix, &delimiter), &mut io::sink()).unwrap();
+            split_data(data, &pattern_config(&prefix, &delimiter), &mut io::sink()).unwrap();
             let chunks = read_chunks(&prefix);
             assert_eq!(chunks.len(), wanted, "{}", name);
             assert_eq!(chunks.concat().as_bytes(), data, "{}", name);
@@ -1284,7 +1284,7 @@ mod tests {
             let delimiter = Delimiter {
                 needle: Literal::new(b">", false),
             };
-            split_buffer(data, &pattern_config(&prefix, &delimiter), &mut io::sink()).unwrap();
+            split_data(data, &pattern_config(&prefix, &delimiter), &mut io::sink()).unwrap();
             read_chunks(&prefix)
         };
 
@@ -1301,7 +1301,7 @@ mod tests {
             };
             let config = pattern_config(&prefix, &delimiter);
             let mut refill = Refill::new(data.as_slice(), capacity);
-            stream_split(&mut refill, &config, &mut io::sink()).unwrap();
+            split_stream(&mut refill, &config, &mut io::sink()).unwrap();
             assert_eq!(read_chunks(&prefix), whole, "capacity {}", capacity);
         }
     }
@@ -1375,7 +1375,7 @@ mod tests {
         let prefix = temp_dir.path().join("test_").to_str().unwrap().to_string();
 
         let data = b"line1\nline2\nline3\nline4\nline5\n";
-        split_buffer(data, &config(&prefix, 2, Newlines::Lf), &mut io::sink()).unwrap();
+        split_data(data, &config(&prefix, 2, Newlines::Lf), &mut io::sink()).unwrap();
 
         // Check first file
         let file1 = fs::read_to_string(format!("{}aa", prefix)).unwrap();
@@ -1401,7 +1401,7 @@ mod tests {
             .to_string();
 
         let data = b"a\nb\nc\n";
-        split_buffer(data, &config(&prefix, 1, Newlines::Lf), &mut io::sink()).unwrap();
+        split_data(data, &config(&prefix, 1, Newlines::Lf), &mut io::sink()).unwrap();
 
         assert_eq!(fs::read_to_string(format!("{}aa", prefix)).unwrap(), "a\n");
         assert_eq!(fs::read_to_string(format!("{}ab", prefix)).unwrap(), "b\n");
@@ -1420,12 +1420,12 @@ mod tests {
 
         // Appending the terminator the input never wrote used to make `cat` differ from it.
         let data = b"line1\nline2";
-        split_buffer(data, &config(&prefix, 1, Newlines::Lf), &mut io::sink()).unwrap();
+        split_data(data, &config(&prefix, 1, Newlines::Lf), &mut io::sink()).unwrap();
         assert_eq!(read_chunks(&prefix), vec!["line1\n", "line2"]);
 
         // Under the LF newline set a lone CR is not a terminator, and is still not rewritten.
         let bare = temp_dir.path().join("cr_").to_str().unwrap().to_string();
-        split_buffer(b"\r", &config(&bare, 1, Newlines::Lf), &mut io::sink()).unwrap();
+        split_data(b"\r", &config(&bare, 1, Newlines::Lf), &mut io::sink()).unwrap();
         assert_eq!(fs::read(format!("{}aa", bare)).unwrap(), b"\r");
     }
 
@@ -1453,7 +1453,7 @@ mod tests {
             header_lines: 0,
         };
 
-        let error = split_buffer(&data, &overflowing, &mut io::sink()).unwrap_err();
+        let error = split_data(&data, &overflowing, &mut io::sink()).unwrap_err();
 
         let message = error.to_string();
         assert!(message.contains("--suffix-length"), "{}", message);
@@ -1481,7 +1481,7 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        split_buffer(
+        split_data(
             data,
             &config(&unicode_prefix, 1, Newlines::Unicode),
             &mut io::sink(),
@@ -1494,7 +1494,7 @@ mod tests {
         );
 
         let byte_prefix = temp_dir.path().join("byte_").to_str().unwrap().to_string();
-        split_buffer(
+        split_data(
             data,
             &config(&byte_prefix, 1, Newlines::Lf),
             &mut io::sink(),
@@ -1523,7 +1523,7 @@ mod tests {
                     .join(format!("w{}{}.", which, name))
                     .display()
                     .to_string();
-                split_buffer(data, &utf8_config(&whole_prefix, mode), &mut io::sink()).unwrap();
+                split_data(data, &utf8_config(&whole_prefix, mode), &mut io::sink()).unwrap();
                 let expected = read_chunks(&whole_prefix);
                 assert_eq!(expected.concat().as_bytes(), data, "{} {}", which, name);
 
@@ -1535,7 +1535,7 @@ mod tests {
                         .display()
                         .to_string();
                     let mut refill = Refill::new(data, capacity);
-                    stream_split(&mut refill, &utf8_config(&prefix, mode), &mut io::sink())
+                    split_stream(&mut refill, &utf8_config(&prefix, mode), &mut io::sink())
                         .unwrap();
                     assert_eq!(
                         read_chunks(&prefix),
@@ -1578,7 +1578,7 @@ mod tests {
                     .unwrap()
                     .to_string();
                 let mut whole_manifest = Vec::new();
-                split_buffer(
+                split_data(
                     data,
                     &config(&whole_prefix, lines_per_file, newlines),
                     &mut whole_manifest,
@@ -1602,7 +1602,7 @@ mod tests {
                         .to_string();
                     let mut streamed_manifest = Vec::new();
                     let mut refill = Refill::new(data, capacity);
-                    stream_split(
+                    split_stream(
                         &mut refill,
                         &config(&prefix, lines_per_file, newlines),
                         &mut streamed_manifest,
@@ -1636,7 +1636,7 @@ mod tests {
         let prefix = temp_dir.path().join("empty_").to_str().unwrap().to_string();
 
         let mut refill = Refill::new(&b""[..], 7);
-        stream_split(
+        split_stream(
             &mut refill,
             &config(&prefix, 2, Newlines::Lf),
             &mut io::sink(),

@@ -16,7 +16,7 @@ It provides the following subcommands:
 
 - [`sz-find`](#sz-find-unicode-aware-substring-search): literal substring search with full Unicode case folding, so `--ignore-case strasse` finds "Straße"
 - [`sz-replace`](#sz-replace-substring-replacement): literal find-and-replace with the same folding, 18x faster than GNU `sed s///g`
-- [`sz-segment-utf8`](#sz-segment-utf8-unicode-text-segmentation): UAX-29 and UAX-14 grapheme, word, and sentence boundaries, matching ICU without linking it
+- [`sz-segment-utf8`](#sz-segment-utf8-unicode-text-segmentation): UAX-29 and UAX-14 grapheme, word, & sentence bounds without ICU
 - [`sz-dedup`](#sz-dedup-deduplicate-lines): drops repeats in input order without sorting, 4x faster than `awk '!seen[$0]++'`
 - [`sz-count`](#sz-count-word-count): `wc` counts about 4x faster than GNU, with `--fields chars` for code points
 - [`sz-sort`](#sz-sort-sort-lines): stable sort in `LC_ALL=C` byte order, 3-4x faster than GNU `sort`

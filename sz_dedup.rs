@@ -301,14 +301,7 @@ fn write_line(
     index: usize,
 ) -> io::Result<()> {
     match config.rendering {
-        Rendering::Json => {
-            output.write_all(br#"{"type":"line","data":{"path":"#)?;
-            json_text_field_to(output, config.path.as_bytes())?;
-            output.write_all(br#","text":"#)?;
-            json_text_field_to(output, line)?;
-            write!(output, r#","line_number":{}}}}}"#, index + 1)?;
-            output.write_all(b"\n")
-        }
+        Rendering::Json => write_line_record(output, config.path, line, index),
         Rendering::Verbatim => output.write_all(span),
         Rendering::Terminated(terminator) => {
             output.write_all(line)?;

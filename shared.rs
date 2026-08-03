@@ -793,6 +793,23 @@ pub fn json_escape_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Write one `{"type":"line","data":{"path":…,"text":…,"line_number":N}}` record.
+///
+/// `index` is zero-based; the record reports it one-based, as every tool numbers lines.
+pub fn write_line_record(
+    output: &mut dyn Write,
+    path: &str,
+    line: &[u8],
+    index: usize,
+) -> io::Result<()> {
+    output.write_all(br#"{"type":"line","data":{"path":"#)?;
+    json_text_field_to(output, path.as_bytes())?;
+    output.write_all(br#","text":"#)?;
+    json_text_field_to(output, line)?;
+    write!(output, r#","line_number":{}}}}}"#, index + 1)?;
+    output.write_all(b"\n")
+}
+
 /// Write the `{"text":"…"}` wrapper that every path and line field uses, falling back to
 /// `{"bytes":"<base64>"}` when the slice is not valid UTF-8.
 ///
@@ -915,6 +932,51 @@ pub fn parse_size(value: &str) -> Result<NonZeroUsize, String> {
 }
 
 // endregion: Argument Parsing
+
+// region: Directory Traversal
+
+/// Which files a walk sees. The five flags every directory-accepting tool shares, lifted out
+/// of `Args` so a walk can be built without knowing what a CLI is.
+#[derive(Clone, Default)]
+pub struct TraversalOptions<'a> {
+    pub hidden: bool,
+    pub no_ignore: bool,
+    pub follow: bool,
+    pub max_depth: Option<usize>,
+    pub file_type: Option<&'a [String]>,
+}
+
+/// Build a walk of `root` under `options`.
+///
+/// An unusable `--type` is reported and dropped rather than aborting the walk, so one bad
+/// filter does not cost the caller every other input; `tool` names the reporter.
+pub fn walker(root: &Path, options: &TraversalOptions<'_>, tool: &str) -> ignore::Walk {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(!options.hidden)
+        .git_ignore(!options.no_ignore)
+        .git_global(!options.no_ignore)
+        .git_exclude(!options.no_ignore)
+        .follow_links(options.follow)
+        .max_depth(options.max_depth);
+
+    if let Some(names) = options.file_type {
+        let mut types = ignore::types::TypesBuilder::new();
+        types.add_defaults();
+        for name in names {
+            types.select(name);
+        }
+        match types.build() {
+            Ok(matcher) => {
+                builder.types(matcher);
+            }
+            Err(error) => eprintln!("{tool}: warning: invalid --type: {error}"),
+        }
+    }
+    builder.build()
+}
+
+// endregion: Directory Traversal
 
 // region: Failure and Exit Conventions
 
@@ -1149,6 +1211,16 @@ mod tests {
 
         assert!(failed.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"original\n");
+    }
+
+    #[test]
+    fn writes_a_one_based_line_record() {
+        let mut output = Vec::new();
+        write_line_record(&mut output, "f.txt", b"hello", 0).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"type\":\"line\",\"data\":{\"path\":{\"text\":\"f.txt\"},\"text\":{\"text\":\"hello\"},\"line_number\":1}}\n"
+        );
     }
 
     #[test]

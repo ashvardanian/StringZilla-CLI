@@ -228,12 +228,7 @@ fn write_row(
     index: usize,
 ) -> io::Result<()> {
     if config.json {
-        output.write_all(br#"{"type":"line","data":{"path":"#)?;
-        json_text_field_to(output, config.path.as_bytes())?;
-        output.write_all(br#","text":"#)?;
-        json_text_field_to(output, line)?;
-        write!(output, r#","line_number":{}}}}}"#, index + 1)?;
-        return output.write_all(b"\n");
+        return write_line_record(output, config.path, line, index);
     }
 
     if config.show_line_numbers {
@@ -287,7 +282,7 @@ fn tail_start_lf(data: &[u8], wanted: NonZeroUsize) -> (usize, usize) {
 
 // region: Forward Selectors
 
-/// What [`extract_forward_rows`] carries between windows, so a second call resumes where the
+/// What [`extract_forward`] carries between windows, so a second call resumes where the
 /// first stopped. `Copy` and lifetime-free, and it allocates nothing.
 #[derive(Clone, Copy, Default)]
 struct RowsState {
@@ -329,7 +324,7 @@ impl ForwardSelector {
 
 /// Write the selected rows of `data`, resuming from `state`. [`ControlFlow::Break`] once the
 /// selector can never match again, which lets a streamed caller stop draining its reader.
-fn extract_forward_rows(
+fn extract_forward(
     data: &[u8],
     selector: &ForwardSelector,
     newlines: Newlines,
@@ -358,7 +353,7 @@ fn extract_forward_rows(
 // endregion: Forward Selectors
 
 /// Extract rows using indices, a range, the tail, or a stride, over one whole slice.
-fn extract_rows_by_selector(
+fn extract_data(
     data: &[u8],
     selector: &RowSelector,
     newlines: Newlines,
@@ -370,8 +365,7 @@ fn extract_rows_by_selector(
     match selector {
         RowSelector::Forward(forward) => {
             // One slice is the whole input, so there is no next window an early stop saves.
-            let _early_stop =
-                extract_forward_rows(data, forward, newlines, config, &mut state, output)?;
+            let _early_stop = extract_forward(data, forward, newlines, config, &mut state, output)?;
         }
         RowSelector::Tail(wanted) => match newlines {
             Newlines::Lf => {
@@ -467,10 +461,10 @@ impl TailRing {
     }
 }
 
-/// Drive [`extract_forward_rows`] over a reader, handing it whole-line prefixes of one
+/// Drive [`extract_forward`] over a reader, handing it whole-line prefixes of one
 /// reused window. The selector's early stop ends the loop, so a bounded request such as
 /// `-r 5` stops reading rather than draining the rest of the stream.
-fn stream_forward_rows<R: Read>(
+fn extract_forward_stream<R: Read>(
     refill: &mut Refill<R>,
     selector: &ForwardSelector,
     newlines: Newlines,
@@ -479,14 +473,14 @@ fn stream_forward_rows<R: Read>(
 ) -> io::Result<usize> {
     let mut state = RowsState::default();
     refill.try_for_each_window(newlines.into(), |window| {
-        extract_forward_rows(window, selector, newlines, config, &mut state, output)
+        extract_forward(window, selector, newlines, config, &mut state, output)
     })?;
     Ok(state.emitted)
 }
 
 /// Drive the tail ring over a reader. A stream cannot be scanned backward, so the last
 /// `wanted` lines are the ones a forward walk still holds when the reader runs out.
-fn stream_tail_rows<R: Read>(
+fn extract_tail_stream<R: Read>(
     refill: &mut Refill<R>,
     wanted: NonZeroUsize,
     newlines: Newlines,
@@ -505,7 +499,7 @@ fn stream_tail_rows<R: Read>(
 
 /// Extract rows from a reader, choosing the ring for `--tail` and the forward walk for the
 /// rest. Line numbers are absolute in both, matching the whole-slice paths.
-fn stream_rows<R: Read>(
+fn extract_stream<R: Read>(
     refill: &mut Refill<R>,
     selector: &RowSelector,
     newlines: Newlines,
@@ -514,9 +508,9 @@ fn stream_rows<R: Read>(
 ) -> io::Result<usize> {
     match selector {
         RowSelector::Forward(forward) => {
-            stream_forward_rows(refill, forward, newlines, config, output)
+            extract_forward_stream(refill, forward, newlines, config, output)
         }
-        RowSelector::Tail(wanted) => stream_tail_rows(refill, *wanted, newlines, config, output),
+        RowSelector::Tail(wanted) => extract_tail_stream(refill, *wanted, newlines, config, output),
     }
 }
 
@@ -556,11 +550,10 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     // Only a pipe streams, so both the reader and the writer of either arm are `-`.
     let emitted = match input.into_window(DEFAULT_WINDOW_BYTES) {
         InputWindow::Whole(source) => {
-            extract_rows_by_selector(source.as_bytes(), &selector, newlines, &config, writer)
-                .at("-")?
+            extract_data(source.as_bytes(), &selector, newlines, &config, writer).at("-")?
         }
         InputWindow::Stream(mut refill) => {
-            stream_rows(&mut refill, &selector, newlines, &config, writer).at("-")?
+            extract_stream(&mut refill, &selector, newlines, &config, writer).at("-")?
         }
     };
 
@@ -603,8 +596,8 @@ mod tests {
         RowSelector::Tail(NonZeroUsize::new(wanted).unwrap())
     }
 
-    /// Extract the same way [`extract_rows_by_selector`] does, but through a window of
-    /// exactly `capacity` bytes.
+    /// Extract the same way [`extract_data`] does, but through a window of exactly
+    /// `capacity` bytes.
     fn extract_streamed(
         data: &[u8],
         capacity: usize,
@@ -614,7 +607,7 @@ mod tests {
     ) -> (Vec<u8>, usize) {
         let mut refill = Refill::new(data, capacity);
         let mut output = Vec::new();
-        let count = stream_rows(&mut refill, selector, newlines, config, &mut output).unwrap();
+        let count = extract_stream(&mut refill, selector, newlines, config, &mut output).unwrap();
         (output, count)
     }
 
@@ -649,7 +642,7 @@ mod tests {
         let data = b"line1\nline2\nline3\n";
         let mut discard = io::sink();
 
-        let emitted = extract_rows_by_selector(
+        let emitted = extract_data(
             data,
             &range(0, 0),
             Newlines::Lf,
@@ -659,7 +652,7 @@ mod tests {
         .unwrap();
         assert!(Status::from_found(emitted > 0) == Status::Success);
 
-        let emitted = extract_rows_by_selector(
+        let emitted = extract_data(
             data,
             &indices(&[998]),
             Newlines::Lf,
@@ -833,8 +826,7 @@ mod tests {
         let selector = indices(&[1]); // line2
 
         let count =
-            extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output)
-                .unwrap();
+            extract_data(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 1);
         assert_eq!(output, b"line2\n");
@@ -848,8 +840,7 @@ mod tests {
         let selector = range(1, 3); // lines 2-4
 
         let count =
-            extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output)
-                .unwrap();
+            extract_data(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 3);
         assert_eq!(output, b"line2\nline3\nline4\n");
@@ -863,8 +854,7 @@ mod tests {
         let selector = tail(2);
 
         let count =
-            extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output)
-                .unwrap();
+            extract_data(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 2);
         assert_eq!(output, b"line4\nline5\n");
@@ -878,8 +868,7 @@ mod tests {
         let selector = every(2); // every 2nd line
 
         let count =
-            extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output)
-                .unwrap();
+            extract_data(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 3);
         assert_eq!(output, b"line2\nline4\nline6\n");
@@ -894,7 +883,7 @@ mod tests {
         let mut config = text_config();
         config.show_line_numbers = true;
 
-        extract_rows_by_selector(data, &selector, Newlines::Lf, &config, &mut output).unwrap();
+        extract_data(data, &selector, Newlines::Lf, &config, &mut output).unwrap();
 
         assert_eq!(output, b"1:line1\n2:line2\n");
     }
@@ -906,7 +895,7 @@ mod tests {
         let mut config = text_config();
         config.terminator = Terminator::Null;
 
-        extract_rows_by_selector(data, &range(0, 1), Newlines::Lf, &config, &mut output).unwrap();
+        extract_data(data, &range(0, 1), Newlines::Lf, &config, &mut output).unwrap();
 
         assert_eq!(output, b"a\0b\0");
     }
@@ -918,7 +907,7 @@ mod tests {
         let mut config = text_config();
         config.json = true;
 
-        extract_rows_by_selector(data, &range(1, 1), Newlines::Lf, &config, &mut output).unwrap();
+        extract_data(data, &range(1, 1), Newlines::Lf, &config, &mut output).unwrap();
 
         assert_eq!(
             String::from_utf8(output).unwrap(),
@@ -938,8 +927,7 @@ mod tests {
         let selector = indices(&[0, 2, 4]); // a, c, e
 
         let count =
-            extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output)
-                .unwrap();
+            extract_data(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 3);
         assert_eq!(output, b"a\nc\ne\n");
@@ -953,8 +941,7 @@ mod tests {
         let selector = range(0, 100); // Request more than exists
 
         let count =
-            extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output)
-                .unwrap();
+            extract_data(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 2); // Only 2 lines exist
     }
@@ -1009,7 +996,7 @@ mod tests {
         let mut config = text_config();
         config.show_line_numbers = true;
 
-        extract_rows_by_selector(data, &tail(2), Newlines::Lf, &config, &mut output).unwrap();
+        extract_data(data, &tail(2), Newlines::Lf, &config, &mut output).unwrap();
 
         assert_eq!(output, b"3:line3\n4:line4\n");
     }
@@ -1019,7 +1006,7 @@ mod tests {
         let data = "line1\u{2028}line2\u{2028}line3\u{2028}".as_bytes();
         let mut output = Vec::new();
 
-        let count = extract_rows_by_selector(
+        let count = extract_data(
             data,
             &tail(2),
             Newlines::Unicode,
@@ -1040,8 +1027,7 @@ mod tests {
         let selector = tail(100);
 
         let count =
-            extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut output)
-                .unwrap();
+            extract_data(data, &selector, Newlines::Lf, &text_config(), &mut output).unwrap();
 
         assert_eq!(count, 2); // Return all lines
         assert_eq!(output, b"line1\nline2\n");
@@ -1081,14 +1067,8 @@ mod tests {
                 for config in [&text_config(), &numbered, &json] {
                     for newlines in [Newlines::Lf, Newlines::Unicode] {
                         let mut expected = Vec::new();
-                        let expected_count = extract_rows_by_selector(
-                            data,
-                            selector,
-                            newlines,
-                            config,
-                            &mut expected,
-                        )
-                        .unwrap();
+                        let expected_count =
+                            extract_data(data, selector, newlines, config, &mut expected).unwrap();
 
                         for capacity in [7, 13, 64, 4096] {
                             let (output, count) =
@@ -1171,8 +1151,7 @@ mod tests {
 
         for selector in [indices(&[4]), range(0, 4)] {
             let mut expected = Vec::new();
-            extract_rows_by_selector(data, &selector, Newlines::Lf, &text_config(), &mut expected)
-                .unwrap();
+            extract_data(data, &selector, Newlines::Lf, &text_config(), &mut expected).unwrap();
 
             let reader = BudgetedReader {
                 data,
@@ -1181,7 +1160,7 @@ mod tests {
             };
             let mut refill = Refill::new(reader, window);
             let mut output = Vec::new();
-            stream_rows(
+            extract_stream(
                 &mut refill,
                 &selector,
                 Newlines::Lf,
@@ -1200,7 +1179,7 @@ mod tests {
         };
         let mut refill = Refill::new(reader, window);
         let mut output = Vec::new();
-        assert!(stream_rows(
+        assert!(extract_stream(
             &mut refill,
             &every(5),
             Newlines::Lf,

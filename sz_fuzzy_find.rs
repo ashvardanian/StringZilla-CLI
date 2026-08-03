@@ -480,7 +480,6 @@ struct OutputConfig {
     /// Prefix each record with its file name, as grep does for multiple inputs.
     prefix: bool,
     json: bool,
-    quiet: bool,
     summary: bool,
     terminator: Terminator,
 }
@@ -803,11 +802,15 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     Ok(())
 }
 
-fn build_device(args: &Args) -> Result<DeviceScope, String> {
+fn build_device(
+    device: Device,
+    threads: Option<usize>,
+    gpu_id: Option<usize>,
+) -> Result<DeviceScope, String> {
     // `DeviceScope::default()` yields a single core; 0 means every core.
-    let cores = args.threads.unwrap_or(0);
-    let result = match args.device.unwrap_or(Device::Auto) {
-        Device::Gpu => DeviceScope::gpu_device(args.gpu_id.unwrap_or(0)),
+    let cores = threads.unwrap_or(0);
+    let result = match device {
+        Device::Gpu => DeviceScope::gpu_device(gpu_id.unwrap_or(0)),
         Device::Cpu | Device::Auto => DeviceScope::cpu_cores(cores),
     };
     result.map_err(|e| format!("{:?}", e))
@@ -833,7 +836,12 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let cost = args.cost.unwrap_or(Cost::Edit);
     let cost_is_edit = args.cost_matrix.is_none() && cost == Cost::Edit;
 
-    let device = build_device(args).map_err(|message| reject(&message))?;
+    let device = build_device(
+        args.device.unwrap_or(Device::Auto),
+        args.threads,
+        args.gpu_id,
+    )
+    .map_err(|message| reject(&message))?;
     let scheme = build_scheme(cost, args.cost_matrix.as_deref())?;
     let sw = SmithWatermanScores::new(
         &device,
@@ -857,7 +865,9 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         lev_utf8,
     };
 
-    let (patterns, inputs) = resolve_positionals(args).map_err(|message| reject(&message))?;
+    let (patterns, inputs) =
+        resolve_positionals(args.pattern.as_deref(), &args.extra, &args.inputs)
+            .map_err(|message| reject(&message))?;
     let queries: Vec<Query> = patterns
         .into_iter()
         .map(|pattern| Query::new(pattern, args.ignore_case))
@@ -876,13 +886,22 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         count: args.show == Some(Show::Count),
         prefix: inputs.len() > 1,
         json: args.format == Some(Format::Json),
-        quiet: args.quiet,
         summary: args.summary,
         terminator: Terminator::from_null(args.null),
     };
 
+    // A quiet run still searches, so the match count that answers it stays honest.
+    let mut discard = io::sink();
+    let writer: &mut dyn Write = if args.quiet {
+        &mut discard
+    } else {
+        &mut *output
+    };
+    let opened = inputs
+        .iter()
+        .map(|name| (name.as_str(), get_input(Some(name))));
     let outcome =
-        search_inputs(output, &inputs, &queries, &engines, &cfg, &output_config).at("-")?;
+        search_inputs(writer, opened, &queries, &engines, &cfg, &output_config).at("-")?;
 
     output.flush().at("-")?;
     if outcome.readable == 0 {
@@ -903,34 +922,40 @@ struct Outcome {
 /// The queries and the input paths, once the positional has been assigned to whichever
 /// of the two it belongs to. Without `--pattern` the positional is the needle; with it,
 /// every positional is a path.
-fn resolve_positionals(args: &Args) -> Result<(Vec<String>, Vec<String>), String> {
-    let mut inputs = args.inputs.clone();
+fn resolve_positionals(
+    pattern: Option<&str>,
+    extra: &[String],
+    inputs: &[String],
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut inputs = inputs.to_vec();
     let mut patterns: Vec<String> = Vec::new();
-    match (&args.pattern, args.extra.is_empty()) {
-        (Some(pattern), true) => patterns.push(pattern.clone()),
-        (Some(path), false) => inputs.insert(0, path.clone()),
+    match (pattern, extra.is_empty()) {
+        (Some(pattern), true) => patterns.push(pattern.to_string()),
+        (Some(path), false) => inputs.insert(0, path.to_string()),
         (None, true) => return Err("no query given; pass a pattern or --pattern".into()),
         (None, false) => {}
     }
-    patterns.extend(args.extra.iter().cloned());
+    patterns.extend(extra.iter().cloned());
     if inputs.is_empty() {
         inputs.push("-".to_string());
     }
     Ok((patterns, inputs))
 }
 
-/// Search every input, warning about the ones that cannot be read and continuing.
-fn search_inputs(
+/// Search every opened input, warning about the ones that could not be opened and continuing.
+fn search_inputs<'a>(
     output: &mut dyn Write,
-    inputs: &[String],
+    inputs: impl IntoIterator<Item = (&'a str, io::Result<InputSource>)>,
     queries: &[Query],
     engines: &Engines,
     cfg: &MatchConfig,
     out_cfg: &OutputConfig,
 ) -> io::Result<Outcome> {
     let mut outcome = Outcome::default();
-    for name in inputs {
-        let input = match get_input(Some(name.as_str())) {
+    let mut seen = 0;
+    for (name, input) in inputs {
+        seen += 1;
+        let input = match input {
             Ok(input) => input,
             Err(error) => {
                 eprintln!("sz-fuzzy-find: {}: {}", name, error);
@@ -951,14 +976,14 @@ fn search_inputs(
                 write_match(output, out_cfg, name, index + 1, line)?;
             }
         }
-        if out_cfg.count && !out_cfg.quiet {
+        if out_cfg.count {
             write_count(output, out_cfg, name, count)?;
         }
         outcome.total += count;
     }
 
-    if out_cfg.summary && !out_cfg.quiet {
-        write_summary(output, out_cfg, &outcome, inputs.len())?;
+    if out_cfg.summary {
+        write_summary(output, out_cfg, &outcome, seen)?;
     }
     Ok(outcome)
 }
@@ -1011,9 +1036,6 @@ fn write_match(
     line_no: usize,
     line: &[u8],
 ) -> io::Result<()> {
-    if cfg.quiet {
-        return Ok(());
-    }
     if cfg.json {
         // Ripgrep's schema, minus `submatches`: fuzzy matching has no exact span.
         output.write_all(br#"{"type":"match","data":{"path":"#)?;
@@ -1087,14 +1109,16 @@ mod tests {
     fn reads_one_file_without_waiting_on_stdin() {
         // The positional is a path once `--pattern` carries the needle, so the input
         // list must not fall back to stdin beside it.
-        let args = Args::try_parse_from(["sz-fuzzy-find", "--pattern", "abc", "file.txt"]).unwrap();
-        let (patterns, inputs) = resolve_positionals(&args).unwrap();
+        let positionals = |argv: &[&str]| {
+            let args = Args::try_parse_from(argv).unwrap();
+            resolve_positionals(args.pattern.as_deref(), &args.extra, &args.inputs).unwrap()
+        };
+        let (patterns, inputs) = positionals(&["sz-fuzzy-find", "--pattern", "abc", "file.txt"]);
         assert_eq!(patterns, ["abc"]);
         assert_eq!(inputs, ["file.txt"]);
 
         // With no positional at all, stdin is still the input.
-        let args = Args::try_parse_from(["sz-fuzzy-find", "--pattern", "abc"]).unwrap();
-        assert_eq!(resolve_positionals(&args).unwrap().1, ["-"]);
+        assert_eq!(positionals(&["sz-fuzzy-find", "--pattern", "abc"]).1, ["-"]);
     }
 
     #[test]
@@ -1166,7 +1190,6 @@ mod tests {
             count: false,
             prefix: false,
             json: true,
-            quiet: false,
             summary: true,
             terminator: Terminator::Newline,
         };
@@ -1190,10 +1213,6 @@ mod tests {
 
     #[test]
     fn keeps_matches_when_one_input_is_missing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let present = dir.path().join("present.txt");
-        std::fs::write(&present, b"colour\n").unwrap();
-
         let engines = engines_for(edit_scheme());
         let cfg = MatchConfig {
             ignore_case: false,
@@ -1208,19 +1227,18 @@ mod tests {
             count: false,
             prefix: false,
             json: false,
-            quiet: false,
             summary: false,
             terminator: Terminator::Newline,
         };
-        let inputs = vec![
-            dir.path().join("missing.txt").display().to_string(),
-            present.display().to_string(),
+        let inputs = [
+            ("missing.txt", Err(io::Error::from(io::ErrorKind::NotFound))),
+            ("present.txt", Ok(InputSource::Buffer(b"colour\n".to_vec()))),
         ];
         let queries = vec![Query::new("color".to_string(), false)];
 
         let mut written = Vec::new();
         let outcome =
-            search_inputs(&mut written, &inputs, &queries, &engines, &cfg, &out_cfg).unwrap();
+            search_inputs(&mut written, inputs, &queries, &engines, &cfg, &out_cfg).unwrap();
         assert_eq!(outcome.readable, 1);
         assert_eq!(outcome.total, 1);
         assert_eq!(written, b"colour\n");

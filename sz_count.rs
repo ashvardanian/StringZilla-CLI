@@ -38,7 +38,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
-use ignore::{Walk, WalkBuilder};
 use stringzilla::sz;
 use stringzilla::sz::StringZillableUnary;
 
@@ -361,7 +360,7 @@ impl Plan {
 }
 
 /// Everything the counting passes need, decided once from `Args`, mirroring the
-/// [`RenderConfig`] the printer is handed.
+/// [`OutputConfig`] the printer is handed.
 #[derive(Clone, Copy)]
 struct Counter {
     mode: Mode,
@@ -613,7 +612,7 @@ fn drained_length<R: Read>(mut refill: Refill<R>) -> io::Result<usize> {
 
 /// Everything the printer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
-struct RenderConfig {
+struct OutputConfig {
     fields: Fields,
     format: Format,
 }
@@ -637,7 +636,7 @@ fn format_human(value: usize) -> String {
 /// Grouped numbers borrow the buffer; the other two forms have to allocate.
 fn format_number<'a>(
     value: usize,
-    config: &RenderConfig,
+    config: &OutputConfig,
     buffer: &'a mut [u8; 26],
 ) -> Cow<'a, str> {
     match config.format {
@@ -669,7 +668,7 @@ struct TableWidths {
 /// A fixed width silently misaligns the moment a count outgrows it.
 fn column_widths<'a>(
     rows: impl Iterator<Item = &'a Counts>,
-    config: &RenderConfig,
+    config: &OutputConfig,
 ) -> [usize; FIELD_COUNT] {
     let mut widths = [0usize; FIELD_COUNT];
     for (index, (header, _)) in Counts::default().columns(config.fields).enumerate() {
@@ -697,7 +696,7 @@ fn name_width<'a>(names: impl Iterator<Item = (&'a str, usize)>) -> usize {
 /// Write the header row
 fn print_header(
     output: &mut dyn Write,
-    config: &RenderConfig,
+    config: &OutputConfig,
     widths: &TableWidths,
 ) -> io::Result<()> {
     write!(output, "{:>width$}", "", width = widths.name)?;
@@ -717,7 +716,7 @@ fn print_row(
     prefix: &str,
     name: &str,
     counts: &Counts,
-    config: &RenderConfig,
+    config: &OutputConfig,
     widths: &TableWidths,
 ) -> io::Result<()> {
     let prefix_width = prefix.chars().count();
@@ -744,7 +743,7 @@ fn print_row(
 /// Write the separator line above the totals
 fn print_separator(
     output: &mut dyn Write,
-    config: &RenderConfig,
+    config: &OutputConfig,
     widths: &TableWidths,
 ) -> io::Result<()> {
     write!(output, "{:>width$}", "", width = widths.name)?;
@@ -761,7 +760,7 @@ fn print_separator(
 fn print_totals(
     output: &mut dyn Write,
     counts: &Counts,
-    config: &RenderConfig,
+    config: &OutputConfig,
     widths: &TableWidths,
 ) -> io::Result<()> {
     write!(output, "{:>width$}", "", width = widths.name)?;
@@ -824,7 +823,7 @@ struct Report {
 }
 
 /// Write the whole report.
-fn render(output: &mut dyn Write, report: &Report, config: &RenderConfig) -> io::Result<()> {
+fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io::Result<()> {
     if config.format == Format::Json {
         for row in &report.rows {
             write_counts_json(output, &row.path, &row.counts, config.fields)?;
@@ -892,34 +891,6 @@ fn render(output: &mut dyn Write, report: &Report, config: &RenderConfig) -> io:
 
 // region: Input Processing
 
-/// Walk `path`, skipping hidden and ignored entries unless the flags say otherwise.
-fn walk(path: &Path, args: &Args) -> Walk {
-    let mut builder = WalkBuilder::new(path);
-    builder
-        .hidden(!args.hidden)
-        .git_ignore(!args.no_ignore)
-        .git_global(!args.no_ignore)
-        .git_exclude(!args.no_ignore)
-        .follow_links(args.follow);
-    if let Some(depth) = args.max_depth {
-        builder.max_depth(Some(depth));
-    }
-    if let Some(names) = &args.file_type {
-        let mut types = ignore::types::TypesBuilder::new();
-        types.add_defaults();
-        for name in names {
-            types.select(name);
-        }
-        match types.build() {
-            Ok(matcher) => {
-                builder.types(matcher);
-            }
-            Err(error) => eprintln!("sz-count: invalid --type: {}", error),
-        }
-    }
-    builder.build()
-}
-
 /// Compile each `--glob` once, so a malformed one is reported here rather than
 /// silently matching nothing on every file of the walk.
 fn compile_globs(patterns: &[String]) -> Vec<glob::Pattern> {
@@ -951,12 +922,12 @@ fn glob_selects(globs: &Option<Vec<glob::Pattern>>, path: &Path) -> bool {
 /// The files a directory holds, sorted, with every walk failure warned about.
 fn walk_files(
     path: &Path,
-    args: &Args,
+    traversal: &TraversalOptions<'_>,
     globs: &Option<Vec<glob::Pattern>>,
     failures: &mut usize,
 ) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    for result in walk(path, args) {
+    for result in walker(path, traversal, "sz-count") {
         match result {
             Ok(entry) if is_readable_entry(&entry) && glob_selects(globs, entry.path()) => {
                 paths.push(entry.path().to_path_buf())
@@ -981,9 +952,9 @@ enum Resolved {
 
 /// Resolve every input, warning on the ones that cannot be stat'ed and counting them,
 /// so a missing file no longer abandons the inputs beside it.
-fn resolve_inputs(args: &Args, failures: &mut usize) -> Vec<Resolved> {
+fn resolve_inputs(inputs: &[String], failures: &mut usize) -> Vec<Resolved> {
     let mut resolved = Vec::new();
-    for input in &args.inputs {
+    for input in inputs {
         if input == "-" {
             resolved.push(Resolved::Stdin);
             continue;
@@ -1028,9 +999,15 @@ fn push_row(
 }
 
 /// Count every input, in the order they were named.
-fn gather(args: &Args, counter: Counter, failures: &mut usize) -> Report {
-    let globs = args.glob.as_deref().map(compile_globs);
-    let resolved = resolve_inputs(args, failures);
+fn gather(
+    inputs: &[String],
+    globs: Option<&[String]>,
+    traversal: &TraversalOptions<'_>,
+    counter: Counter,
+    failures: &mut usize,
+) -> Report {
+    let globs = globs.map(compile_globs);
+    let resolved = resolve_inputs(inputs, failures);
     let mut report = Report {
         rows: Vec::new(),
         total: Counts::default(),
@@ -1045,7 +1022,7 @@ fn gather(args: &Args, counter: Counter, failures: &mut usize) -> Report {
         } else {
             format!("{}/", text)
         });
-        for path in walk_files(directory, args, &globs, failures) {
+        for path in walk_files(directory, traversal, &globs, failures) {
             let name = path
                 .strip_prefix(directory)
                 .unwrap_or(&path)
@@ -1077,7 +1054,7 @@ fn gather(args: &Args, counter: Counter, failures: &mut usize) -> Report {
                 push_row(&mut report, counter, path, name, failures);
             }
             Resolved::Directory(directory) => {
-                for path in walk_files(directory, args, &globs, failures) {
+                for path in walk_files(directory, traversal, &globs, failures) {
                     let name = path.display().to_string();
                     push_row(&mut report, counter, &path, name, failures);
                 }
@@ -1090,7 +1067,8 @@ fn gather(args: &Args, counter: Counter, failures: &mut usize) -> Report {
 /// The status a finished run reports. Nothing readable did not complete; nothing
 /// counted completed and found nothing.
 fn outcome(report: &Report, failures: usize) -> Status {
-    if !report.rows.is_empty() {
+    let emitted = !report.rows.is_empty();
+    if emitted {
         Status::Success
     } else if failures > 0 {
         Status::Error
@@ -1108,12 +1086,26 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let fields = Fields::from_selection(&args.fields);
     let counter = Counter::new(mode, fields);
 
+    let traversal = TraversalOptions {
+        hidden: args.hidden,
+        no_ignore: args.no_ignore,
+        follow: args.follow,
+        max_depth: args.max_depth,
+        file_type: args.file_type.as_deref(),
+    };
+
     let mut failures = 0;
-    let counted = gather(args, counter, &mut failures);
+    let counted = gather(
+        &args.inputs,
+        args.glob.as_deref(),
+        &traversal,
+        counter,
+        &mut failures,
+    );
     let status = outcome(&counted, failures);
 
     if status == Status::Success && !args.quiet {
-        let config = RenderConfig {
+        let config = OutputConfig {
             fields,
             format: args.format,
         };
@@ -1458,7 +1450,13 @@ mod tests {
         let counted = |arguments: &[&str], failures: &mut usize| {
             let args = Args::parse_from(arguments);
             let fields = Fields::from_selection(&args.fields);
-            gather(&args, Counter::new(Mode::Ascii, fields), failures)
+            gather(
+                &args.inputs,
+                None,
+                &TraversalOptions::default(),
+                Counter::new(Mode::Ascii, fields),
+                failures,
+            )
         };
         let directory_path = directory.path().to_str().unwrap();
 

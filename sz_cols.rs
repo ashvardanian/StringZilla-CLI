@@ -206,7 +206,7 @@ impl<'a> ColumnSelection<'a> {
     }
 }
 
-/// What [`extract_cols`] carries between windows, so a second call resumes where the
+/// What [`extract_data`] carries between windows, so a second call resumes where the
 /// first stopped. `Copy` and lifetime-free, and it allocates nothing.
 #[derive(Clone, Copy, Default)]
 struct ColsState {
@@ -273,7 +273,7 @@ fn write_record_json(
 }
 
 /// Extract the selected columns from every complete line in `data`, resuming from `state`.
-fn extract_cols(
+fn extract_data(
     data: &[u8],
     state: &mut ColsState,
     selection: &ColumnSelection,
@@ -311,9 +311,9 @@ fn extract_cols(
 
 // region: Streaming
 
-/// Drive [`extract_cols`] over a reader, handing it whole-line prefixes of one reused
+/// Drive [`extract_data`] over a reader, handing it whole-line prefixes of one reused
 /// window so that a pipe costs bounded memory rather than the input's size.
-fn stream_cols<R: Read>(
+fn extract_stream<R: Read>(
     refill: &mut Refill<R>,
     state: &mut ColsState,
     selection: &ColumnSelection,
@@ -322,7 +322,7 @@ fn stream_cols<R: Read>(
     output: &mut dyn Write,
 ) -> io::Result<()> {
     refill.for_each_window(newlines.into(), |window| {
-        extract_cols(window, state, selection, newlines, config, output)
+        extract_data(window, state, selection, newlines, config, output)
     })
 }
 
@@ -365,7 +365,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let mut state = ColsState::default();
     // Only a pipe streams, so both the reader and the writer of either arm are `-`.
     match input.into_window(DEFAULT_WINDOW_BYTES) {
-        InputWindow::Whole(source) => extract_cols(
+        InputWindow::Whole(source) => extract_data(
             source.as_bytes(),
             &mut state,
             &selection,
@@ -374,7 +374,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
             writer,
         )
         .at("-")?,
-        InputWindow::Stream(mut refill) => stream_cols(
+        InputWindow::Stream(mut refill) => extract_stream(
             &mut refill,
             &mut state,
             &selection,
@@ -408,7 +408,7 @@ mod tests {
 
         let mut state = ColsState::default();
         let mut discard = io::sink();
-        extract_cols(
+        extract_data(
             b"a\tb\n",
             &mut state,
             &selection,
@@ -420,7 +420,7 @@ mod tests {
         assert!(Status::from_found(state.emitted > 0) == Status::Success);
 
         let mut state = ColsState::default();
-        extract_cols(
+        extract_data(
             b"",
             &mut state,
             &selection,
@@ -627,7 +627,7 @@ mod tests {
     ) -> (Vec<u8>, usize) {
         let mut state = ColsState::default();
         let mut output = Vec::new();
-        extract_cols(data, &mut state, selection, newlines, config, &mut output).unwrap();
+        extract_data(data, &mut state, selection, newlines, config, &mut output).unwrap();
         (output, state.emitted)
     }
 
@@ -642,7 +642,7 @@ mod tests {
         let mut refill = Refill::new(data, capacity);
         let mut state = ColsState::default();
         let mut output = Vec::new();
-        stream_cols(
+        extract_stream(
             &mut refill,
             &mut state,
             selection,

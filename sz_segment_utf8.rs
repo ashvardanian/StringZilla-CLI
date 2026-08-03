@@ -28,7 +28,6 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use ignore::WalkBuilder;
 use stringzilla::sz::{
     StringZillableUnary, Utf8Graphemes, Utf8Linebreaks, Utf8Segments, Utf8Sentences,
     Utf8SplitDelimiters, Utf8SplitNewlines, Utf8SplitWhitespaces, Utf8Wordbreaks,
@@ -418,7 +417,7 @@ fn write_count(
 
 /// Segment a whole input. A `--chunk-bytes` budget packs the segments into chunks, which
 /// re-slices the source span and so needs every byte of the input at once.
-fn segment_whole(
+fn segment_data(
     data: &[u8],
     segmentation: Segmentation,
     config: &OutputConfig,
@@ -434,13 +433,13 @@ fn segment_whole(
             chunk_bytes.get(),
             output,
         ),
-        None => segment_data(data, segmentation, config, path_json, 0, output),
+        None => write_segments(data, segmentation, config, path_json, 0, output),
     }
 }
 
 /// Segment `data` and write the records, returning how many were emitted. `base` is where
 /// `data` starts in the input, so a streamed window still reports absolute offsets.
-fn segment_data(
+fn write_segments(
     data: &[u8],
     segmentation: Segmentation,
     config: &OutputConfig,
@@ -533,7 +532,7 @@ fn segment_stream(
     let mut records = 0;
     let mut base = 0;
     refill.for_each_window(segmentation.by.cut_after(), |window| {
-        records += segment_data(window, segmentation, config, path_json, base, output)?;
+        records += write_segments(window, segmentation, config, path_json, base, output)?;
         base += window.len();
         Ok(())
     })?;
@@ -557,17 +556,17 @@ fn segment_input(
     } else {
         get_input(path)?
     };
-    let display = path.unwrap_or("-");
+    let name = path.unwrap_or("-");
 
     // Escape the path once per file, never per segment.
     let mut path_json = Vec::new();
     if config.render == Render::Json {
-        json_text_field_to(&mut path_json, display.as_bytes())?;
+        json_text_field_to(&mut path_json, name.as_bytes())?;
     }
 
     let records = match input.into_window(DEFAULT_WINDOW_BYTES) {
         InputWindow::Whole(source) => {
-            segment_whole(source.as_bytes(), segmentation, config, &path_json, output)?
+            segment_data(source.as_bytes(), segmentation, config, &path_json, output)?
         }
         InputWindow::Stream(mut refill) => {
             segment_stream(&mut refill, segmentation, config, &path_json, output)?
@@ -582,8 +581,8 @@ fn segment_input(
 
 /// Compile each `--glob` once, so a malformed one is reported here rather than silently
 /// matching nothing on every file of the walk.
-fn compile_globs(args: &Args) -> Option<Vec<glob::Pattern>> {
-    args.glob.as_ref().map(|globs| {
+fn compile_globs(globs: Option<&[String]>) -> Option<Vec<glob::Pattern>> {
+    globs.map(|globs| {
         globs
             .iter()
             .filter_map(|glob| match glob::Pattern::new(glob) {
@@ -597,48 +596,21 @@ fn compile_globs(args: &Args) -> Option<Vec<glob::Pattern>> {
     })
 }
 
-/// Build the walker for one directory, with the traversal filters `sz-find` applies.
-fn build_walker(root: &Path, args: &Args) -> ignore::Walk {
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(!args.hidden)
-        .git_ignore(!args.no_ignore)
-        .git_global(!args.no_ignore)
-        .git_exclude(!args.no_ignore)
-        .follow_links(args.follow);
-
-    if let Some(depth) = args.max_depth {
-        builder.max_depth(Some(depth));
-    }
-
-    if let Some(types) = &args.file_type {
-        let mut types_builder = ignore::types::TypesBuilder::new();
-        types_builder.add_defaults();
-        for kind in types {
-            types_builder.select(kind);
-        }
-        match types_builder.build() {
-            Ok(matcher) => {
-                builder.types(matcher);
-            }
-            Err(error) => eprintln!("sz-segment-utf8: invalid --type: {}", error),
-        }
-    }
-
-    builder.build()
-}
-
 /// Collect the files named by the inputs, walking directories with ignore support.
-fn resolve_inputs(args: &Args) -> Vec<String> {
-    let globs = compile_globs(args);
+fn resolve_inputs(
+    inputs: &[String],
+    globs: Option<&[String]>,
+    traversal: &TraversalOptions<'_>,
+) -> Vec<String> {
+    let globs = compile_globs(globs);
     let mut resolved = Vec::new();
-    for input in &args.inputs {
+    for input in inputs {
         let path = Path::new(input);
         if input == "-" || !path.is_dir() {
             resolved.push(input.clone());
             continue;
         }
-        for entry in build_walker(path, args) {
+        for entry in walker(path, traversal, "sz-segment-utf8") {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -683,7 +655,14 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let segmentation = Segmentation::from_args(args);
     let config = OutputConfig::from_args(args);
 
-    let inputs = resolve_inputs(args);
+    let traversal = TraversalOptions {
+        hidden: args.hidden,
+        no_ignore: args.no_ignore,
+        follow: args.follow,
+        max_depth: args.max_depth,
+        file_type: args.file_type.as_deref(),
+    };
+    let inputs = resolve_inputs(&args.inputs, args.glob.as_deref(), &traversal);
     let mut records = 0;
     let mut readable = 0;
 
@@ -734,7 +713,7 @@ mod tests {
     fn whole(data: &[u8], segmentation: Segmentation, config: &OutputConfig) -> (Vec<u8>, usize) {
         let mut output = Vec::new();
         let records =
-            segment_whole(data, segmentation, config, br#"{"text":"-"}"#, &mut output).unwrap();
+            segment_data(data, segmentation, config, br#"{"text":"-"}"#, &mut output).unwrap();
         (output, records)
     }
 
