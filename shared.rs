@@ -7,14 +7,14 @@
 //! attributes prevent warnings for legitimately shared code.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, Write};
 use std::num::{NonZeroUsize, ParseIntError};
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::process;
 use std::sync::OnceLock;
 
-use memmap2::{Mmap, MmapMut};
+use memmap2::Mmap;
 use stringzilla::sz;
 use stringzilla::sz::{FindSplits, StringZillableBinary, StringZillableUnary, Utf8SplitNewlines};
 
@@ -25,8 +25,6 @@ use stringzilla::sz::{FindSplits, StringZillableBinary, StringZillableUnary, Utf
 pub enum InputSource {
     /// Memory-mapped file for zero-copy access (read-only)
     MappedFile(Mmap),
-    /// Mutable memory-mapped file for in-place modification
-    MutableMappedFile(MmapMut, File),
     /// Buffered stdin data
     Buffer(Vec<u8>),
     /// An undrained pipe on stdin, the one source with no whole slice. Produced only
@@ -49,7 +47,6 @@ impl InputSource {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             InputSource::MappedFile(mmap) => &mmap[..],
-            InputSource::MutableMappedFile(mmap, _) => &mmap[..],
             InputSource::Buffer(buf) => buf,
             InputSource::Pipe(_) => {
                 debug_assert!(
@@ -67,28 +64,6 @@ impl InputSource {
         match self {
             InputSource::Pipe(reader) => InputWindow::Stream(Refill::new(reader, capacity)),
             source => InputWindow::Whole(source),
-        }
-    }
-
-    /// Get mutable access to the input data (only for mutable sources)
-    pub fn as_mut_bytes(&mut self) -> Option<&mut [u8]> {
-        match self {
-            InputSource::MutableMappedFile(mmap, _) => Some(&mut mmap[..]),
-            InputSource::Buffer(buf) => Some(&mut buf[..]),
-            InputSource::MappedFile(_) | InputSource::Pipe(_) => None,
-        }
-    }
-
-    /// Flush changes and truncate file to new length.
-    /// Only works for MutableMappedFile; no-op for other variants.
-    pub fn truncate_and_flush(&mut self, new_len: u64) -> io::Result<()> {
-        match self {
-            InputSource::MutableMappedFile(mmap, file) => {
-                mmap.flush()?;
-                file.set_len(new_len)?;
-                Ok(())
-            }
-            _ => Ok(()),
         }
     }
 }
@@ -211,12 +186,94 @@ pub fn is_readable_entry(entry: &ignore::DirEntry) -> bool {
     }
 }
 
-/// Create a mutable InputSource for in-place file modification
+/// Rewrite `path` through a sibling temporary file, renamed over it once the write has
+/// reached the disk, then copied back over the original inode so symlinks and hardlinks
+/// survive. In-place editing that truncates first loses the file outright when the process
+/// dies mid-write; here the complete result exists before the target is touched.
 #[allow(dead_code)]
-pub fn get_input_mutable(path: &str) -> io::Result<InputSource> {
-    let file = OpenOptions::new().read(true).write(true).open(path)?;
-    let mmap = unsafe { MmapMut::map_mut(&file)? };
-    Ok(InputSource::MutableMappedFile(mmap, file))
+pub fn write_replacing<T>(
+    path: &str,
+    write: impl FnOnce(&mut dyn Write) -> io::Result<T>,
+) -> io::Result<T> {
+    // Resolve first: editing through a symlink must change the file it names, not replace
+    // the link with a regular file.
+    let resolved = std::fs::canonicalize(path)?;
+    // Opening for writing now is the authoritative permission check — a read-only target
+    // fails here rather than being silently rewritten — and this handle is where the new
+    // content lands, so the inode and any hardlinks to it survive.
+    let mut target = OpenOptions::new().write(true).open(&resolved)?;
+    let directory = resolved.parent().unwrap_or(Path::new("."));
+    let (mut temporary, temporary_path) = create_temporary(directory)?;
+
+    let written = (|| {
+        let mut writer = BufWriter::new(&mut temporary);
+        let value = write(&mut writer)?;
+        writer.flush()?;
+        drop(writer);
+        temporary.sync_all()?;
+        temporary.seek(io::SeekFrom::Start(0))?;
+        Ok(value)
+    })();
+
+    let value = match written {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+    };
+
+    // The one window where the target is neither the old content nor the new. The complete
+    // result is already durable in the temporary, so a failure here keeps it and names it
+    // rather than deleting the only copy.
+    let copied = (|| {
+        target.set_len(0)?;
+        io::copy(&mut temporary, &mut target)?;
+        target.sync_all()
+    })();
+
+    match copied {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&temporary_path);
+            Ok(value)
+        }
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; the rewritten content is in {}",
+                temporary_path.display()
+            ),
+        )),
+    }
+}
+
+/// Create a fresh temporary in `directory`, readable and writable by its owner alone.
+/// `create_new` refuses both an existing path and a symlink, so a planted link cannot
+/// redirect the write; the nonce keeps concurrent runs in one directory apart.
+fn create_temporary(directory: &Path) -> io::Result<(File, std::path::PathBuf)> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+
+    for attempt in 0..u16::MAX {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let candidate = directory.join(format!(
+            ".sz.{}.{nonce:08x}.{attempt:04x}.tmp",
+            process::id()
+        ));
+        match options.open(&candidate) {
+            Ok(file) => return Ok((file, candidate)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a temporary file",
+    ))
 }
 
 /// Create an output writer from either a file path or stdout
@@ -320,6 +377,61 @@ fn drop_trailing_empty<'a, I: Iterator<Item = &'a [u8]>>(
     Some(line)
 }
 
+/// A byte range, in the coordinates of the buffer it was found in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+pub struct Span {
+    pub offset: usize,
+    pub length: usize,
+}
+
+/// Iterator over lines *with* their terminators, as offsets into the input.
+///
+/// [`LineIter`] drops terminators, so a caller that copies its output cannot reproduce the
+/// input: CRLF, NEL, LS and PS all become whatever the caller writes back. Each span here
+/// runs from a line's first byte to the first byte of the next line, so concatenating every
+/// span reproduces the input exactly.
+#[allow(dead_code)]
+pub struct LineSpans<'a> {
+    data: &'a [u8],
+    lines: LineIter<'a>,
+    pending: Option<&'a [u8]>,
+}
+
+#[allow(dead_code)]
+impl<'a> LineSpans<'a> {
+    pub fn new(data: &'a [u8], newlines: Newlines) -> Self {
+        let mut lines = LineIter::new(data, newlines);
+        let pending = lines.next();
+        Self {
+            data,
+            lines,
+            pending,
+        }
+    }
+}
+
+impl Iterator for LineSpans<'_> {
+    type Item = Span;
+
+    #[inline]
+    fn next(&mut self) -> Option<Span> {
+        let line = self.pending.take()?;
+        let offset = offset_within(self.data, line);
+        self.pending = self.lines.next();
+        // The terminator is whatever separates this line from the next, so the span ends
+        // where the next line begins — or at the input's end for the final line.
+        let end = match self.pending {
+            Some(next) => offset_within(self.data, next),
+            None => self.data.len(),
+        };
+        Some(Span {
+            offset,
+            length: end - offset,
+        })
+    }
+}
+
 /// Byte offset of `segment` within `data`. Segmenters yield borrowed subslices and
 /// expose no offsets accessor, so the pointer difference is the offset.
 #[allow(dead_code)]
@@ -334,55 +446,6 @@ pub fn offset_within(data: &[u8], segment: &[u8]) -> usize {
 }
 
 // endregion: Line Iteration
-
-// region: Literal Search
-
-/// A matched byte range, in the coordinates of the haystack it was found in.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
-pub struct Span {
-    pub offset: usize,
-    pub length: usize,
-}
-
-/// A literal needle in the form its search kernel wants. Case folding is decided once, and
-/// the uncased metadata is analyzed once rather than on every call.
-///
-/// Under folding a match is not the needle's length: the kernel compares folded text, so
-/// "strasse" matches "Straße" and the span is the source bytes, not the needle's. Callers
-/// that compute an offset from a match are unaffected; callers that need to know how far a
-/// match can reach ask [`Literal::max_match_len`].
-#[allow(dead_code)]
-pub struct Literal<'a> {
-    pattern: &'a [u8],
-    folded: Option<sz::Utf8UncasedNeedle<'a>>,
-}
-
-#[allow(dead_code)]
-impl<'a> Literal<'a> {
-    /// Analyze `pattern` once. `ignore_case` selects full Unicode case folding.
-    pub fn new(pattern: &'a [u8], ignore_case: bool) -> Self {
-        Self {
-            pattern,
-            folded: ignore_case.then(|| sz::Utf8UncasedNeedle::new(pattern)),
-        }
-    }
-
-    /// The leftmost match at or after the start of `data`.
-    #[inline]
-    pub fn find_in(&self, data: &[u8]) -> Option<Span> {
-        match &self.folded {
-            Some(needle) => sz::utf8_uncased_search(data, needle)
-                .map(|(offset, length)| Span { offset, length }),
-            None => sz::find(data, self.pattern).map(|offset| Span {
-                offset,
-                length: self.pattern.len(),
-            }),
-        }
-    }
-}
-
-// endregion: Literal Search
 
 // region: Streaming Windows
 
@@ -725,12 +788,41 @@ pub fn json_escape_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
     }
 }
 
-/// Write the `{"text":"…"}` wrapper that every path and line field uses.
+/// Write the `{"text":"…"}` wrapper that every path and line field uses, falling back to
+/// `{"bytes":"<base64>"}` when the slice is not valid UTF-8.
+///
+/// Passing invalid bytes through raw would emit JSON no decoder accepts, and text tools do
+/// meet non-UTF-8 input. The two-arm shape is ripgrep's, which this envelope already follows.
 #[allow(dead_code)]
 pub fn json_text_field_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
+    if std::str::from_utf8(data).is_err() {
+        output.write_all(br#"{"bytes":""#)?;
+        base64_to(output, data)?;
+        return output.write_all(br#""}"#);
+    }
     output.write_all(br#"{"text":""#)?;
     json_escape_to(output, data)?;
     output.write_all(br#""}"#)
+}
+
+/// Standard base64 with padding, written without allocating.
+fn base64_to(output: &mut dyn Write, data: &[u8]) -> io::Result<()> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = [0u8; 4];
+    for group in data.chunks(3) {
+        let bits = group.iter().enumerate().fold(0u32, |bits, (index, byte)| {
+            bits | (u32::from(*byte) << (16 - 8 * index))
+        });
+        for (index, slot) in encoded.iter_mut().enumerate() {
+            *slot = if index <= group.len() {
+                ALPHABET[(bits >> (18 - 6 * index)) as usize & 0x3F]
+            } else {
+                b'='
+            };
+        }
+        output.write_all(&encoded)?;
+    }
+    Ok(())
 }
 
 /// Render `value` with `,` between thousands groups. `usize::MAX` is 20 digits
@@ -756,13 +848,6 @@ pub fn format_grouped_number(buffer: &mut [u8; 26], value: usize) -> &str {
     }
     // Only ASCII digits and commas were written.
     core::str::from_utf8(&buffer[written..]).unwrap_or("")
-}
-
-/// Write `value` with `,` between thousands groups, without allocating.
-#[allow(dead_code)]
-pub fn write_grouped_number(output: &mut dyn Write, value: usize) -> io::Result<()> {
-    let mut buffer = [0u8; 26];
-    output.write_all(format_grouped_number(&mut buffer, value).as_bytes())
 }
 
 // endregion: Machine-Readable Output
@@ -953,6 +1038,23 @@ mod tests {
     }
 
     #[test]
+    fn encodes_invalid_utf8_as_base64_bytes() {
+        let mut output = Vec::new();
+        json_text_field_to(&mut output, b"a\xffb").unwrap();
+        assert_eq!(output, br#"{"bytes":"Yf9i"}"#);
+
+        // Padding: one and two leftover bytes.
+        for (data, expected) in [
+            (b"\xff".as_slice(), br#"{"bytes":"/w=="}"#.as_slice()),
+            (b"\xff\xfe".as_slice(), br#"{"bytes":"//4="}"#.as_slice()),
+        ] {
+            let mut output = Vec::new();
+            json_text_field_to(&mut output, data).unwrap();
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
     fn wraps_json_text_field() {
         let mut output = Vec::new();
         json_text_field_to(&mut output, b"a\"b").unwrap();
@@ -960,9 +1062,27 @@ mod tests {
     }
 
     fn grouped(value: usize) -> String {
-        let mut output = Vec::new();
-        write_grouped_number(&mut output, value).unwrap();
-        String::from_utf8(output).unwrap()
+        let mut buffer = [0u8; 26];
+        format_grouped_number(&mut buffer, value).to_string()
+    }
+
+    #[test]
+    fn line_spans_reproduce_the_input() {
+        // Every terminator width is different, which is the whole reason spans exist:
+        // LF is one byte, CRLF two, LS three.
+        let data = "a\r\nb\u{2028}c\nd".as_bytes();
+        let spans: Vec<Span> = LineSpans::new(data, Newlines::Unicode).collect();
+
+        let joined: Vec<u8> = spans
+            .iter()
+            .flat_map(|span| &data[span.offset..span.offset + span.length])
+            .copied()
+            .collect();
+        assert_eq!(joined, data);
+        assert_eq!(
+            spans.iter().map(|span| span.length).collect::<Vec<_>>(),
+            [3, 4, 2, 1]
+        );
     }
 
     #[test]
@@ -1048,32 +1168,6 @@ mod tests {
             last_cut("a\u{0085}b".as_bytes(), CutAfter::LineTerminators),
             Some(3)
         );
-    }
-
-    #[test]
-    fn finds_literal_spans_cased_and_folded() {
-        let cased = Literal::new(b"ss", false);
-        assert_eq!(
-            cased.find_in(b"aSSbss"),
-            Some(Span {
-                offset: 4,
-                length: 2
-            })
-        );
-
-        // Folded, the span covers the source bytes, so "strasse" reaches "Straße".
-        let folded = Literal::new("strasse".as_bytes(), true);
-        let found = folded.find_in("Bahnhofstraße 5".as_bytes()).unwrap();
-        assert_eq!(found.offset, 7);
-        assert_eq!(found.length, "straße".len());
-
-        // The span need not be the needle's length at all: the one-byte "k" matches the
-        // three-byte KELVIN SIGN, which is the expansion `max_match_len` has to cover.
-        let kelvin = Literal::new(b"k", true);
-        let found = kelvin.find_in("x\u{212A}y".as_bytes()).unwrap();
-        assert_eq!(found.offset, 1);
-        assert_eq!(found.length, "\u{212A}".len());
-        assert!(found.length > kelvin.pattern.len());
     }
 
     #[test]

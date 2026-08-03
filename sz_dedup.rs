@@ -29,28 +29,16 @@
 //! - Grow 2x when load factor exceeds 60%
 //! - Rehash all entries into new larger array
 //!
-//! ## In-Place Compaction
+//! ## In-Place Rewriting
 //!
-//! When modifying a file in-place, the algorithm uses two pointers:
-//!
-//! ```text
-//! read_pos ────────────────────────────►
-//!     ┌────────┬────────┬────────┬────────┬────────┐
-//!     │ line A │ line B │ line A │ line C │ line B │  (input)
-//!     └────────┴────────┴────────┴────────┴────────┘
-//!
-//! write_pos ───────────────►
-//!     ┌────────┬────────┬────────┐
-//!     │ line A │ line B │ line C │  (compacted output)
-//!     └────────┴────────┴────────┘
-//! ```
-//!
-//! **Invariant**: `write_pos ≤ read_pos` always holds, ensuring we never overwrite
-//! unread data. After compaction, the file is truncated to the new length.
+//! `--in-place` writes the surviving lines to a temporary file beside the input and then
+//! copies them back over the original, so the file keeps its identity — symlinks and
+//! hardlinks to it survive — and an interrupted run leaves the input intact. Each line
+//! keeps the terminator it arrived with, so nothing but the duplicates changes.
 //!
 //! ## Case-Insensitive Mode
 //!
-//! For `-i` mode, uses proper Unicode case folding via `utf8_uncased_fold()`:
+//! `--ignore-case` uses proper Unicode case folding via `utf8_uncased_fold()`:
 //!
 //! 1. **Hashing**: Case-fold line into scratch buffer, then hash the folded form
 //! 2. **Collision check**: Use `utf8_uncased_order()` directly on original
@@ -66,22 +54,22 @@
 //! sz-dedup --in-place file.txt
 //!
 //! # Case-insensitive deduplication (full Unicode support)
-//! sz-dedup -i file.txt
+//! sz-dedup --ignore-case file.txt
 //!
 //! # Output to different file (streaming mode)
-//! sz-dedup file.txt -o unique.txt
+//! sz-dedup file.txt --output unique.txt
 //!
 //! # From stdin to stdout
 //! cat file.txt | sz-dedup
 //!
-//! # Show count of unique lines
-//! sz-dedup -c file.txt
+//! # Show one line about the whole run
+//! sz-dedup --summary file.txt
 //! ```
 
 use std::cmp::Ordering;
 use std::io::{self, Write};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz;
 
 mod shared;
@@ -236,91 +224,71 @@ fn lines_equal(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
 
 // region: Deduplication Functions
 
-/// Deduplicate lines in-place, compacting the buffer.
-///
-/// When `utf8` is true, handles all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
-/// When `utf8` is false, only handles LF newlines.
-fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> DedupCounts {
-    // Compaction only overwrites `[0..write_pos]`, which is always behind `line_start`,
-    // so the tail `data[line_start..]` is intact — find each newline lazily there with
-    // no up-front offset buffer.
-    let mut seen = AppendOnlyFlatHashSet::new();
-    let mut scratch = Vec::new();
-    let mut write_pos: usize = 0;
-    let mut unique_count: usize = 0;
-    let mut total_count: usize = 0;
-    let mut line_start: usize = 0;
-
-    while line_start < data.len() {
-        // Next newline in the untouched tail; the final line has none (len 0).
-        let (line_end, newline_len) = if utf8 {
-            // UTF-8 aware: first of the 7 Unicode newline chars, CRLF as one run.
-            match sz::Utf8Newlines::new(&data[line_start..]).next() {
-                Some(run) => (offset_within(data, run), run.len()),
-                None => (data.len(), 0),
-            }
-        } else {
-            match sz::find(&data[line_start..], b"\n") {
-                Some(offset) => (line_start + offset, 1),
-                None => (data.len(), 0),
-            }
-        };
-
-        let line_len = line_end - line_start;
-        let line = &data[line_start..line_end];
-        let hash = compute_hash(line, ignore_case, &mut scratch);
-
-        // Check for duplicate against already-written lines in [0..write_pos].
-        let is_duplicate = seen.contains(hash, line, data, ignore_case);
-
-        if !is_duplicate {
-            seen.insert(hash, write_pos as u64, line_len as u64);
-            if write_pos != line_start {
-                data.copy_within(line_start..line_end, write_pos);
-            }
-            write_pos += line_len;
-            // Preserve the original newline sequence.
-            if newline_len > 0 {
-                data.copy_within(line_end..line_end + newline_len, write_pos);
-                write_pos += newline_len;
-            }
-            unique_count += 1;
-        }
-
-        total_count += 1;
-        line_start = line_end + newline_len;
-    }
-
-    DedupCounts {
-        total: total_count,
-        unique: unique_count,
-        compacted_bytes: write_pos,
-    }
-}
-
-/// How many lines were read, how many survived deduplication, and how many bytes
-/// the survivors occupy.
+/// How many lines were read and how many survived deduplication.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct DedupCounts {
     total: usize,
     unique: usize,
-    /// Length to truncate the file to after in-place compaction. The streaming
-    /// path rewrites nothing and leaves it zero.
-    compacted_bytes: usize,
 }
 
 impl DedupCounts {
-    /// Whether any duplicate was dropped, which is what `-q` reports.
+    /// Whether any duplicate was dropped, which is what `--quiet` reports.
     fn dropped_any(self) -> bool {
         self.unique < self.total
     }
 }
 
+/// Lines paired with the span they occupy, terminator included, so a caller that
+/// rewrites the input can reproduce CR, CRLF, NEL, LS and PS rather than flatten them.
+struct TerminatedLines<'a> {
+    data: &'a [u8],
+    lines: LineIter<'a>,
+    pending: Option<&'a [u8]>,
+}
+
+impl<'a> TerminatedLines<'a> {
+    fn new(data: &'a [u8], newlines: Newlines) -> Self {
+        let mut lines = LineIter::new(data, newlines);
+        let pending = lines.next();
+        Self {
+            data,
+            lines,
+            pending,
+        }
+    }
+}
+
+impl<'a> Iterator for TerminatedLines<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let line = self.pending.take()?;
+        let start = offset_within(self.data, line);
+        self.pending = self.lines.next();
+        let end = match self.pending {
+            Some(next) => offset_within(self.data, next),
+            None => self.data.len(),
+        };
+        Some((line, &self.data[start..end]))
+    }
+}
+
+/// How a surviving line is written out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rendering {
+    /// The line plus the requested terminator, normalizing the input's own.
+    Terminated(Terminator),
+    /// One JSON record per line, closed by a summary record.
+    Json,
+    /// The line exactly as it appeared, terminator and all.
+    Verbatim,
+}
+
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig<'a> {
-    json: bool,
-    terminator: Terminator,
+    rendering: Rendering,
     /// Input name carried into the JSON envelope.
     path: &'a str,
 }
@@ -330,24 +298,39 @@ fn write_line(
     output: &mut dyn Write,
     config: &OutputConfig,
     line: &[u8],
+    span: &[u8],
     index: usize,
 ) -> io::Result<()> {
-    if config.json {
-        output.write_all(br#"{"type":"line","data":{"path":"#)?;
-        json_text_field_to(output, config.path.as_bytes())?;
-        output.write_all(br#","lines":"#)?;
-        json_text_field_to(output, line)?;
-        write!(output, r#","line_number":{}}}}}"#, index + 1)?;
-        return output.write_all(b"\n");
+    match config.rendering {
+        Rendering::Json => {
+            output.write_all(br#"{"type":"line","data":{"path":"#)?;
+            json_text_field_to(output, config.path.as_bytes())?;
+            output.write_all(br#","text":"#)?;
+            json_text_field_to(output, line)?;
+            write!(output, r#","line_number":{}}}}}"#, index + 1)?;
+            output.write_all(b"\n")
+        }
+        Rendering::Verbatim => output.write_all(span),
+        Rendering::Terminated(terminator) => {
+            output.write_all(line)?;
+            output.write_all(&[terminator.as_byte()])
+        }
     }
-    output.write_all(line)?;
-    output.write_all(&[config.terminator.as_byte()])
 }
 
-/// Deduplicate lines, writing to output stream (for stdin or explicit output file).
+/// Write the summary record that closes a JSON stream.
+fn write_summary_json(output: &mut dyn Write, path: &str, counts: DedupCounts) -> io::Result<()> {
+    output.write_all(br#"{"type":"summary","data":{"path":"#)?;
+    json_text_field_to(output, path.as_bytes())?;
+    writeln!(
+        output,
+        r#","unique_lines":{},"total_lines":{}}}}}"#,
+        counts.unique, counts.total
+    )
+}
+
+/// Deduplicate `data` into `output`, keeping the first occurrence of each line.
 /// When `utf8` is true, handles all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
-/// When `utf8` is false, only handles LF newlines.
-/// Output is normalized to LF newlines.
 fn dedup_to_writer(
     data: &[u8],
     output: &mut dyn Write,
@@ -359,9 +342,7 @@ fn dedup_to_writer(
     let mut scratch = Vec::new();
     let mut counts = DedupCounts::default();
 
-    let lines = LineIter::new(data, Newlines::from_utf8(utf8));
-
-    for line in lines {
+    for (line, span) in TerminatedLines::new(data, Newlines::from_utf8(utf8)) {
         counts.total += 1;
         let line_offset = offset_within(data, line);
         let hash = compute_hash(line, ignore_case, &mut scratch);
@@ -370,11 +351,14 @@ fn dedup_to_writer(
 
         if !is_duplicate {
             seen.insert(hash, line_offset as u64, line.len() as u64);
-            write_line(output, config, line, counts.unique)?;
+            write_line(output, config, line, span, counts.unique)?;
             counts.unique += 1;
         }
     }
 
+    if config.rendering == Rendering::Json {
+        write_summary_json(output, config.path, counts)?;
+    }
     output.flush()?;
     Ok(counts)
 }
@@ -382,6 +366,13 @@ fn dedup_to_writer(
 // endregion: Deduplication Functions
 
 // region: CLI
+
+/// How records are rendered.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    Text,
+    Json,
+}
 
 /// Deduplicate lines in files
 #[derive(Parser)]
@@ -391,120 +382,138 @@ struct Args {
     /// Input file (use '-' or omit for stdin)
     input: Option<String>,
 
-    /// Output file (use '-' or omit for stdout, or omit for in-place)
-    #[arg(short, long)]
+    /// Write to this file instead of stdout
+    #[arg(long, conflicts_with_all = ["in_place", "dry_run"])]
     output: Option<String>,
 
-    /// Case-insensitive deduplication (full Unicode case folding)
-    #[arg(short = 'i', long)]
-    ignore_case: bool,
-
-    /// Rewrite the input file in place instead of writing to stdout
-    #[arg(long, conflicts_with_all = ["output", "quiet"])]
+    /// Rewrite the input file itself, so symlinks and hardlinks survive; a failure during the final copy leaves the new content in a named temporary file
+    #[arg(long, conflicts_with_all = ["dry_run", "null", "quiet"])]
     in_place: bool,
 
-    /// Show count of unique lines
-    #[arg(short = 'c', long)]
-    count: bool,
+    /// Deduplicate the input and write nothing
+    #[arg(long)]
+    dry_run: bool,
 
-    /// Enable UTF-8 mode (handle Unicode newlines: CR, CRLF, NEL, LS, PS)
+    /// Fold case when comparing lines; implies --utf8
+    #[arg(long)]
+    ignore_case: bool,
+
+    /// Treat the input as UTF-8 text
     #[arg(long)]
     utf8: bool,
 
-    /// Emit JSON Lines, one record per emitted line
-    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
-    json: bool,
+    /// Render records as plain lines or as JSON Lines
+    #[arg(long, value_enum, default_value_t = Format::Text, help_heading = "Output Formats")]
+    format: Format,
 
-    /// NUL-terminate each output line instead of newline
-    #[arg(short = '0', long, help_heading = "Output Formats")]
+    /// Print one line about the whole run on stdout
+    #[arg(long, conflicts_with = "dry_run", help_heading = "Output Formats")]
+    summary: bool,
+
+    /// NUL-terminate each output record instead of newline
+    #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
-    /// Suppress output; exit 0 if any duplicate was dropped, 1 otherwise
-    #[arg(short = 'q', long, conflicts_with_all = ["output", "json", "null"], help_heading = "Output Formats")]
+    /// Suppress all output; exit 0 if any duplicate was dropped, 1 otherwise
+    #[arg(long, conflicts_with_all = ["output", "dry_run", "null", "summary"], help_heading = "Output Formats")]
     quiet: bool,
 }
 
+/// Report a constraint clap cannot express, rendered as clap renders its own.
+fn reject(message: &str) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+}
+
+/// Name the file a failure happened on, so every diagnostic reads `sz-dedup: <path>: <error>`.
+fn at_path(path: &str) -> impl Fn(io::Error) -> io::Error + '_ {
+    move |error| io::Error::new(error.kind(), format!("{}: {}", path, error))
+}
+
+/// Every constraint that depends on an argument's *value*, which clap cannot declare.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    if args.format == Format::Json {
+        if args.null {
+            return Err(reject("--format json cannot be combined with --null"));
+        }
+        if args.quiet {
+            return Err(reject("--format json cannot be combined with --quiet"));
+        }
+    }
+    if args.in_place && args.input.as_deref().is_none_or(|path| path == "-") {
+        return Err(reject(
+            "--in-place requires a file argument (cannot rewrite stdin)",
+        ));
+    }
+    Ok(())
+}
+
 fn main() {
-    let args = Args::parse();
-
-    // UTF-8 mode is implicit when case-insensitive (case folding requires UTF-8)
-    let utf8_mode = args.utf8 || args.ignore_case;
-
     let mut stdout = io::stdout();
+    match run() {
+        Ok(code) => code.exit(&mut stdout),
+        Err(error) => exit_on_write_error(&mut stdout, &error, "sz-dedup"),
+    }
+}
+
+fn run() -> io::Result<ExitCode> {
+    let args = Args::parse();
+    if let Err(error) = validate(&args) {
+        error.exit();
+    }
+
+    // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
+    let utf8_mode = args.utf8 || args.ignore_case;
+    let name = args.input.as_deref().unwrap_or("-");
+
+    let input = get_input(args.input.as_deref()).map_err(at_path(name))?;
+    let data = input.as_bytes();
 
     // In-place is opt-in: the default writes to stdout like every other binary,
     // so `sz-dedup file | head` cannot destroy the input.
-    let in_place_path = if args.in_place {
-        let Some(path) = args.input.as_deref().filter(|path| *path != "-") else {
-            eprintln!("Error: --in-place requires a file argument (cannot rewrite stdin)");
-            ExitCode::Error.exit(&mut stdout);
+    let counts = if args.in_place {
+        let path = args.input.as_deref().expect("validated");
+        let config = OutputConfig {
+            rendering: Rendering::Verbatim,
+            path: name,
         };
-        Some(path)
-    } else {
-        None
-    };
-
-    let config = OutputConfig {
-        json: args.json,
-        terminator: Terminator::from_null(args.null),
-        path: args.input.as_deref().unwrap_or("-"),
-    };
-
-    let counts = if let Some(input_path) = in_place_path {
-        // In-place mode: mutable mmap, compact, truncate
-        let mut input = get_input_mutable(input_path).unwrap_or_else(|error| {
-            exit_with_error(
-                &mut stdout,
-                &error,
-                "Error opening file for in-place modification",
-            )
-        });
-
-        let data = input.as_mut_bytes().unwrap();
-        let counts = dedup_in_place(data, args.ignore_case, utf8_mode);
-
-        if let Err(error) = input.truncate_and_flush(counts.compacted_bytes as u64) {
-            exit_with_error(&mut stdout, &error, "Error truncating file");
-        }
-
-        counts
-    } else {
-        // Streaming mode: read-only input, write to output
-        let input = get_input(args.input.as_deref())
-            .unwrap_or_else(|error| exit_with_error(&mut stdout, &error, "Error reading input"));
-
-        let data = input.as_bytes();
-
-        // `-q` reports through the exit code alone, so the lines go nowhere.
-        let mut output: Box<dyn Write> = if args.quiet {
-            Box::new(io::sink())
-        } else {
-            get_output(args.output.as_deref()).unwrap_or_else(|error| {
-                exit_with_error(&mut stdout, &error, "Error opening output")
-            })
+        write_replacing(path, |output| {
+            dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
+        })
+        .map_err(at_path(path))?
+    } else if args.dry_run || args.quiet {
+        let config = OutputConfig {
+            rendering: Rendering::Terminated(Terminator::from_null(args.null)),
+            path: name,
         };
-
+        dedup_to_writer(data, &mut io::sink(), args.ignore_case, utf8_mode, &config)?
+    } else {
+        let config = OutputConfig {
+            rendering: match args.format {
+                Format::Json => Rendering::Json,
+                Format::Text => Rendering::Terminated(Terminator::from_null(args.null)),
+            },
+            path: name,
+        };
+        let target = args.output.as_deref().unwrap_or("-");
+        let mut output = get_output(args.output.as_deref()).map_err(at_path(target))?;
         dedup_to_writer(data, &mut output, args.ignore_case, utf8_mode, &config)
-            .unwrap_or_else(|error| exit_on_write_error(&mut output, &error, "Error deduplicating"))
+            .map_err(at_path(target))?
     };
 
-    // The summary always terminates a `--json` run. In-place mode has no per-line
-    // stream at all, so it is the entire report there.
-    if args.json {
-        let _ = stdout.write_all(br#"{"type":"summary","data":{"path":"#);
-        let _ = json_text_field_to(&mut stdout, config.path.as_bytes());
-        let _ = writeln!(
-            stdout,
-            r#","unique_lines":{},"total_lines":{}}}}}"#,
-            counts.unique, counts.total
-        );
-    } else if args.count {
-        eprintln!("{} unique lines", counts.unique);
+    if args.format == Format::Json {
+        // A run with no record stream still owes its one summary record.
+        if args.in_place || args.dry_run {
+            write_summary_json(&mut io::stdout(), name, counts)?;
+        }
+    } else if args.summary || args.dry_run {
+        println!("{} unique lines of {}", counts.unique, counts.total);
     }
 
-    if args.quiet {
-        ExitCode::from_found(counts.dropped_any()).exit(&mut stdout);
-    }
+    Ok(if args.quiet {
+        ExitCode::from_found(counts.dropped_any())
+    } else {
+        ExitCode::from_found(counts.unique > 0)
+    })
 }
 
 // endregion: CLI
@@ -514,11 +523,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn text_config() -> OutputConfig<'static> {
         OutputConfig {
-            json: false,
-            terminator: Terminator::Newline,
+            rendering: Rendering::Terminated(Terminator::Newline),
+            path: "-",
+        }
+    }
+
+    fn verbatim_config() -> OutputConfig<'static> {
+        OutputConfig {
+            rendering: Rendering::Verbatim,
             path: "-",
         }
     }
@@ -553,55 +569,27 @@ mod tests {
     }
 
     #[test]
-    fn dedups_repeated_lines_in_place() {
-        let mut data = b"line1\nline2\nline1\nline3\n".to_vec();
-        let counts = dedup_in_place(&mut data, false, false);
+    fn folds_unicode_case_when_comparing_lines() {
+        let data = "MÜNCHEN\nmünchen\nberlin\n".as_bytes();
+        let mut output = Vec::new();
 
-        assert_eq!(counts.unique, 3);
-        let result = String::from_utf8(data[..counts.compacted_bytes].to_vec()).unwrap();
-        let lines: Vec<_> = result.lines().collect();
-        assert_eq!(lines, vec!["line1", "line2", "line3"]);
-    }
-
-    #[test]
-    fn dedups_in_place_ignoring_case() {
-        let mut data = b"Hello\nhello\nworld\nWORLD\n".to_vec();
-        let counts = dedup_in_place(&mut data, true, true);
+        let counts = dedup_to_writer(data, &mut output, true, true, &text_config()).unwrap();
 
         assert_eq!(counts.unique, 2);
-        let result = String::from_utf8(data[..counts.compacted_bytes].to_vec()).unwrap();
-        let lines: Vec<_> = result.lines().collect();
-        assert_eq!(lines, vec!["Hello", "world"]);
+        assert_eq!(output, "MÜNCHEN\nberlin\n".as_bytes());
     }
 
     #[test]
-    fn dedups_in_place_folding_unicode() {
-        let mut data = "MÜNCHEN\nmünchen\nberlin\n".as_bytes().to_vec();
-        let counts = dedup_in_place(&mut data, true, true);
+    fn keeps_every_terminator_the_input_used() {
+        // The in-place rendering: a rewritten file must differ from the original only
+        // by the lines that were dropped.
+        let data = "a\r\nb\u{2028}a\r\nc".as_bytes();
+        let mut output = Vec::new();
 
-        assert_eq!(counts.unique, 2);
-        let result = String::from_utf8(data[..counts.compacted_bytes].to_vec()).unwrap();
-        let lines: Vec<_> = result.lines().collect();
-        assert_eq!(lines, vec!["MÜNCHEN", "berlin"]);
-    }
+        let counts = dedup_to_writer(data, &mut output, false, true, &verbatim_config()).unwrap();
 
-    #[test]
-    fn collapses_all_duplicate_lines_in_place() {
-        let mut data = b"dup\ndup\ndup\ndup\n".to_vec();
-        let counts = dedup_in_place(&mut data, false, false);
-
-        assert_eq!(counts.unique, 1);
-        assert_eq!(&data[..counts.compacted_bytes], b"dup\n");
-    }
-
-    #[test]
-    fn keeps_unique_lines_in_place() {
-        let mut data = b"a\nb\nc\n".to_vec();
-        let original_len = data.len();
-        let counts = dedup_in_place(&mut data, false, false);
-
-        assert_eq!(counts.unique, 3);
-        assert_eq!(counts.compacted_bytes, original_len);
+        assert_eq!(counts.total, 4);
+        assert_eq!(output, "a\r\nb\u{2028}c".as_bytes());
     }
 
     #[test]
@@ -660,6 +648,148 @@ mod tests {
         let counts = dedup_to_writer(data, &mut output, false, false, &text_config()).unwrap();
 
         assert_eq!(counts.unique, 2); // "" and "text"
+    }
+
+    #[test]
+    fn declares_no_short_flags() {
+        let mut command = Args::command();
+        command.build();
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "output",
+                "in-place",
+                "dry-run",
+                "ignore-case",
+                "utf8",
+                "format",
+                "summary",
+                "null",
+                "quiet",
+                "help",
+                "version",
+            ]
+        );
+    }
+
+    /// Parse and then apply the value-conditional checks, as `run` does.
+    fn accepts(flags: &[&str]) -> bool {
+        let arguments = ["sz-dedup", "f"].into_iter().chain(flags.iter().copied());
+        Args::try_parse_from(arguments).is_ok_and(|args| validate(&args).is_ok())
+    }
+
+    #[test]
+    fn declares_the_conflicts_that_used_to_pass_silently() {
+        assert!(accepts(&["--in-place"]));
+        for flags in [
+            vec!["--in-place", "--null"],
+            vec!["--in-place", "--output", "o"],
+            vec!["--in-place", "--dry-run"],
+            vec!["--quiet", "--summary"],
+            vec!["--quiet", "--format", "json"],
+            vec!["--null", "--format", "json"],
+            vec!["--summary", "--dry-run"],
+        ] {
+            assert!(!accepts(&flags), "expected {:?} to be rejected", flags);
+        }
+        assert!(
+            accepts(&["--summary", "--format", "json"]),
+            "--summary names the record json already emits"
+        );
+    }
+
+    #[test]
+    fn refuses_to_rewrite_stdin_in_place() {
+        for arguments in [
+            vec!["sz-dedup", "--in-place"],
+            vec!["sz-dedup", "--in-place", "-"],
+        ] {
+            let args = Args::try_parse_from(&arguments).unwrap();
+            assert!(validate(&args).is_err(), "expected {:?} to fail", arguments);
+        }
+    }
+
+    #[test]
+    fn rewrites_the_input_through_a_temporary_file() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("lines.txt");
+        fs::write(&path, b"a\nb\na\n").unwrap();
+        let config = verbatim_config();
+
+        write_replacing(path.to_str().unwrap(), |output| {
+            dedup_to_writer(&fs::read(&path).unwrap(), output, false, false, &config)
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"a\nb\n");
+        let leftovers: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, ["lines.txt"]);
+    }
+
+    #[test]
+    fn leaves_the_input_untouched_when_the_rewrite_fails() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("lines.txt");
+        fs::write(&path, b"original\n").unwrap();
+
+        let failed: io::Result<()> = write_replacing(path.to_str().unwrap(), |output| {
+            output.write_all(b"partial\n")?;
+            Err(io::Error::other("interrupted"))
+        });
+
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original\n");
+    }
+
+    #[test]
+    fn rewrites_an_empty_file_as_a_no_op() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("empty.txt");
+        fs::write(&path, b"").unwrap();
+        let config = verbatim_config();
+
+        let counts = write_replacing(path.to_str().unwrap(), |output| {
+            dedup_to_writer(b"", output, false, false, &config)
+        })
+        .unwrap();
+
+        assert_eq!(counts, DedupCounts::default());
+        assert_eq!(fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn closes_a_json_stream_with_its_summary() {
+        let data = b"a\na\n";
+        let mut output = Vec::new();
+        let config = OutputConfig {
+            rendering: Rendering::Json,
+            path: "f.txt",
+        };
+
+        dedup_to_writer(data, &mut output, false, false, &config).unwrap();
+
+        let text = String::from_utf8(output).unwrap();
+        let records: Vec<_> = text.lines().collect();
+        assert_eq!(records.len(), 2);
+        assert!(records[1].contains(r#""type":"summary""#));
+        assert!(records[1].contains(r#""unique_lines":1,"total_lines":2"#));
     }
 
     #[test]

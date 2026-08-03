@@ -3,17 +3,19 @@
 //! A grep-like tool that combines exact substring matching with bounded fuzzy
 //! matching, built entirely on StringZilla's `szs` kernels:
 //!
-//! - Default (substring): **Smith-Waterman** local alignment of the needle against
-//!   each line. Threshold via `-k` (converted) or `--min-similarity`.
-//! - `-w/--word`: tokenize lines and match the needle against each word using
-//!   **Levenshtein** (`--cost edit`, integer `-k`) or Smith-Waterman (matrix costs).
-//!   With `--utf8`, word mode tokenizes on Unicode alphanumerics and counts edit
+//! - `--match line` (default): **Smith-Waterman** local alignment of the needle
+//!   against each line. Threshold via `--max-distance` or `--min-similarity`.
+//! - `--match word`: tokenize lines and match the needle against each word using
+//!   **Levenshtein** (`--cost edit`) or Smith-Waterman (matrix costs). With
+//!   `--utf8`, word mode tokenizes on Unicode alphanumerics and counts edit
 //!   distance in code points rather than bytes.
 //!
 //! Scoring is selectable: `--cost edit` (uniform), `--cost keyboard` (QWERTY key
 //! proximity), `--cost phonetic` (articulatory similarity), or `--cost-matrix FILE`.
 //! Custom scoring routes through Smith-Waterman, which carries the
-//! `byte_to_class[256]` + `class_substitution_costs[32][32]` matrix.
+//! `byte_to_class[256]` + `class_substitution_costs[32][32]` matrix. That matrix has
+//! 32 classes for 52 letters, so Smith-Waterman folds case unconditionally and
+//! `--ignore-case` changes only the exact and Levenshtein paths.
 //!
 //! Execution runs on the CPU multicore backend by default, or the GPU when built
 //! with `--features cuda` and invoked with `--device gpu`.
@@ -22,7 +24,7 @@
 //!
 //! ```bash
 //! # Substring fuzzy search, up to 1 edit (Smith-Waterman)
-//! sz-fuzzy-find -k 1 color file.txt
+//! sz-fuzzy-find --max-distance 1 color file.txt
 //!
 //! # Keyboard-aware scoring (fat-finger typos), 80% similarity
 //! sz-fuzzy-find --cost keyboard --min-similarity 0.8 color file.txt
@@ -31,16 +33,17 @@
 //! sz-fuzzy-find --cost phonetic --min-similarity 0.8 Smith names.txt
 //!
 //! # Word mode: needle vs each token via Levenshtein
-//! sz-fuzzy-find -w -k 1 colour file.txt
+//! sz-fuzzy-find --match word --max-distance 1 colour file.txt
 //!
 //! # Run on the GPU (requires: cargo build --features cuda)
-//! sz-fuzzy-find --device gpu -k 1 needle big.txt
+//! sz-fuzzy-find --device gpu --max-distance 1 needle big.txt
 //! ```
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::process;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz;
 use stringzilla::szs::{
     DeviceScope, LevenshteinDistances, LevenshteinDistancesUtf8, SmithWatermanScores,
@@ -60,15 +63,6 @@ const MATCH_I: isize = MATCH as isize;
 const CLASS_DIGIT: usize = 26;
 const CLASS_OTHER: usize = 27;
 const CLASS_SPACE: usize = 28;
-
-/// Selected scoring model.
-#[derive(Clone)]
-enum Cost {
-    Edit,
-    Keyboard,
-    Phonetic,
-    Custom,
-}
 
 /// A fully-built scoring scheme: byte→class map, 32×32 class scores, affine gaps.
 struct Scheme {
@@ -106,14 +100,14 @@ fn letter(c: u8) -> usize {
 
 fn diagonal_only() -> [[i8; 32]; 32] {
     let mut m = [[0i8; 32]; 32];
-    for i in 0..32 {
-        m[i][i] = MATCH;
+    for (class, row) in m.iter_mut().enumerate() {
+        row[class] = MATCH;
     }
     m
 }
 
 /// `edit`: uniform — diagonal +MATCH, all substitutions 0. With gaps ≈ −MATCH this
-/// behaves like substitution/indel-counting edit distance under the `-k` threshold.
+/// behaves like substitution/indel-counting edit distance under the `--max-distance` threshold.
 fn edit_scheme() -> Scheme {
     Scheme {
         byte_to_class: default_byte_to_class(),
@@ -228,10 +222,12 @@ fn phonetic_scheme() -> Scheme {
 
 /// Letters substituting with digits/other/whitespace classes are clearly wrong.
 fn penalize_nonletters(m: &mut [[i8; 32]; 32]) {
-    for a in 0..26 {
+    for &c in &[CLASS_DIGIT, CLASS_OTHER, CLASS_SPACE] {
+        m[c][..26].fill(-4);
+    }
+    for row in m.iter_mut().take(26) {
         for &c in &[CLASS_DIGIT, CLASS_OTHER, CLASS_SPACE] {
-            m[a][c] = -4;
-            m[c][a] = -4;
+            row[c] = -4;
         }
     }
 }
@@ -274,13 +270,15 @@ fn load_custom_scheme(path: &str) -> io::Result<Scheme> {
     })
 }
 
-fn build_scheme(cost: &Cost, custom_path: Option<&str>) -> io::Result<Scheme> {
-    Ok(match cost {
-        Cost::Edit => edit_scheme(),
-        Cost::Keyboard => keyboard_scheme(),
-        Cost::Phonetic => phonetic_scheme(),
-        Cost::Custom => load_custom_scheme(custom_path.expect("custom requires --cost-matrix"))?,
-    })
+fn build_scheme(cost: Cost, custom_path: Option<&str>) -> io::Result<Scheme> {
+    match custom_path {
+        Some(path) => load_custom_scheme(path),
+        None => Ok(match cost {
+            Cost::Edit => edit_scheme(),
+            Cost::Keyboard => keyboard_scheme(),
+            Cost::Phonetic => phonetic_scheme(),
+        }),
+    }
 }
 
 // endregion: Scoring Matrices
@@ -314,7 +312,12 @@ struct Query {
 }
 
 impl Query {
-    fn new(pattern: String) -> Self {
+    fn new(pattern: String, ignore_case: bool) -> Self {
+        let pattern = if ignore_case {
+            pattern.to_lowercase()
+        } else {
+            pattern
+        };
         let chars = pattern.chars().count();
         let bytes = pattern.into_bytes();
         let letters = letter_set(&bytes);
@@ -431,7 +434,7 @@ fn exact_contains(line: &[u8], needle: &[u8], ignore_case: bool) -> bool {
 }
 
 /// Minimum Smith-Waterman score for a needle of `len` bytes to count as a match.
-/// `--min-similarity s` ⇒ `s · MATCH · len`; otherwise `-k` ⇒ `(len − k) · MATCH`.
+/// `--min-similarity s` ⇒ `s · MATCH · len`; otherwise `--max-distance k` ⇒ `(len − k) · MATCH`.
 fn score_threshold(len: usize, min_similarity: Option<f64>, k: usize) -> isize {
     match min_similarity {
         Some(s) => (s * MATCH_I as f64 * len as f64).ceil() as isize,
@@ -449,6 +452,28 @@ struct MatchConfig {
     utf8: bool,
 }
 
+impl MatchConfig {
+    /// Edit budget for one query, so `--min-similarity` reaches the Levenshtein path
+    /// rather than being ignored there.
+    fn budget(&self, query: &Query) -> usize {
+        match self.min_similarity {
+            Some(similarity) => {
+                ((1.0 - similarity) * query.length(self.utf8) as f64).floor() as usize
+            }
+            None => self.max_distance,
+        }
+    }
+}
+
+/// Lowercase a token when folding, borrowing it otherwise.
+fn fold(token: &str, ignore_case: bool) -> Cow<'_, [u8]> {
+    if ignore_case {
+        Cow::Owned(token.to_lowercase().into_bytes())
+    } else {
+        Cow::Borrowed(token.as_bytes())
+    }
+}
+
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig {
@@ -458,6 +483,7 @@ struct OutputConfig {
     prefix: bool,
     json: bool,
     quiet: bool,
+    summary: bool,
     terminator: Terminator,
 }
 
@@ -469,22 +495,38 @@ struct Engines {
     lev_utf8: LevenshteinDistancesUtf8,
 }
 
+/// One input's lines, which of them matched, and how many word-mode kernels had to
+/// skip because `--utf8` was promised and the line was not well-formed.
+struct Searched<'a> {
+    lines: Vec<&'a [u8]>,
+    matched: Vec<bool>,
+    malformed: usize,
+}
+
 /// Search one input's bytes; returns the lines and per-line match flags.
 fn search_lines<'a>(
     data: &'a [u8],
     queries: &[Query],
     eng: &Engines,
     cfg: &MatchConfig,
-) -> (Vec<&'a [u8]>, Vec<bool>) {
+) -> Searched<'a> {
     let lines: Vec<&[u8]> = LineIter::new(data, Newlines::from_utf8(cfg.utf8)).collect();
     let mut matched = vec![false; lines.len()];
+    let malformed = if cfg.utf8 && cfg.word {
+        lines
+            .iter()
+            .filter(|line| std::str::from_utf8(line).is_err())
+            .count()
+    } else {
+        0
+    };
 
     // Reused across queries: every one of these is sized by the line count, and
     // reallocating them per query is pure churn.
     let mut candidates: Vec<usize> = Vec::new();
     let mut haystacks: Vec<&[u8]> = Vec::new();
     let mut token_runs: Vec<(usize, usize)> = Vec::new();
-    let mut tokens: Vec<&[u8]> = Vec::new();
+    let mut tokens: Vec<Cow<'a, [u8]>> = Vec::new();
 
     for q in queries {
         let needle = q.bytes.as_slice();
@@ -493,6 +535,7 @@ fn search_lines<'a>(
             continue;
         }
         let thr = score_threshold(len, cfg.min_similarity, cfg.max_distance);
+        let budget = cfg.budget(q);
 
         // Exact-first: cheap, and it covers the distance-0 case.
         for (i, line) in lines.iter().enumerate() {
@@ -522,21 +565,18 @@ fn search_lines<'a>(
             tokens.clear();
             for &index in &candidates {
                 if cfg.utf8 {
-                    let Ok(text) = std::str::from_utf8(lines[index]) else {
-                        continue;
-                    };
-                    tokens.extend(
-                        tokenize_utf8(text)
-                            .map(|token| token.as_bytes())
-                            .filter(|token| {
-                                !filtering || survives(q, token, cfg.max_distance, true)
-                            }),
-                    );
+                    if let Ok(text) = std::str::from_utf8(lines[index]) {
+                        tokens.extend(
+                            tokenize_utf8(text)
+                                .map(|token| fold(token, cfg.ignore_case))
+                                .filter(|token| !filtering || survives(q, token, budget, true)),
+                        );
+                    }
                 } else {
                     tokens.extend(
-                        tokenize(lines[index]).filter(|token| {
-                            !filtering || survives(q, token, cfg.max_distance, false)
-                        }),
+                        tokenize(lines[index])
+                            .filter(|token| !filtering || survives(q, token, budget, false))
+                            .map(Cow::Borrowed),
                     );
                 }
                 token_runs.push((index, tokens.len()));
@@ -544,10 +584,11 @@ fn search_lines<'a>(
             if tokens.is_empty() {
                 continue;
             }
+            let views: Vec<&[u8]> = tokens.iter().map(|token| token.as_ref()).collect();
             if !cfg.cost_is_edit {
                 let scores = eng
                     .sw
-                    .compute(&eng.device, &query[..], &tokens)
+                    .compute(&eng.device, &query[..], &views)
                     .expect("smith-waterman compute failed");
                 mark_lines_by_run(scores.row(0), &token_runs, &mut matched, |score| {
                     score >= thr
@@ -555,24 +596,24 @@ fn search_lines<'a>(
             } else if cfg.utf8 {
                 // Code-point-level distances; both sides validated above.
                 let needle = std::str::from_utf8(needle).expect("patterns are UTF-8 arguments");
-                let tokens: Vec<&str> = tokens
+                let views: Vec<&str> = views
                     .iter()
                     .map(|t| std::str::from_utf8(t).expect("tokens cut from validated lines"))
                     .collect();
                 let dists = eng
                     .lev_utf8
-                    .compute(&eng.device, &[needle][..], &tokens[..])
+                    .compute(&eng.device, &[needle][..], &views[..])
                     .expect("utf8 levenshtein compute failed");
                 mark_lines_by_run(dists.row(0), &token_runs, &mut matched, |distance| {
-                    distance <= cfg.max_distance
+                    distance <= budget
                 });
             } else {
                 let dists = eng
                     .lev
-                    .compute(&eng.device, &query[..], &tokens)
+                    .compute(&eng.device, &query[..], &views)
                     .expect("levenshtein compute failed");
                 mark_lines_by_run(dists.row(0), &token_runs, &mut matched, |distance| {
-                    distance <= cfg.max_distance
+                    distance <= budget
                 });
             }
         } else {
@@ -597,136 +638,207 @@ fn search_lines<'a>(
         }
     }
 
-    (lines, matched)
+    Searched {
+        lines,
+        matched,
+        malformed,
+    }
 }
 
 // endregion: Matching
 
 // region: CLI
 
+/// What the needle is matched against
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Match {
+    Line,
+    Word,
+}
+
+/// Which record kind to emit
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Show {
+    Lines,
+    Count,
+}
+
+/// How records are rendered
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Format {
+    Text,
+    Json,
+}
+
+/// Which scoring model scores a substitution
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Cost {
+    Edit,
+    Keyboard,
+    Phonetic,
+}
+
+/// Where the kernels run
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Device {
+    Auto,
+    Cpu,
+    Gpu,
+}
+
 /// Fuzzy (edit-distance / alignment bounded) substring search
 #[derive(Parser)]
 #[command(name = "sz-fuzzy-find")]
 #[command(version, about = "SIMD/GPU-accelerated fuzzy substring search", long_about = None)]
 struct Args {
-    /// Substring to search for (approximately); omit when using -e
+    /// Substring to search for (approximately); omit when using --pattern
     pattern: Option<String>,
 
     /// Input files (use '-' or omit for stdin)
     inputs: Vec<String>,
 
     /// Additional query; a line matches if ANY query matches (repeatable)
-    #[arg(short = 'e', long = "pattern")]
+    #[arg(id = "pattern_flag", long = "pattern", value_name = "PATTERN")]
     extra: Vec<String>,
 
-    /// Maximum edit distance (used directly in -w edit mode, or as a similarity floor)
-    #[arg(short = 'k', long = "max-distance", default_value = "1")]
-    max_distance: usize,
+    /// Maximum edit distance, in code points under --utf8
+    #[arg(long)]
+    max_distance: Option<usize>,
 
-    /// Minimum normalized similarity 0..1 (overrides -k); 1.0 == exact
-    #[arg(long = "min-similarity")]
+    /// Minimum normalized similarity; 1.0 is exact
+    #[arg(long, conflicts_with = "max_distance", value_parser = parse_similarity)]
     min_similarity: Option<f64>,
 
-    /// Scoring model: edit, keyboard, or phonetic
-    #[arg(long = "cost", default_value = "edit")]
-    cost: String,
+    /// Which scoring model scores a substitution
+    #[arg(long, value_enum, conflicts_with = "cost_matrix")]
+    cost: Option<Cost>,
 
-    /// Load a custom scoring matrix from FILE (implies a custom cost model)
-    #[arg(long = "cost-matrix")]
+    /// Load a scoring matrix from FILE instead of a built-in model
+    #[arg(long)]
     cost_matrix: Option<String>,
 
-    /// Word mode: match the needle against each token rather than the whole line
-    #[arg(short = 'w', long = "word")]
-    word: bool,
+    /// What the needle is matched against
+    #[arg(long = "match", value_enum, value_name = "MATCH")]
+    match_against: Option<Match>,
 
-    /// Execution device: auto, cpu, or gpu
-    #[arg(long = "device", default_value = "auto")]
-    device: String,
+    /// Where the kernels run
+    #[arg(long, value_enum)]
+    device: Option<Device>,
 
     /// CPU thread count (0 = all cores)
-    #[arg(long = "threads")]
+    #[arg(long)]
     threads: Option<usize>,
 
-    /// GPU device index (with --device gpu)
-    #[arg(long = "gpu-id", default_value = "0")]
-    gpu_id: usize,
+    /// GPU device index
+    #[arg(long, requires = "device")]
+    gpu_id: Option<usize>,
 
-    /// Case-insensitive search (full Unicode case folding)
-    #[arg(short = 'i', long)]
+    /// Case-insensitive search with full Unicode folding; implies --utf8
+    #[arg(long)]
     ignore_case: bool,
 
-    /// Show line numbers
-    #[arg(short = 'n', long)]
+    /// Prefix each record with its line number
+    #[arg(long)]
     line_numbers: bool,
 
-    /// Count matching lines only
-    #[arg(short = 'c', long)]
-    count: bool,
-
-    /// Enable UTF-8 mode: Unicode newlines, and code-point edit distances in -w mode
+    /// Treat the input as UTF-8 text
     #[arg(long)]
     utf8: bool,
 
-    /// Emit JSON Lines in the ripgrep-compatible schema
-    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
-    json: bool,
+    /// Which record kind to emit
+    #[arg(long, value_enum)]
+    show: Option<Show>,
+
+    /// Print one line about the whole run, on stdout
+    #[arg(long)]
+    summary: bool,
+
+    /// How records are rendered
+    #[arg(long, value_enum, help_heading = "Output Formats")]
+    format: Option<Format>,
 
     /// NUL-terminate each output record instead of newline
-    #[arg(short = '0', long, help_heading = "Output Formats")]
+    #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
-    /// Suppress all output; exit 0 on any match, 1 on none
-    #[arg(short = 'q', long, conflicts_with_all = ["count", "json", "null", "line_numbers"], help_heading = "Output Formats")]
+    /// Suppress all output; exit 0 if any match was found, 1 otherwise
+    #[arg(long, conflicts_with_all = ["show", "format", "null", "line_numbers", "summary"], help_heading = "Output Formats")]
     quiet: bool,
 }
 
+/// A similarity outside 0..=1 is silently useless: `2.0` matches nothing, `-1.0` and
+/// `nan` match everything.
+fn parse_similarity(text: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .parse()
+        .map_err(|_| format!("`{}` is not a number", text))?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(format!("`{}` is outside 0.0..=1.0", text));
+    }
+    Ok(value)
+}
+
+/// Report a constraint clap cannot express, rendered as clap renders its own.
+fn reject(message: &str) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+}
+
+/// Every constraint clap cannot express, because `conflicts_with` fires on an
+/// argument's presence and never on its value.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    let device = args.device.unwrap_or(Device::Auto);
+    if args.gpu_id.is_some() && device != Device::Gpu {
+        return Err(reject("--gpu-id needs --device gpu"));
+    }
+    if args.threads.is_some() && device == Device::Gpu {
+        return Err(reject("--threads is a CPU setting, and --device is gpu"));
+    }
+    if args.null && args.format == Some(Format::Json) {
+        return Err(reject("--format json cannot be combined with --null"));
+    }
+    if args.line_numbers && args.show == Some(Show::Count) {
+        return Err(reject(
+            "--line-numbers has no record to number under --show count",
+        ));
+    }
+    Ok(())
+}
+
 fn build_device(args: &Args) -> Result<DeviceScope, String> {
-    let result = match args.device.as_str() {
-        "gpu" => DeviceScope::gpu_device(args.gpu_id),
-        "cpu" => DeviceScope::cpu_cores(args.threads.unwrap_or(0)),
-        // `DeviceScope::default()` yields a single core; 0 means every core.
-        _ => DeviceScope::cpu_cores(args.threads.unwrap_or(0)),
+    // `DeviceScope::default()` yields a single core; 0 means every core.
+    let cores = args.threads.unwrap_or(0);
+    let result = match args.device.unwrap_or(Device::Auto) {
+        Device::Gpu => DeviceScope::gpu_device(args.gpu_id.unwrap_or(0)),
+        Device::Cpu | Device::Auto => DeviceScope::cpu_cores(cores),
     };
     result.map_err(|e| format!("{:?}", e))
 }
 
-fn parse_cost(args: &Args) -> Result<Cost, String> {
-    if args.cost_matrix.is_some() {
-        return Ok(Cost::Custom);
-    }
-    match args.cost.as_str() {
-        "edit" => Ok(Cost::Edit),
-        "keyboard" => Ok(Cost::Keyboard),
-        "phonetic" => Ok(Cost::Phonetic),
-        other => Err(format!(
-            "unknown --cost '{}' (edit|keyboard|phonetic)",
-            other
-        )),
+fn main() {
+    match run() {
+        Ok(code) => process::exit(code as i32),
+        Err(error) => {
+            eprintln!("sz-fuzzy-find: {}", error);
+            process::exit(ExitCode::Error as i32);
+        }
     }
 }
 
-fn main() {
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn run() -> io::Result<ExitCode> {
     let args = Args::parse();
+    if let Err(error) = validate(&args) {
+        error.exit();
+    }
 
-    let cost = parse_cost(&args).unwrap_or_else(|e| {
-        eprintln!("Error: {}", e);
-        process::exit(2);
-    });
-    let cost_is_edit = matches!(cost, Cost::Edit);
+    let cost = args.cost.unwrap_or(Cost::Edit);
+    let cost_is_edit = args.cost_matrix.is_none() && cost == Cost::Edit;
 
-    let device = build_device(&args).unwrap_or_else(|e| {
-        eprintln!(
-            "Error: could not initialize device '{}': {}",
-            args.device, e
-        );
-        process::exit(2);
-    });
-
-    let scheme = build_scheme(&cost, args.cost_matrix.as_deref()).unwrap_or_else(|e| {
-        eprintln!("Error reading cost matrix: {}", e);
-        process::exit(2);
-    });
-
+    let device = build_device(&args).map_err(invalid)?;
+    let scheme = build_scheme(cost, args.cost_matrix.as_deref())?;
     let sw = SmithWatermanScores::new(
         &device,
         &scheme.byte_to_class,
@@ -734,20 +846,13 @@ fn main() {
         scheme.gap_open,
         scheme.gap_extend,
     )
-    .unwrap_or_else(|e| {
-        eprintln!("Error: Smith-Waterman init failed: {:?}", e);
-        process::exit(2);
-    });
+    .map_err(|e| invalid(format!("Smith-Waterman init failed: {:?}", e)))?;
 
-    // Standard unit-cost Levenshtein for -w edit mode, byte- and code-point-level.
-    let lev = LevenshteinDistances::new(&device, 0, 1, 1, 1).unwrap_or_else(|e| {
-        eprintln!("Error: Levenshtein init failed: {:?}", e);
-        process::exit(2);
-    });
-    let lev_utf8 = LevenshteinDistancesUtf8::new(&device, 0, 1, 1, 1).unwrap_or_else(|e| {
-        eprintln!("Error: UTF-8 Levenshtein init failed: {:?}", e);
-        process::exit(2);
-    });
+    // Standard unit-cost Levenshtein for word edit mode, byte- and code-point-level.
+    let lev = LevenshteinDistances::new(&device, 0, 1, 1, 1)
+        .map_err(|e| invalid(format!("Levenshtein init failed: {:?}", e)))?;
+    let lev_utf8 = LevenshteinDistancesUtf8::new(&device, 0, 1, 1, 1)
+        .map_err(|e| invalid(format!("UTF-8 Levenshtein init failed: {:?}", e)))?;
 
     let engines = Engines {
         device,
@@ -756,90 +861,163 @@ fn main() {
         lev_utf8,
     };
 
-    // With -e supplying the queries, a positional is an input path, as in grep.
+    let (patterns, inputs) =
+        resolve_positionals(&args).unwrap_or_else(|message| reject(&message).exit());
+    let queries: Vec<Query> = patterns
+        .into_iter()
+        .map(|pattern| Query::new(pattern, args.ignore_case))
+        .collect();
+
+    let cfg = MatchConfig {
+        ignore_case: args.ignore_case,
+        word: args.match_against == Some(Match::Word),
+        cost_is_edit,
+        max_distance: args.max_distance.unwrap_or(1),
+        min_similarity: args.min_similarity,
+        utf8: args.utf8 || args.ignore_case,
+    };
+    let output_config = OutputConfig {
+        line_numbers: args.line_numbers,
+        count: args.show == Some(Show::Count),
+        prefix: inputs.len() > 1,
+        json: args.format == Some(Format::Json),
+        quiet: args.quiet,
+        summary: args.summary,
+        terminator: Terminator::from_null(args.null),
+    };
+
+    let mut output = get_output(None)?;
+    let outcome = match search_inputs(
+        &mut output,
+        &inputs,
+        &queries,
+        &engines,
+        &cfg,
+        &output_config,
+    ) {
+        Ok(outcome) => outcome,
+        // The only exit that can fire with matches still buffered, so it flushes first.
+        Err(error) => exit_on_write_error(&mut output, &error, "Error writing output"),
+    };
+
+    let code = if outcome.readable == 0 {
+        ExitCode::Error
+    } else {
+        ExitCode::from_found(outcome.total > 0)
+    };
+    code.exit(&mut output)
+}
+
+/// What the whole run found, for the exit code and `--summary`.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct Outcome {
+    total: usize,
+    readable: usize,
+    malformed: usize,
+}
+
+/// The queries and the input paths, once the positional has been assigned to whichever
+/// of the two it belongs to. Without `--pattern` the positional is the needle; with it,
+/// every positional is a path.
+fn resolve_positionals(args: &Args) -> Result<(Vec<String>, Vec<String>), String> {
     let mut inputs = args.inputs.clone();
     let mut patterns: Vec<String> = Vec::new();
     match (&args.pattern, args.extra.is_empty()) {
         (Some(pattern), true) => patterns.push(pattern.clone()),
         (Some(path), false) => inputs.insert(0, path.clone()),
-        (None, true) => {
-            eprintln!("Error: no query given; pass a pattern or -e PATTERN");
-            process::exit(ExitCode::Error as i32);
-        }
+        (None, true) => return Err("no query given; pass a pattern or --pattern".into()),
         (None, false) => {}
     }
     patterns.extend(args.extra.iter().cloned());
     if inputs.is_empty() {
         inputs.push("-".to_string());
     }
-    let queries: Vec<Query> = patterns.into_iter().map(Query::new).collect();
+    Ok((patterns, inputs))
+}
 
-    let cfg = MatchConfig {
-        ignore_case: args.ignore_case,
-        word: args.word,
-        cost_is_edit,
-        max_distance: args.max_distance,
-        min_similarity: args.min_similarity,
-        utf8: args.utf8 || args.ignore_case,
-    };
-    let output_config = OutputConfig {
-        line_numbers: args.line_numbers,
-        count: args.count,
-        prefix: inputs.len() > 1,
-        json: args.json,
-        quiet: args.quiet,
-        terminator: Terminator::from_null(args.null),
-    };
-
-    let mut output = get_output(None).unwrap_or_else(|e| {
-        eprintln!("Error opening output: {}", e);
-        process::exit(2);
-    });
-
-    let mut total = 0usize;
-    for name in &inputs {
+/// Search every input, warning about the ones that cannot be read and continuing.
+fn search_inputs(
+    output: &mut dyn Write,
+    inputs: &[String],
+    queries: &[Query],
+    engines: &Engines,
+    cfg: &MatchConfig,
+    out_cfg: &OutputConfig,
+) -> io::Result<Outcome> {
+    let mut outcome = Outcome::default();
+    for name in inputs {
         let input = match get_input(Some(name.as_str())) {
             Ok(input) => input,
-            Err(e) => {
-                eprintln!("Error reading {}: {}", name, e);
-                process::exit(2);
+            Err(error) => {
+                eprintln!("sz-fuzzy-find: {}: {}", name, error);
+                continue;
             }
         };
-        let (lines, matched) = search_lines(input.as_bytes(), &queries, &engines, &cfg);
+        outcome.readable += 1;
+        let found = search_lines(input.as_bytes(), queries, engines, cfg);
+        outcome.malformed += found.malformed;
 
         let mut count = 0usize;
-        for (index, line) in lines.iter().enumerate() {
-            if !matched[index] {
+        for (index, line) in found.lines.iter().enumerate() {
+            if !found.matched[index] {
                 continue;
             }
             count += 1;
-            if output_config.count {
-                continue;
-            }
-            if let Err(error) = write_match(&mut output, &output_config, name, index + 1, line) {
-                if error.kind() == io::ErrorKind::BrokenPipe {
-                    process::exit(0);
-                }
-                eprintln!("Error writing output: {}", error);
-                process::exit(ExitCode::Error as i32);
+            if !out_cfg.count {
+                write_match(output, out_cfg, name, index + 1, line)?;
             }
         }
-        if output_config.count && !output_config.quiet {
-            let _ = if output_config.prefix {
-                writeln!(output, "{}:{}", name, count)
-            } else {
-                writeln!(output, "{}", count)
-            };
+        if out_cfg.count && !out_cfg.quiet {
+            write_count(output, out_cfg, name, count)?;
         }
-        total += count;
+        outcome.total += count;
     }
 
-    // Flush explicitly: process::exit skips the BufWriter's Drop, which would
-    // otherwise discard everything we buffered.
-    let _ = output.flush();
+    if out_cfg.summary && !out_cfg.quiet {
+        write_summary(output, out_cfg, &outcome, inputs.len())?;
+    }
+    Ok(outcome)
+}
 
-    // grep convention: exit 0 if any line matched, 1 otherwise.
-    process::exit(if total > 0 { 0 } else { 1 });
+/// The one summary record closing the run, in whichever format it selected.
+fn write_summary(
+    output: &mut dyn Write,
+    cfg: &OutputConfig,
+    outcome: &Outcome,
+    inputs: usize,
+) -> io::Result<()> {
+    if cfg.json {
+        return writeln!(
+            output,
+            r#"{{"type":"summary","data":{{"matched_lines":{},"readable_inputs":{},"total_inputs":{},"malformed_lines":{}}}}}"#,
+            outcome.total, outcome.readable, inputs, outcome.malformed
+        );
+    }
+    writeln!(
+        output,
+        "matched {} lines in {} of {} inputs, skipping {} malformed lines",
+        outcome.total, outcome.readable, inputs, outcome.malformed
+    )
+}
+
+/// One count record per input, in whichever format the run selected.
+fn write_count(
+    output: &mut dyn Write,
+    cfg: &OutputConfig,
+    name: &str,
+    count: usize,
+) -> io::Result<()> {
+    if cfg.json {
+        output.write_all(br#"{"type":"count","data":{"path":"#)?;
+        json_text_field_to(output, name.as_bytes())?;
+        write!(output, r#","count":{}}}}}"#, count)?;
+        return output.write_all(b"\n");
+    }
+    if cfg.prefix {
+        write!(output, "{}:", name)?;
+    }
+    write!(output, "{}", count)?;
+    output.write_all(&[cfg.terminator.as_byte()])
 }
 
 fn write_match(
@@ -878,6 +1056,261 @@ fn write_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn declares_no_short_flags() {
+        assert!(Args::command()
+            .get_arguments()
+            .all(|a| a.get_short().is_none() || matches!(a.get_short(), Some('h') | Some('V'))));
+    }
+
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|a| a.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "pattern",
+                "max-distance",
+                "min-similarity",
+                "cost",
+                "cost-matrix",
+                "match",
+                "device",
+                "threads",
+                "gpu-id",
+                "ignore-case",
+                "line-numbers",
+                "utf8",
+                "show",
+                "summary",
+                "format",
+                "null",
+                "quiet",
+                "help",
+                "version"
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_one_file_without_waiting_on_stdin() {
+        // The positional is a path once `--pattern` carries the needle, so the input
+        // list must not fall back to stdin beside it.
+        let args = Args::try_parse_from(["sz-fuzzy-find", "--pattern", "abc", "file.txt"]).unwrap();
+        let (patterns, inputs) = resolve_positionals(&args).unwrap();
+        assert_eq!(patterns, ["abc"]);
+        assert_eq!(inputs, ["file.txt"]);
+
+        // With no positional at all, stdin is still the input.
+        let args = Args::try_parse_from(["sz-fuzzy-find", "--pattern", "abc"]).unwrap();
+        assert_eq!(resolve_positionals(&args).unwrap().1, ["-"]);
+    }
+
+    #[test]
+    fn rejects_settings_that_used_to_be_ignored() {
+        for argv in [
+            ["sz-fuzzy-find", "--min-similarity", "2.0", "a"].as_slice(),
+            ["sz-fuzzy-find", "--min-similarity", "nan", "a"].as_slice(),
+            ["sz-fuzzy-find", "--device", "banana", "a"].as_slice(),
+            ["sz-fuzzy-find", "--device", "GPU", "a"].as_slice(),
+            ["sz-fuzzy-find", "--gpu-id", "1", "a"].as_slice(),
+            ["sz-fuzzy-find", "--cost", "edit", "--cost-matrix", "f", "a"].as_slice(),
+            [
+                "sz-fuzzy-find",
+                "--min-similarity",
+                "0.5",
+                "--max-distance",
+                "1",
+                "a",
+            ]
+            .as_slice(),
+        ] {
+            assert!(
+                Args::try_parse_from(argv).is_err(),
+                "{:?} must be a usage error",
+                argv
+            );
+        }
+        // A value-conditional constraint clap cannot express.
+        let args = Args::try_parse_from(["sz-fuzzy-find", "--device", "cpu", "--gpu-id", "1", "a"])
+            .unwrap();
+        assert!(validate(&args).is_err());
+    }
+
+    #[test]
+    fn accepts_threads_under_the_default_device() {
+        // `--threads` used to demand `--device`, which the default already resolves to CPU.
+        let args = Args::try_parse_from(["sz-fuzzy-find", "--threads", "2", "a"]).unwrap();
+        assert!(validate(&args).is_ok());
+        let gpu = Args::try_parse_from(["sz-fuzzy-find", "--device", "gpu", "--threads", "2", "a"])
+            .unwrap();
+        assert!(validate(&gpu).is_err());
+    }
+
+    #[test]
+    fn names_its_placeholders_after_the_flags() {
+        let mut command = Args::command();
+        command.build();
+        let placeholder = |id: &str| {
+            command
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .and_then(|a| a.get_value_names())
+                .map(|names| names[0].to_string())
+        };
+        assert_eq!(placeholder("pattern_flag").as_deref(), Some("PATTERN"));
+        assert_eq!(placeholder("match_against").as_deref(), Some("MATCH"));
+    }
+
+    #[test]
+    fn closes_a_json_stream_with_its_summary() {
+        // `--summary` used to append a prose line after the JSON records.
+        let outcome = Outcome {
+            total: 9,
+            readable: 1,
+            malformed: 0,
+        };
+        let mut cfg = OutputConfig {
+            line_numbers: false,
+            count: false,
+            prefix: false,
+            json: true,
+            quiet: false,
+            summary: true,
+            terminator: Terminator::Newline,
+        };
+        let mut written = Vec::new();
+        write_summary(&mut written, &cfg, &outcome, 1).unwrap();
+        let record = String::from_utf8(written).unwrap();
+        assert!(
+            record.starts_with(r#"{"type":"summary","data":{"#),
+            "{}",
+            record
+        );
+        assert!(record.contains(r#""matched_lines":9"#), "{}", record);
+
+        cfg.json = false;
+        let mut written = Vec::new();
+        write_summary(&mut written, &cfg, &outcome, 1).unwrap();
+        assert!(String::from_utf8(written)
+            .unwrap()
+            .starts_with("matched 9 lines"));
+    }
+
+    #[test]
+    fn keeps_matches_when_one_input_is_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let present = dir.path().join("present.txt");
+        std::fs::write(&present, b"colour\n").unwrap();
+
+        let engines = engines_for(edit_scheme());
+        let cfg = MatchConfig {
+            ignore_case: false,
+            word: false,
+            cost_is_edit: true,
+            max_distance: 1,
+            min_similarity: None,
+            utf8: false,
+        };
+        let out_cfg = OutputConfig {
+            line_numbers: false,
+            count: false,
+            prefix: false,
+            json: false,
+            quiet: false,
+            summary: false,
+            terminator: Terminator::Newline,
+        };
+        let inputs = vec![
+            dir.path().join("missing.txt").display().to_string(),
+            present.display().to_string(),
+        ];
+        let queries = vec![Query::new("color".to_string(), false)];
+
+        let mut written = Vec::new();
+        let outcome =
+            search_inputs(&mut written, &inputs, &queries, &engines, &cfg, &out_cfg).unwrap();
+        assert_eq!(outcome.readable, 1);
+        assert_eq!(outcome.total, 1);
+        assert_eq!(written, b"colour\n");
+    }
+
+    #[test]
+    fn folds_case_on_the_levenshtein_path() {
+        // `--match word --cost edit --ignore-case` used to compare unfolded tokens.
+        let engines = engines_for(edit_scheme());
+        let cfg = |ignore_case: bool| MatchConfig {
+            ignore_case,
+            word: true,
+            cost_is_edit: true,
+            max_distance: 0,
+            min_similarity: None,
+            utf8: true,
+        };
+        let data = "COLOUR\n".as_bytes();
+        let folded = vec![Query::new("colour".to_string(), true)];
+        let literal = vec![Query::new("colour".to_string(), false)];
+        assert!(search_lines(data, &folded, &engines, &cfg(true)).matched[0]);
+        assert!(!search_lines(data, &literal, &engines, &cfg(false)).matched[0]);
+    }
+
+    #[test]
+    fn counts_lines_skipped_as_malformed_under_utf8() {
+        let engines = engines_for(edit_scheme());
+        let cfg = MatchConfig {
+            ignore_case: false,
+            word: true,
+            cost_is_edit: true,
+            max_distance: 1,
+            min_similarity: None,
+            utf8: true,
+        };
+        let data = b"colour\n\xff\xfe bad\n";
+        let queries = vec![Query::new("color".to_string(), false)];
+        assert_eq!(search_lines(data, &queries, &engines, &cfg).malformed, 1);
+    }
+
+    #[test]
+    fn spends_min_similarity_as_an_edit_budget() {
+        // In word+edit mode `--min-similarity` used to be dropped entirely.
+        let cfg = MatchConfig {
+            ignore_case: false,
+            word: true,
+            cost_is_edit: true,
+            max_distance: 9,
+            min_similarity: Some(0.8),
+            utf8: false,
+        };
+        let query = Query::new("colour".to_string(), false);
+        assert_eq!(cfg.budget(&query), 1);
+    }
+
+    fn engines_for(scheme: Scheme) -> Engines {
+        let device = cpu();
+        let sw = SmithWatermanScores::new(
+            &device,
+            &scheme.byte_to_class,
+            &scheme.costs,
+            scheme.gap_open,
+            scheme.gap_extend,
+        )
+        .unwrap();
+        let lev = LevenshteinDistances::new(&device, 0, 1, 1, 1).unwrap();
+        let lev_utf8 = LevenshteinDistancesUtf8::new(&device, 0, 1, 1, 1).unwrap();
+        Engines {
+            device,
+            sw,
+            lev,
+            lev_utf8,
+        }
+    }
 
     #[test]
     fn scores_keyboard_neighbors_above_distant_keys() {

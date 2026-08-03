@@ -7,24 +7,24 @@
 //!
 //! ```bash
 //! # Extract second column (tab-delimited by default)
-//! sz-cols -f 2 data.tsv
+//! sz-cols --columns 2 data.tsv
 //!
 //! # Extract multiple columns
-//! sz-cols -f 1,3,5 data.tsv
+//! sz-cols --columns 1,3,5 data.tsv
 //!
 //! # Use comma as delimiter (CSV)
-//! sz-cols -d ',' -f 2 data.csv
+//! sz-cols --delimiter ',' --columns 2 data.csv
 //!
 //! # Extract column range
-//! sz-cols -f 2-5 data.tsv
+//! sz-cols --columns 2-5 data.tsv
 //!
 //! # From stdin
-//! cat data.tsv | sz-cols -f 2
+//! cat data.tsv | sz-cols --columns 2
 //! ```
 
 use std::io::{self, Read, Write};
 
-use clap::Parser;
+use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
 use stringzilla::sz::{FindSplits, MatcherType};
 
 mod shared;
@@ -38,38 +38,85 @@ struct Args {
     /// Input file (use '-' or omit for stdin)
     input: Option<String>,
 
-    /// Field(s) to extract: single (2), list (1,3,5), or range (2-5)
-    #[arg(short = 'f', long = "fields", required = true)]
-    fields: String,
+    /// Column(s) to extract: single (2), list (1,3,5), or range (2-5)
+    #[arg(long, required = true)]
+    columns: String,
 
-    /// Field delimiter (default: tab)
-    #[arg(short = 'd', long = "delimiter", default_value = "\t")]
+    /// Column delimiter (default: tab)
+    #[arg(long, default_value = "\t")]
     delimiter: String,
 
     /// Output delimiter (default: same as input delimiter)
-    #[arg(short = 'D', long = "output-delimiter")]
+    #[arg(long)]
     output_delimiter: Option<String>,
 
-    /// Only output lines with at least N fields
-    #[arg(long = "min-fields")]
-    min_fields: Option<usize>,
+    /// Only output lines with at least N columns
+    #[arg(long)]
+    min_columns: Option<usize>,
 
-    /// Enable UTF-8 mode (split rows on Unicode newlines: CR, CRLF, NEL, LS, PS)
+    /// Treat the input as UTF-8 text
     #[arg(long)]
     utf8: bool,
 
-    /// Emit JSON Lines, one record per output line
-    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
-    json: bool,
+    /// How records are rendered
+    #[arg(
+        long,
+        value_enum,
+        default_value = "text",
+        help_heading = "Output Formats"
+    )]
+    format: Format,
 
-    /// NUL-terminate each output record; -D still separates fields within a record
-    #[arg(short = '0', long, help_heading = "Output Formats")]
+    /// NUL-terminate each output record instead of newline
+    #[arg(long, help_heading = "Output Formats")]
     null: bool,
+
+    /// Suppress all output; exit 0 if any record was extracted, 1 otherwise
+    #[arg(long, conflicts_with_all = ["format", "null", "output_delimiter"], help_heading = "Output Formats")]
+    quiet: bool,
 }
 
-/// Parse field specification into a list of 0-based field indices
-fn parse_fields(spec: &str) -> Result<Vec<usize>, String> {
-    let mut fields = Vec::new();
+/// How records are rendered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Format {
+    /// The selected columns, joined by the output delimiter.
+    Text,
+    /// JSON Lines, one record per output line.
+    Json,
+}
+
+/// Report a constraint clap cannot express, rendered as clap renders its own.
+fn reject(message: &str) -> clap::Error {
+    Args::command().error(ErrorKind::ArgumentConflict, message)
+}
+
+/// Name the file a failure happened on, so every diagnostic reads `sz-cols: <path>: <error>`.
+fn at_path(path: &str) -> impl Fn(io::Error) -> io::Error + '_ {
+    move |error| io::Error::new(error.kind(), format!("{}: {}", path, error))
+}
+
+/// The constraints clap cannot express: `conflicts_with` fires on a flag's presence,
+/// never on its value, and an empty delimiter reaches the splitter unchecked.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    if args.delimiter.is_empty() {
+        return Err(reject("--delimiter cannot be empty"));
+    }
+    if args.format == Format::Json {
+        if args.output_delimiter.is_some() {
+            return Err(reject(
+                "--format json nests columns, so --output-delimiter has no effect",
+            ));
+        }
+        if args.null {
+            return Err(reject("--format json cannot be combined with --null"));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a column specification into a list of 0-based column indices
+fn parse_columns(spec: &str) -> Result<Vec<usize>, String> {
+    let mut columns = Vec::new();
 
     for part in spec.split(',') {
         let part = part.trim();
@@ -81,36 +128,36 @@ fn parse_fields(spec: &str) -> Result<Vec<usize>, String> {
             }
             let start: usize = parts[0]
                 .parse()
-                .map_err(|_| format!("Invalid field number: {}", parts[0]))?;
+                .map_err(|_| format!("Invalid column number: {}", parts[0]))?;
             let end: usize = parts[1]
                 .parse()
-                .map_err(|_| format!("Invalid field number: {}", parts[1]))?;
+                .map_err(|_| format!("Invalid column number: {}", parts[1]))?;
             if start == 0 || end == 0 {
-                return Err("Field numbers start at 1".to_string());
+                return Err("Column numbers start at 1".to_string());
             }
             if start > end {
                 return Err(format!("Invalid range: {} > {}", start, end));
             }
             for i in start..=end {
-                fields.push(i - 1); // Convert to 0-based
+                columns.push(i - 1); // Convert to 0-based
             }
         } else {
             // Single field: "2"
             let num: usize = part
                 .parse()
-                .map_err(|_| format!("Invalid field number: {}", part))?;
+                .map_err(|_| format!("Invalid column number: {}", part))?;
             if num == 0 {
-                return Err("Field numbers start at 1".to_string());
+                return Err("Column numbers start at 1".to_string());
             }
-            fields.push(num - 1); // Convert to 0-based
+            columns.push(num - 1); // Convert to 0-based
         }
     }
 
-    if fields.is_empty() {
-        return Err("No fields specified".to_string());
+    if columns.is_empty() {
+        return Err("No columns specified".to_string());
     }
 
-    Ok(fields)
+    Ok(columns)
 }
 
 /// Split a line into `out` on the delimiter (SIMD `FindSplits`), reusing the
@@ -138,7 +185,7 @@ fn split_fields<'a>(
 
 /// Which fields to extract and how far each line has to be split, decided once from `Args`.
 #[derive(Clone, Copy)]
-struct FieldSelection<'a> {
+struct ColumnSelection<'a> {
     /// Zero-based field indices, in output order.
     indices: &'a [usize],
     /// How many leading fields to split out, or `None` for the whole line.
@@ -146,20 +193,20 @@ struct FieldSelection<'a> {
     /// Separates fields within an input line.
     delimiter: &'a [u8],
     /// Drop lines carrying fewer fields than this.
-    min_fields: Option<usize>,
+    min_columns: Option<usize>,
 }
 
-impl<'a> FieldSelection<'a> {
+impl<'a> ColumnSelection<'a> {
     /// Select `indices`, splitting only as far as the furthest of them reaches.
-    /// `--min-fields` tests the total field count, so it forfeits that early stop.
-    fn new(indices: &'a [usize], delimiter: &'a [u8], min_fields: Option<usize>) -> Self {
-        FieldSelection {
+    /// `--min-columns` tests the total column count, so it forfeits that early stop.
+    fn new(indices: &'a [usize], delimiter: &'a [u8], min_columns: Option<usize>) -> Self {
+        ColumnSelection {
             indices,
-            limit: min_fields
+            limit: min_columns
                 .is_none()
                 .then(|| indices.iter().copied().max().map_or(0, |index| index + 1)),
             delimiter,
-            min_fields,
+            min_columns,
         }
     }
 }
@@ -168,7 +215,7 @@ impl<'a> FieldSelection<'a> {
 /// first stopped. `Copy` and lifetime-free, and it allocates nothing.
 #[derive(Clone, Copy, Default)]
 struct ColsState {
-    /// Input lines seen so far, which `--json` reports.
+    /// Input lines seen so far, which `--format json` reports.
     line_number: usize,
     /// Records written so far. Nothing in the run reads it; the tests do, to compare a
     /// streamed extraction against a whole-buffer one.
@@ -180,7 +227,7 @@ struct ColsState {
 struct OutputConfig<'a> {
     json: bool,
     terminator: Terminator,
-    /// Separates fields within one record; unused under `--json`, which nests them.
+    /// Separates fields within one record; unused under `--format json`, which nests them.
     output_delimiter: &'a [u8],
     /// Input name carried into the JSON envelope.
     path: &'a str,
@@ -198,9 +245,9 @@ fn write_record_text(
     output: &mut dyn Write,
     config: &OutputConfig,
     fields: &[&[u8]],
-    field_indices: &[usize],
+    column_indices: &[usize],
 ) -> io::Result<()> {
-    for (position, &index) in field_indices.iter().enumerate() {
+    for (position, &index) in column_indices.iter().enumerate() {
         if position > 0 {
             output.write_all(config.output_delimiter)?;
         }
@@ -214,13 +261,13 @@ fn write_record_json(
     output: &mut dyn Write,
     config: &OutputConfig,
     fields: &[&[u8]],
-    field_indices: &[usize],
+    column_indices: &[usize],
     line_number: usize,
 ) -> io::Result<()> {
     output.write_all(br#"{"type":"line","data":{"path":"#)?;
     json_text_field_to(output, config.path.as_bytes())?;
-    output.write_all(br#","fields":["#)?;
-    for (position, &index) in field_indices.iter().enumerate() {
+    output.write_all(br#","columns":["#)?;
+    for (position, &index) in column_indices.iter().enumerate() {
         if position > 0 {
             output.write_all(b",")?;
         }
@@ -234,7 +281,7 @@ fn write_record_json(
 fn extract_cols(
     data: &[u8],
     state: &mut ColsState,
-    selection: &FieldSelection,
+    selection: &ColumnSelection,
     newlines: Newlines,
     config: &OutputConfig,
     output: &mut dyn Write,
@@ -245,8 +292,8 @@ fn extract_cols(
         state.line_number += 1;
         split_fields(line, selection.delimiter, selection.limit, &mut fields);
 
-        // Skip lines with too few fields if min_fields is set
-        if selection.min_fields.is_some_and(|min| fields.len() < min) {
+        // Skip lines with too few fields if min_columns is set
+        if selection.min_columns.is_some_and(|min| fields.len() < min) {
             continue;
         }
 
@@ -274,7 +321,7 @@ fn extract_cols(
 fn stream_cols<R: Read>(
     refill: &mut Refill<R>,
     state: &mut ColsState,
-    selection: &FieldSelection,
+    selection: &ColumnSelection,
     newlines: Newlines,
     config: &OutputConfig,
     output: &mut dyn Write,
@@ -286,24 +333,20 @@ fn stream_cols<R: Read>(
 
 // endregion: Streaming
 
-fn main() {
+fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
     let args = Args::parse();
+    if let Err(error) = validate(&args) {
+        error.exit();
+    }
 
-    // Parse field specification
-    let mut output = stdout_writer();
+    let column_indices = parse_columns(&args.columns).unwrap_or_else(|message| {
+        Args::command()
+            .error(ErrorKind::ValueValidation, message)
+            .exit()
+    });
 
-    let field_indices = match parse_fields(&args.fields) {
-        Ok(indices) => indices,
-        Err(message) => {
-            eprintln!("Error: {}", message);
-            ExitCode::Error.exit(&mut output);
-        }
-    };
-
-    let input = match get_input_streaming(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(error) => exit_with_error(&mut output, &error, "Error reading input"),
-    };
+    let name = args.input.as_deref().unwrap_or("-");
+    let input = get_input_streaming(args.input.as_deref()).map_err(at_path(name))?;
 
     let delimiter = args.delimiter.as_bytes();
     let output_delimiter = args
@@ -312,39 +355,48 @@ fn main() {
         .map(|delimiter| delimiter.as_bytes())
         .unwrap_or(delimiter);
 
-    let selection = FieldSelection::new(&field_indices, delimiter, args.min_fields);
+    let selection = ColumnSelection::new(&column_indices, delimiter, args.min_columns);
 
     let config = OutputConfig {
-        json: args.json,
+        json: args.format == Format::Json,
         terminator: Terminator::from_null(args.null),
         output_delimiter,
-        path: args.input.as_deref().unwrap_or("-"),
+        path: name,
     };
+
+    // A quiet run still extracts, so the record count that answers it stays honest.
+    let mut discard = io::sink();
+    let output: &mut dyn Write = if args.quiet { &mut discard } else { output };
 
     let newlines = Newlines::from_utf8(args.utf8);
     let mut state = ColsState::default();
-    let result = match input.into_window(DEFAULT_WINDOW_BYTES) {
+    match input.into_window(DEFAULT_WINDOW_BYTES) {
         InputWindow::Whole(source) => extract_cols(
             source.as_bytes(),
             &mut state,
             &selection,
             newlines,
             &config,
-            &mut output,
-        ),
+            output,
+        )?,
         InputWindow::Stream(mut refill) => stream_cols(
             &mut refill,
             &mut state,
             &selection,
             newlines,
             &config,
-            &mut output,
-        ),
-    };
+            output,
+        )?,
+    }
 
-    // One flush per run: flushing inside the loop would issue one per window.
-    if let Err(error) = result.and_then(|()| output.flush()) {
-        exit_on_write_error(&mut output, &error, "Error");
+    Ok(ExitCode::from_found(state.emitted > 0))
+}
+
+fn main() {
+    let mut output = stdout_writer();
+    match run(&mut output) {
+        Ok(code) => code.exit(&mut output),
+        Err(error) => exit_on_write_error(&mut output, &error, "sz-cols"),
     }
 }
 
@@ -353,33 +405,176 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_single_field_index() {
-        assert_eq!(parse_fields("2").unwrap(), vec![1]); // 0-based
-        assert_eq!(parse_fields("1").unwrap(), vec![0]);
+    fn counts_records_a_quiet_run_never_writes() {
+        // `--quiet` extracts into a sink, so the count that becomes the exit status
+        // is the same one a printing run would report.
+        let selection = ColumnSelection::new(&[0], b"\t", None);
+        let config = text_config(b"\t");
+
+        let mut state = ColsState::default();
+        let mut discard = io::sink();
+        extract_cols(
+            b"a\tb\n",
+            &mut state,
+            &selection,
+            Newlines::Lf,
+            &config,
+            &mut discard,
+        )
+        .unwrap();
+        assert!(ExitCode::from_found(state.emitted > 0) == ExitCode::Success);
+
+        let mut state = ColsState::default();
+        extract_cols(
+            b"",
+            &mut state,
+            &selection,
+            Newlines::Lf,
+            &config,
+            &mut discard,
+        )
+        .unwrap();
+        assert!(ExitCode::from_found(state.emitted > 0) == ExitCode::NoResult);
     }
 
     #[test]
-    fn parses_comma_separated_field_list() {
-        assert_eq!(parse_fields("1,3,5").unwrap(), vec![0, 2, 4]);
-        assert_eq!(parse_fields("2, 4").unwrap(), vec![1, 3]); // with spaces
+    fn quiet_rejects_the_flags_it_would_ignore() {
+        // Under `--quiet` the exit status is the whole output, so nothing that shapes a
+        // record can reach it.
+        let rejected = [
+            vec!["sz-cols", "--columns", "1", "--quiet", "--format", "json"],
+            vec!["sz-cols", "--columns", "1", "--quiet", "--null"],
+            vec![
+                "sz-cols",
+                "--columns",
+                "1",
+                "--quiet",
+                "--output-delimiter",
+                ",",
+            ],
+        ];
+        for arguments in rejected {
+            assert!(
+                Args::try_parse_from(&arguments).is_err(),
+                "{:?} must be rejected",
+                arguments
+            );
+        }
+
+        // Which rows survive still steers the status, so the filters compose.
+        let accepted = [
+            vec!["sz-cols", "--columns", "1", "--quiet", "--min-columns", "3"],
+            vec!["sz-cols", "--columns", "1", "--quiet", "--delimiter", ","],
+            vec!["sz-cols", "--columns", "1", "--quiet", "--utf8"],
+        ];
+        for arguments in accepted {
+            assert!(
+                Args::try_parse_from(&arguments).is_ok(),
+                "{:?} must compose",
+                arguments
+            );
+        }
     }
 
     #[test]
-    fn parses_field_range() {
-        assert_eq!(parse_fields("2-5").unwrap(), vec![1, 2, 3, 4]);
-        assert_eq!(parse_fields("1-3").unwrap(), vec![0, 1, 2]);
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "columns",
+                "delimiter",
+                "output-delimiter",
+                "min-columns",
+                "utf8",
+                "format",
+                "null",
+                "quiet",
+                "help",
+                "version",
+            ]
+        );
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
     }
 
     #[test]
-    fn parses_mixed_field_list_and_range() {
-        assert_eq!(parse_fields("1,3-5,7").unwrap(), vec![0, 2, 3, 4, 6]);
+    fn names_the_path_a_failure_happened_on() {
+        // A missing input used to report `Error reading input: …`, naming nothing.
+        let error = at_path("missing.tsv")(io::Error::from(io::ErrorKind::NotFound));
+        assert!(error.to_string().starts_with("missing.tsv: "), "{}", error);
     }
 
     #[test]
-    fn rejects_invalid_field_specs() {
-        assert!(parse_fields("0").is_err()); // 0 not allowed
-        assert!(parse_fields("5-2").is_err()); // invalid range
-        assert!(parse_fields("abc").is_err()); // not a number
+    fn rejects_what_json_would_silently_ignore() {
+        // An empty delimiter used to reach the splitter, and JSON used to drop both flags.
+        let parsed = |arguments: &[&str]| Args::try_parse_from(arguments).unwrap();
+        assert!(validate(&parsed(&["sz-cols", "--columns", "1", "--delimiter", ""])).is_err());
+        assert!(validate(&parsed(&[
+            "sz-cols",
+            "--columns",
+            "1",
+            "--format",
+            "json",
+            "--output-delimiter",
+            ","
+        ]))
+        .is_err());
+        assert!(validate(&parsed(&[
+            "sz-cols",
+            "--columns",
+            "1",
+            "--format",
+            "json",
+            "--null"
+        ]))
+        .is_err());
+        assert!(validate(&parsed(&[
+            "sz-cols",
+            "--columns",
+            "1",
+            "--output-delimiter",
+            ","
+        ]))
+        .is_ok());
+        assert!(validate(&parsed(&["sz-cols", "--columns", "1", "--null"])).is_ok());
+    }
+
+    #[test]
+    fn parses_single_column_index() {
+        assert_eq!(parse_columns("2").unwrap(), vec![1]); // 0-based
+        assert_eq!(parse_columns("1").unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn parses_comma_separated_column_list() {
+        assert_eq!(parse_columns("1,3,5").unwrap(), vec![0, 2, 4]);
+        assert_eq!(parse_columns("2, 4").unwrap(), vec![1, 3]); // with spaces
+    }
+
+    #[test]
+    fn parses_column_range() {
+        assert_eq!(parse_columns("2-5").unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(parse_columns("1-3").unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn parses_mixed_column_list_and_range() {
+        assert_eq!(parse_columns("1,3-5,7").unwrap(), vec![0, 2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn rejects_invalid_column_specs() {
+        assert!(parse_columns("0").is_err()); // 0 not allowed
+        assert!(parse_columns("5-2").is_err()); // invalid range
+        assert!(parse_columns("abc").is_err()); // not a number
     }
 
     fn fields<'a>(line: &'a [u8], delimiter: &'a [u8]) -> Vec<&'a [u8]> {
@@ -424,7 +619,7 @@ mod tests {
     /// Extract from a whole buffer, returning the output and the record count.
     fn extract(
         data: &[u8],
-        selection: &FieldSelection,
+        selection: &ColumnSelection,
         newlines: Newlines,
         config: &OutputConfig,
     ) -> (Vec<u8>, usize) {
@@ -438,7 +633,7 @@ mod tests {
     fn extract_streamed(
         data: &[u8],
         capacity: usize,
-        selection: &FieldSelection,
+        selection: &ColumnSelection,
         newlines: Newlines,
         config: &OutputConfig,
     ) -> (Vec<u8>, usize) {
@@ -463,7 +658,7 @@ mod tests {
 
         let (output, count) = extract(
             data,
-            &FieldSelection::new(&[1], b"\t", None),
+            &ColumnSelection::new(&[1], b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );
@@ -478,7 +673,7 @@ mod tests {
 
         let (output, _) = extract(
             data,
-            &FieldSelection::new(&[0, 2], b"\t", None),
+            &ColumnSelection::new(&[0, 2], b"\t", None),
             Newlines::Lf,
             &text_config(b","),
         );
@@ -492,7 +687,7 @@ mod tests {
 
         let (output, _) = extract(
             data,
-            &FieldSelection::new(&[0, 2], b"\t", None),
+            &ColumnSelection::new(&[0, 2], b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );
@@ -502,12 +697,12 @@ mod tests {
     }
 
     #[test]
-    fn skips_rows_below_min_fields() {
+    fn skips_rows_below_min_columns() {
         let data = b"a\tb\tc\na\n1\t2\t3\n";
 
         let (output, count) = extract(
             data,
-            &FieldSelection::new(&[1], b"\t", Some(3)),
+            &ColumnSelection::new(&[1], b"\t", Some(3)),
             Newlines::Lf,
             &text_config(b"\t"),
         );
@@ -525,7 +720,7 @@ mod tests {
 
         let (output, _) = extract(
             data,
-            &FieldSelection::new(&[0], b"\t", None),
+            &ColumnSelection::new(&[0], b"\t", None),
             Newlines::Lf,
             &config,
         );
@@ -534,14 +729,14 @@ mod tests {
     }
 
     #[test]
-    fn emits_json_records_with_fields() {
+    fn emits_json_records_with_columns() {
         let data = b"a\tb\tc\n";
         let mut config = text_config(b"\t");
         config.json = true;
 
         let (output, _) = extract(
             data,
-            &FieldSelection::new(&[0, 2], b"\t", None),
+            &ColumnSelection::new(&[0, 2], b"\t", None),
             Newlines::Lf,
             &config,
         );
@@ -550,14 +745,14 @@ mod tests {
             String::from_utf8(output).unwrap(),
             concat!(
                 r#"{"type":"line","data":{"path":{"text":"-"},"#,
-                r#""fields":[{"text":"a"},{"text":"c"}],"line_number":1}}"#,
+                r#""columns":[{"text":"a"},{"text":"c"}],"line_number":1}}"#,
                 "\n"
             )
         );
     }
 
     #[test]
-    fn stops_splitting_once_selected_fields_are_in_hand() {
+    fn stops_splitting_once_selected_columns_are_in_hand() {
         let wide: Vec<u8> = {
             let mut line: Vec<u8> = (0..64)
                 .map(|column| format!("c{}", column))
@@ -570,24 +765,24 @@ mod tests {
 
         let early = extract(
             &wide,
-            &FieldSelection::new(&[0, 2], b"\t", None),
+            &ColumnSelection::new(&[0, 2], b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );
         let whole = extract(
             &wide,
-            &FieldSelection {
+            &ColumnSelection {
                 indices: &[0, 2],
                 limit: None,
                 delimiter: b"\t",
-                min_fields: None,
+                min_columns: None,
             },
             Newlines::Lf,
             &text_config(b"\t"),
         );
 
-        assert_eq!(FieldSelection::new(&[0, 2], b"\t", None).limit, Some(3));
-        assert_eq!(FieldSelection::new(&[0, 2], b"\t", Some(4)).limit, None);
+        assert_eq!(ColumnSelection::new(&[0, 2], b"\t", None).limit, Some(3));
+        assert_eq!(ColumnSelection::new(&[0, 2], b"\t", Some(4)).limit, None);
         assert_eq!(early, whole);
         assert_eq!(early.0, b"c0\tc2\n");
     }
@@ -596,7 +791,7 @@ mod tests {
     fn splits_rows_on_unicode_newlines_under_utf8() {
         // Line separators, which only the Unicode newline set breaks on.
         let data = "a\tb\u{2028}c\td\n".as_bytes();
-        let selection = FieldSelection::new(&[1], b"\t", None);
+        let selection = ColumnSelection::new(&[1], b"\t", None);
 
         let (output, count) = extract(data, &selection, Newlines::Unicode, &text_config(b"\t"));
         assert_eq!(count, 2);
@@ -619,9 +814,9 @@ mod tests {
 
         for (newline_set, newlines) in [("lf", Newlines::Lf), ("unicode", Newlines::Unicode)] {
             for selection in [
-                FieldSelection::new(&[1], b"\t", None),
-                FieldSelection::new(&[0, 2], b"\t", None),
-                FieldSelection::new(&[1], b"\t", Some(3)),
+                ColumnSelection::new(&[1], b"\t", None),
+                ColumnSelection::new(&[0, 2], b"\t", None),
+                ColumnSelection::new(&[1], b"\t", Some(3)),
             ] {
                 for config in [text_config(b"\t"), text_config(b","), json] {
                     let whole = extract(data, &selection, newlines, &config);
@@ -644,7 +839,7 @@ mod tests {
         let (output, count) = extract_streamed(
             b"",
             7,
-            &FieldSelection::new(&[0], b"\t", None),
+            &ColumnSelection::new(&[0], b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );

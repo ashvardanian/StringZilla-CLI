@@ -78,5 +78,5 @@ path = "sz_fuzzy_find.rs"
 required-features = ["fuzzy-find"]
 
 [[bin]]
-name = "sz-segment"
-path = "sz_segment.rs"
+name = "sz-segment-utf8"
+path = "sz_segment_utf8.rs"

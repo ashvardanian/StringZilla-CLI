@@ -19,26 +19,27 @@
 //! sz-sort file.txt
 //!
 //! # Reverse (descending) order
-//! sz-sort -r file.txt
+//! sz-sort --reverse file.txt
 //!
 //! # Sort and drop duplicate lines (like `sort -u`)
-//! sz-sort -u file.txt
+//! sz-sort --unique file.txt
 //!
 //! # Case-insensitive sort (full Unicode case folding)
-//! sz-sort -i file.txt
+//! sz-sort --ignore-case file.txt
 //!
-//! # Write to a file instead of stdout
-//! sz-sort file.txt -o sorted.txt
+//! # Write to a file instead of stdout, or back into the input
+//! sz-sort file.txt --output sorted.txt
+//! sz-sort file.txt --in-place
 //!
 //! # Verify a file is already sorted (exit 1 if not)
-//! sz-sort -c file.txt
+//! sz-sort --check file.txt
 //! ```
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::io::{self, Write};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, ValueEnum};
 use stringtape::{BytesCowsAuto, StringTapeError};
 use stringzilla::sz;
 
@@ -144,7 +145,7 @@ fn sorted_order(
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig<'a> {
-    json: bool,
+    format: Format,
     /// Drop lines equal to the one before them, which sorting made adjacent.
     unique: bool,
     terminator: Terminator,
@@ -159,10 +160,10 @@ fn write_line(
     line: &[u8],
     position: usize,
 ) -> io::Result<()> {
-    if config.json {
+    if config.format == Format::Json {
         output.write_all(br#"{"type":"line","data":{"path":"#)?;
         json_text_field_to(output, config.path.as_bytes())?;
-        output.write_all(br#","lines":"#)?;
+        output.write_all(br#","text":"#)?;
         json_text_field_to(output, line)?;
         write!(output, r#","line_number":{}}}}}"#, position + 1)?;
         return output.write_all(b"\n");
@@ -171,14 +172,31 @@ fn write_line(
     output.write_all(&[config.terminator.as_byte()])
 }
 
+/// Write the summary record that closes a JSON stream.
+fn write_summary_json(
+    output: &mut dyn Write,
+    path: &str,
+    total: usize,
+    written: usize,
+) -> io::Result<()> {
+    output.write_all(br#"{"type":"summary","data":{"path":"#)?;
+    json_text_field_to(output, path.as_bytes())?;
+    writeln!(
+        output,
+        r#","written_lines":{},"total_lines":{}}}}}"#,
+        written, total
+    )
+}
+
 /// Write the lines in permutation order, dropping adjacent equals under `--unique`.
+/// Returns how many lines were written.
 fn write_sorted(
     lines: &BytesCowsAuto<'_>,
     permutation: &[sz::SortedIdx],
     order: SortOrder,
     config: &OutputConfig,
     output: &mut dyn Write,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let mut previous: Option<&[u8]> = None;
     let mut written = 0;
     for &index in permutation {
@@ -192,7 +210,11 @@ fn write_sorted(
         write_line(output, config, line, written)?;
         written += 1;
     }
-    output.flush()
+    if config.format == Format::Json {
+        write_summary_json(output, config.path, lines.len(), written)?;
+    }
+    output.flush()?;
+    Ok(written)
 }
 
 /// Check whether `lines` are already in sorted order. Returns the 1-based index
@@ -207,6 +229,13 @@ fn check_sorted(lines: &BytesCowsAuto<'_>, order: SortOrder) -> Option<usize> {
 
 // region: CLI
 
+/// How records are rendered.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    Text,
+    Json,
+}
+
 /// Sort lines in a file or stream
 #[derive(Parser)]
 #[command(name = "sz-sort")]
@@ -215,100 +244,154 @@ struct Args {
     /// Input file (use '-' or omit for stdin)
     input: Option<String>,
 
-    /// Output file (use '-' or omit for stdout)
-    #[arg(short, long)]
+    /// Write to this file instead of stdout
+    #[arg(long, conflicts_with_all = ["in_place", "dry_run"])]
     output: Option<String>,
 
+    /// Rewrite the input file itself, so symlinks and hardlinks survive; a failure during the final copy leaves the new content in a named temporary file
+    #[arg(long, conflicts_with_all = ["dry_run", "null", "quiet"])]
+    in_place: bool,
+
+    /// Sort the input and write nothing
+    #[arg(long)]
+    dry_run: bool,
+
     /// Reverse the result (descending order)
-    #[arg(short, long)]
+    #[arg(long)]
     reverse: bool,
 
     /// Drop duplicate lines, keeping one of each (like `sort -u`)
-    #[arg(short, long)]
+    #[arg(long)]
     unique: bool,
 
-    /// Case-insensitive sort (full Unicode case folding)
-    #[arg(short = 'i', long)]
+    /// Fold case when comparing lines; implies --utf8
+    #[arg(long)]
     ignore_case: bool,
 
-    /// Check whether the input is already sorted; exit 1 if not (no output)
-    #[arg(short = 'c', long)]
+    /// Report through the exit code whether the input is already sorted
+    #[arg(long, conflicts_with_all = ["output", "in_place", "dry_run", "unique", "null", "format", "summary"])]
     check: bool,
 
-    /// Enable UTF-8 mode (handle Unicode newlines: CR, CRLF, NEL, LS, PS)
+    /// Treat the input as UTF-8 text
     #[arg(long)]
     utf8: bool,
 
-    /// Emit JSON Lines, one record per emitted line
-    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
-    json: bool,
+    /// Render records as plain lines or as JSON Lines
+    #[arg(long, value_enum, default_value_t = Format::Text, help_heading = "Output Formats")]
+    format: Format,
 
-    /// NUL-terminate each output line instead of newline
-    #[arg(short = '0', long, help_heading = "Output Formats")]
+    /// Print one line about the whole run on stdout
+    #[arg(long, conflicts_with = "dry_run", help_heading = "Output Formats")]
+    summary: bool,
+
+    /// NUL-terminate each output record instead of newline
+    #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
-    /// Suppress output; with --check, report order through the exit code only
-    #[arg(
-        short = 'q',
-        long,
-        requires = "check",
-        conflicts_with = "output",
-        help_heading = "Output Formats"
-    )]
+    /// Suppress all output; exit 0 if any line was sorted, 1 otherwise
+    #[arg(long, conflicts_with_all = ["output", "dry_run", "null", "summary", "format"], help_heading = "Output Formats")]
     quiet: bool,
 }
 
+/// Report a constraint clap cannot express, rendered as clap renders its own.
+fn reject(message: &str) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+}
+
+/// Name the file a failure happened on, so every diagnostic reads `sz-sort: <path>: <error>`.
+fn at_path(path: &str) -> impl Fn(io::Error) -> io::Error + '_ {
+    move |error| io::Error::new(error.kind(), format!("{}: {}", path, error))
+}
+
+/// Every constraint that depends on an argument's *value*, which clap cannot declare.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    if args.format == Format::Json {
+        if args.null {
+            return Err(reject("--format json cannot be combined with --null"));
+        }
+        if args.in_place {
+            return Err(reject("--format json cannot be combined with --in-place"));
+        }
+    }
+    if args.in_place && args.input.as_deref().is_none_or(|path| path == "-") {
+        return Err(reject(
+            "--in-place requires a file argument (cannot rewrite stdin)",
+        ));
+    }
+    Ok(())
+}
+
 fn main() {
-    let args = Args::parse();
     let mut stdout = io::stdout();
+    match run() {
+        Ok(code) => code.exit(&mut stdout),
+        Err(error) => exit_on_write_error(&mut stdout, &error, "sz-sort"),
+    }
+}
 
-    // UTF-8 mode is implicit when case-insensitive (case folding requires UTF-8).
-    let utf8_mode = args.utf8 || args.ignore_case;
+fn run() -> io::Result<ExitCode> {
+    let args = Args::parse();
+    if let Err(error) = validate(&args) {
+        error.exit();
+    }
 
-    let input = get_input(args.input.as_deref())
-        .unwrap_or_else(|error| exit_with_error(&mut stdout, &error, "Error reading input"));
+    let name = args.input.as_deref().unwrap_or("-");
+    let input = get_input(args.input.as_deref()).map_err(at_path(name))?;
     let data = input.as_bytes();
 
     let order = SortOrder {
         ignore_case: args.ignore_case,
         reverse: args.reverse,
     };
-    let lines = collect_lines(data, Newlines::from_utf8(utf8_mode)).unwrap_or_else(|error| {
-        eprintln!("Error indexing lines: {:?}", error);
-        ExitCode::Error.exit(&mut stdout)
-    });
-    let name = args.input.as_deref().unwrap_or("-");
+    // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
+    let newlines = Newlines::from_utf8(args.utf8 || args.ignore_case);
+    let lines = collect_lines(data, newlines)
+        .map_err(|error| io::Error::other(format!("indexing lines: {:?}", error)))?;
 
     if args.check {
-        match check_sorted(&lines, order) {
-            None => ExitCode::Success.exit(&mut stdout),
+        return Ok(match check_sorted(&lines, order) {
+            None => ExitCode::Success,
             Some(line_number) => {
                 if !args.quiet {
                     eprintln!("sz-sort: {}:{}: disorder", name, line_number);
                 }
-                ExitCode::NoResult.exit(&mut stdout);
+                ExitCode::NoResult
             }
-        }
+        });
     }
 
-    let permutation = sorted_order(&lines, order).unwrap_or_else(|status| {
-        eprintln!("Error sorting: {:?}", status);
-        ExitCode::Error.exit(&mut stdout)
-    });
-
-    let mut output = get_output(args.output.as_deref())
-        .unwrap_or_else(|error| exit_with_error(&mut stdout, &error, "Error opening output"));
-
+    let permutation = sorted_order(&lines, order)
+        .map_err(|status| io::Error::other(format!("sorting: {:?}", status)))?;
     let config = OutputConfig {
-        json: args.json,
+        format: args.format,
         unique: args.unique,
         terminator: Terminator::from_null(args.null),
         path: name,
     };
 
-    if let Err(error) = write_sorted(&lines, &permutation, order, &config, &mut output) {
-        exit_on_write_error(&mut output, &error, "Error writing output");
+    let written = if args.dry_run || args.quiet {
+        write_sorted(&lines, &permutation, order, &config, &mut io::sink())?
+    } else if args.in_place {
+        let path = args.input.as_deref().expect("validated");
+        write_replacing(path, |output| {
+            write_sorted(&lines, &permutation, order, &config, output)
+        })
+        .map_err(at_path(path))?
+    } else {
+        let target = args.output.as_deref().unwrap_or("-");
+        let mut output = get_output(args.output.as_deref()).map_err(at_path(target))?;
+        write_sorted(&lines, &permutation, order, &config, &mut output).map_err(at_path(target))?
+    };
+
+    if args.format == Format::Json {
+        // The record stream went to a sink, so its closing summary still owes stdout.
+        if args.dry_run {
+            write_summary_json(&mut io::stdout(), name, lines.len(), written)?;
+        }
+    } else if args.summary || args.dry_run {
+        println!("{} lines read, {} written", lines.len(), written);
     }
+    Ok(ExitCode::from_found(written > 0))
 }
 
 // endregion: CLI
@@ -318,10 +401,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn text_config(unique: bool) -> OutputConfig<'static> {
         OutputConfig {
-            json: false,
+            format: Format::Text,
             unique,
             terminator: Terminator::Newline,
             path: "-",
@@ -468,6 +552,160 @@ mod tests {
     #[test]
     fn sorts_empty_input_to_empty() {
         assert_eq!(sort_to_string(b"", false, false, false), "");
+    }
+
+    #[test]
+    fn declares_no_short_flags() {
+        let mut command = Args::command();
+        command.build();
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "output",
+                "in-place",
+                "dry-run",
+                "reverse",
+                "unique",
+                "ignore-case",
+                "check",
+                "utf8",
+                "format",
+                "summary",
+                "null",
+                "quiet",
+                "help",
+                "version",
+            ]
+        );
+    }
+
+    /// Parse and then apply the value-conditional checks, as `run` does.
+    fn accepts(flags: &[&str]) -> bool {
+        let arguments = ["sz-sort", "f"].into_iter().chain(flags.iter().copied());
+        Args::try_parse_from(arguments).is_ok_and(|args| validate(&args).is_ok())
+    }
+
+    #[test]
+    fn keeps_check_alone_and_rejects_the_flags_it_discards() {
+        assert!(accepts(&["--check"]));
+        for flags in [
+            vec!["--check", "--output", "o"],
+            vec!["--check", "--in-place"],
+            vec!["--check", "--dry-run"],
+            vec!["--check", "--unique"],
+            vec!["--check", "--null"],
+            vec!["--check", "--format", "json"],
+            vec!["--check", "--summary"],
+        ] {
+            assert!(!accepts(&flags), "expected {:?} to be rejected", flags);
+        }
+    }
+
+    #[test]
+    fn declares_the_destination_conflicts() {
+        assert!(accepts(&["--in-place"]));
+        for flags in [
+            vec!["--in-place", "--output", "o"],
+            vec!["--in-place", "--dry-run"],
+            vec!["--in-place", "--null"],
+            vec!["--in-place", "--format", "json"],
+            vec!["--null", "--format", "json"],
+        ] {
+            assert!(!accepts(&flags), "expected {:?} to be rejected", flags);
+        }
+        let args = Args::try_parse_from(["sz-sort", "--in-place"]).unwrap();
+        assert!(validate(&args).is_err(), "--in-place cannot rewrite stdin");
+    }
+
+    #[test]
+    fn takes_quiet_alone_and_rejects_what_it_would_suppress() {
+        assert!(accepts(&["--quiet"]), "--quiet must stand on its own");
+        for flags in [
+            vec!["--quiet", "--format", "json"],
+            vec!["--quiet", "--null"],
+            vec!["--quiet", "--summary"],
+            vec!["--quiet", "--output", "o"],
+            vec!["--quiet", "--dry-run"],
+            vec!["--quiet", "--in-place"],
+        ] {
+            assert!(!accepts(&flags), "expected {:?} to be rejected", flags);
+        }
+    }
+
+    #[test]
+    fn rejects_summary_where_dry_run_already_prints_it() {
+        assert!(!accepts(&["--summary", "--dry-run"]));
+    }
+
+    #[test]
+    fn closes_a_json_stream_with_its_summary() {
+        assert!(accepts(&["--summary", "--format", "json"]));
+        let lines = lines_of(b"b\na\n");
+        let order = SortOrder {
+            ignore_case: false,
+            reverse: false,
+        };
+        let permutation = sorted_order(&lines, order).unwrap();
+        let config = OutputConfig {
+            format: Format::Json,
+            unique: false,
+            terminator: Terminator::Newline,
+            path: "f.txt",
+        };
+        let mut output = Vec::new();
+
+        write_sorted(&lines, &permutation, order, &config, &mut output).unwrap();
+
+        let text = String::from_utf8(output).unwrap();
+        let records: Vec<_> = text.lines().collect();
+        assert_eq!(records.len(), 3);
+        assert!(records[2].contains(r#""type":"summary""#));
+        assert!(records[2].contains(r#""written_lines":2,"total_lines":2"#));
+    }
+
+    #[test]
+    fn rewrites_the_input_through_a_temporary_file() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("lines.txt");
+        fs::write(&path, b"b\na\n").unwrap();
+
+        write_replacing(path.to_str().unwrap(), |output| output.write_all(b"a\nb\n")).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"a\nb\n");
+        let leftovers: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, ["lines.txt"]);
+    }
+
+    #[test]
+    fn leaves_the_input_untouched_when_the_rewrite_fails() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("lines.txt");
+        fs::write(&path, b"original\n").unwrap();
+
+        let failed: io::Result<()> = write_replacing(path.to_str().unwrap(), |output| {
+            output.write_all(b"partial\n")?;
+            Err(io::Error::other("interrupted"))
+        });
+
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original\n");
     }
 }
 

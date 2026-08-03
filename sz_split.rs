@@ -7,21 +7,21 @@
 //!
 //! ```bash
 //! # Split by line count
-//! sz-split -l 1000 large.txt output_prefix
+//! sz-split --chunk-lines 1000 large.txt output_prefix
 //!
 //! # Split on Unicode newlines rather than LF alone
-//! sz-split --utf8 -l 1000 utf8_file.txt output
+//! sz-split --utf8 --chunk-lines 1000 utf8_file.txt output
 //!
 //! # From stdin
-//! cat large.txt | sz-split -l 1000 output
+//! cat large.txt | sz-split --chunk-lines 1000 output
 //! ```
 
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::num::NonZeroUsize;
 
-use clap::Parser;
-use stringzilla::sz::{self, StringZillableBinary};
+use clap::{CommandFactory, Parser};
+use stringzilla::sz;
 
 mod shared;
 use shared::*;
@@ -41,41 +41,38 @@ struct Args {
     prefix: String,
 
     /// Number of lines per output file
-    #[arg(short = 'l', long = "chunk-lines", alias = "lines", value_name = "N",
-          value_parser = parse_at_least_one, group = "chunking", help_heading = "Chunk Size")]
+    #[arg(long, value_name = "N", value_parser = parse_at_least_one,
+          group = "chunking", help_heading = "Chunk Size")]
     chunk_lines: Option<NonZeroUsize>,
 
     /// Bytes per output file, never splitting a line; accepts K/M/G/T and Ki/Mi/Gi/Ti
     #[arg(long, value_name = "SIZE", value_parser = parse_size,
-          group = "chunking", conflicts_with = "utf8", help_heading = "Chunk Size")]
+          group = "chunking", help_heading = "Chunk Size")]
     chunk_bytes: Option<NonZeroUsize>,
 
     /// Cut into exactly N files of near-equal bytes at line boundaries; needs a seekable input
     #[arg(long, value_name = "N", value_parser = parse_at_least_one,
-          group = "chunking", conflicts_with = "utf8", help_heading = "Chunk Size")]
-    chunks: Option<NonZeroUsize>,
+          group = "chunking", help_heading = "Chunk Size")]
+    chunk_count: Option<NonZeroUsize>,
 
-    /// Start a new chunk at each line beginning with LITERAL, as `csplit` does with a
-    /// regex — FASTA `>`, mbox `From `, SQL `CREATE TABLE`, Markdown `## `
-    #[arg(short = 'p', long, value_name = "LITERAL", value_parser = parse_pattern,
-          group = "chunking", conflicts_with = "utf8", help_heading = "Chunk Size")]
-    pattern: Option<String>,
+    /// Start a new chunk at each line beginning with LITERAL, as `csplit` does with a regex
+    #[arg(long, value_name = "LITERAL", value_parser = parse_pattern,
+          group = "chunking", help_heading = "Chunk Size")]
+    chunk_pattern: Option<String>,
 
-    /// Fold case when matching --pattern, with full Unicode folding
-    ///
-    /// Checked in `main` rather than with clap's `requires`, which does not fire for an
-    /// argument that belongs to a group another member has already satisfied.
-    #[arg(short = 'i', long)]
+    /// Fold case when matching --chunk-pattern; implies --utf8
+    // Needing a pattern is checked in `validate`: clap's `requires` does not fire for an
+    // argument whose group another member has already satisfied.
+    #[arg(long)]
     ignore_case: bool,
 
-    /// Repeat the input's first N lines atop every chunk, so each one parses alone.
-    /// Breaks `cat <prefix>*` reproducing the input, which is why it is opt-in.
+    /// Repeat the input's first N lines atop every chunk, so each one parses alone
     #[arg(long, value_name = "N", num_args = 0..=1, require_equals = true,
           default_missing_value = "1", value_parser = parse_at_least_one,
           help_heading = "Chunk Size")]
     repeat_header: Option<NonZeroUsize>,
 
-    /// Enable UTF-8 mode (split on Unicode newlines: CR, CRLF, NEL, LS, PS; chunk lines end with LF)
+    /// Treat the input as UTF-8 text
     #[arg(long)]
     utf8: bool,
 
@@ -83,13 +80,26 @@ struct Args {
     #[arg(long, value_parser = parse_at_least_one, default_value = "2")]
     suffix_length: NonZeroUsize,
 
-    /// Emit a JSON Lines manifest of the files written, one record each
-    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
-    json: bool,
+    /// Announce every written chunk on stdout
+    #[arg(
+        long,
+        value_name = "KIND",
+        value_enum,
+        default_value = "none",
+        help_heading = "Output Formats"
+    )]
+    manifest: Manifest,
+}
 
-    /// Print each written path NUL-terminated, for `xargs -0`
-    #[arg(short = '0', long, help_heading = "Output Formats")]
-    null: bool,
+/// How a written chunk is announced.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Manifest {
+    /// Nothing, so a run that asked for no manifest writes no stdout at all.
+    None,
+    /// The path alone, NUL-terminated, for `xargs -0`.
+    Paths,
+    /// A JSON Lines record carrying the tallies.
+    Json,
 }
 
 /// The chunk name suffix for `index` — aa, ab, ac, ... az, ba, bb, ... — or `None` once
@@ -129,6 +139,39 @@ struct Fill<'a> {
     closes: bool,
 }
 
+/// A literal needle in the form its search kernel wants. Case folding is decided once, and
+/// the uncased metadata is analyzed once rather than on every call.
+///
+/// Under folding a match is not the needle's length: the kernel compares folded text, so
+/// "strasse" matches "Straße" and the span covers the source bytes, not the needle's.
+struct Literal<'a> {
+    pattern: &'a [u8],
+    folded: Option<sz::Utf8UncasedNeedle<'a>>,
+}
+
+impl<'a> Literal<'a> {
+    /// Analyze `pattern` once. `ignore_case` selects full Unicode case folding.
+    fn new(pattern: &'a [u8], ignore_case: bool) -> Self {
+        Self {
+            pattern,
+            folded: ignore_case.then(|| sz::Utf8UncasedNeedle::new(pattern)),
+        }
+    }
+
+    /// The leftmost match at or after the start of `data`.
+    #[inline]
+    fn find_in(&self, data: &[u8]) -> Option<Span> {
+        match &self.folded {
+            Some(needle) => sz::utf8_uncased_search(data, needle)
+                .map(|(offset, length)| Span { offset, length }),
+            None => sz::find(data, self.pattern).map(|offset| Span {
+                offset,
+                length: self.pattern.len(),
+            }),
+        }
+    }
+}
+
 /// A line-anchored literal delimiter.
 ///
 /// The needle is the pattern alone and the anchor is checked against the byte before a
@@ -147,12 +190,12 @@ impl Delimiter<'_> {
     ///
     /// Matches away from a line start are skipped rather than ending the search, so a `>`
     /// inside a FASTA sequence line does not hide the record that follows it.
-    fn next_cut(&self, data: &[u8], from: usize) -> Option<usize> {
+    fn next_cut(&self, data: &[u8], from: usize, newlines: Newlines) -> Option<usize> {
         let mut at = from;
         loop {
             let found = self.needle.find_in(data.get(at..)?)?;
             let position = at + found.offset;
-            if position == 0 || data[position - 1] == b'\n' {
+            if position == 0 || ends_with_terminator(&data[..position], newlines) {
                 return Some(position);
             }
             // Advancing past the whole rejected match would skip an anchored match
@@ -160,7 +203,6 @@ impl Delimiter<'_> {
             at = position + 1;
         }
     }
-
 }
 
 /// How chunk boundaries are chosen, decided once from `Args`.
@@ -186,11 +228,11 @@ impl SplitMode<'_> {
     ///
     /// Never returns both an empty span and `closes == false`: the caller's loop makes
     /// progress on every turn by writing bytes, closing a chunk, or both.
-    fn fill<'d>(&self, rest: &'d [u8], filled: Filled) -> Fill<'d> {
+    fn fill<'d>(&self, rest: &'d [u8], filled: Filled, newlines: Newlines) -> Fill<'d> {
         match *self {
             SplitMode::Lines(per_file) => {
                 let wanted = per_file.get() - filled.lines;
-                let (span, lines) = span_filling_chunk(rest, wanted);
+                let (span, lines) = span_filling_chunk(rest, wanted, newlines);
                 Fill {
                     span,
                     lines,
@@ -199,10 +241,10 @@ impl SplitMode<'_> {
             }
             SplitMode::Bytes(budget) => {
                 let room = budget.get() - filled.bytes.min(budget.get());
-                let span = span_within_budget(rest, room, filled.fresh);
+                let span = span_within_budget(rest, room, filled.fresh, newlines);
                 Fill {
                     span,
-                    lines: count_lines(span),
+                    lines: count_lines(span, newlines),
                     // A chunk that took everything offered may still have room, and the
                     // next window can fill it; one that stopped short stopped at its limit.
                     closes: span.len() < rest.len(),
@@ -214,32 +256,22 @@ impl SplitMode<'_> {
                 // already holds something can close on a match at offset 0, writing
                 // nothing — and the turn after that finds the chunk empty and moves on.
                 let from = usize::from(filled.fresh).min(rest.len());
-                match delimiter.next_cut(rest, from) {
+                match delimiter.next_cut(rest, from, newlines) {
                     Some(cut) => {
                         let span = &rest[..cut];
                         Fill {
                             span,
-                            lines: count_lines(span),
+                            lines: count_lines(span, newlines),
                             closes: true,
                         }
                     }
                     None => Fill {
                         span: rest,
-                        lines: count_lines(rest),
+                        lines: count_lines(rest, newlines),
                         closes: false,
                     },
                 }
             }
-        }
-    }
-
-    /// Lines a chunk holds, when the mode is expressed that way. The line-at-a-time path
-    /// asks per line rather than per span, so it reads the budget directly.
-    fn line_capacity(&self) -> NonZeroUsize {
-        match *self {
-            SplitMode::Lines(per_file) => per_file,
-            // `--utf8` pairs only with a line budget; the others are rejected at the CLI.
-            _ => unreachable!("only a line budget reaches the line-at-a-time path"),
         }
     }
 }
@@ -255,7 +287,9 @@ fn parse_pattern(value: &str) -> Result<String, String> {
         return Err("must not be empty".to_string());
     }
     if value.contains('\n') {
-        return Err("must not contain a newline, since it matches the start of one line".to_string());
+        return Err(
+            "must not contain a newline, since it matches the start of one line".to_string(),
+        );
     }
     Ok(value.to_string())
 }
@@ -267,6 +301,9 @@ struct SplitConfig<'a> {
     prefix: &'a str,
     /// Which boundaries end a chunk.
     mode: SplitMode<'a>,
+    /// Which byte sequences break a line, and nothing else: chunks are ranges of the input,
+    /// so no terminator is ever rewritten.
+    newlines: Newlines,
     /// Width of the generated suffix.
     suffix_length: NonZeroUsize,
     /// Lines repeated at the top of every chunk, already taken off the input. Empty unless
@@ -274,7 +311,7 @@ struct SplitConfig<'a> {
     /// reproducing the input.
     header: &'a [u8],
     /// How each written chunk is announced.
-    report: Report,
+    manifest: Manifest,
     /// Lines `header` carries, so the manifest can say how much of a chunk is not data.
     header_lines: usize,
 }
@@ -292,10 +329,6 @@ struct OpenChunk {
     wrote_data: bool,
     /// Bytes written into it.
     bytes: usize,
-    /// Whether the bytes written so far end with a newline. The range path copies the
-    /// input verbatim, so an unterminated final line reaches the chunk unterminated, and
-    /// [`close_chunk`] is where the output's trailing newline is restored.
-    ends_with_newline: bool,
     /// The chunk file itself.
     file: BufWriter<File>,
 }
@@ -346,7 +379,7 @@ fn create_chunk(filename: &str) -> io::Result<BufWriter<File>> {
 }
 
 /// Flush the open chunk and record it in the manifest, readying `state` for the next one.
-/// A run without `--json` writes the record into [`io::sink`], so there is one path here.
+/// A run without `--manifest` writes the record into [`io::sink`], so there is one path here.
 fn close_chunk(
     state: &mut SplitState,
     config: &SplitConfig,
@@ -355,17 +388,11 @@ fn close_chunk(
     let Some(mut chunk) = state.open.take() else {
         return Ok(());
     };
-    // Output is normalized to end with a newline, whatever the input's last line did.
-    if !chunk.ends_with_newline {
-        chunk.file.write_all(b"\n")?;
-        chunk.bytes += 1;
-        chunk.ends_with_newline = true;
-    }
     chunk.file.flush()?;
     // The manifest reports the file as it is on disk, header included.
     write_manifest_entry(
         manifest,
-        config.report,
+        config.manifest,
         &chunk.name,
         chunk.lines + chunk.header_lines,
         chunk.bytes,
@@ -398,57 +425,57 @@ fn open_chunk<'a>(
             header_lines: config.header_lines,
             wrote_data: false,
             bytes: config.header.len(),
-            ends_with_newline: config.header.is_empty() || config.header.ends_with(b"\n"),
             file,
         });
     }
     Ok(state.open.as_mut().expect("just opened"))
 }
 
-/// Write every complete line in `data` into chunk files, resuming from `state`. The chunk
-/// left open at the end is the caller's to [`close_chunk`].
-///
-/// A chunk is a contiguous range of the input, so LF mode copies that range whole. Under
-/// `--utf8` it is not: every Unicode terminator is rewritten to LF, which only a pass that
-/// sees each line can do.
-fn split_by_lines(
-    data: &[u8],
-    state: &mut SplitState,
-    newlines: Newlines,
-    config: &SplitConfig,
-    manifest: &mut dyn Write,
-) -> io::Result<()> {
+/// Whether `data` ends with a line terminator of the chosen set. A chunk ending in CR, NEL,
+/// LS or PS is terminated, and asking `ends_with(b"\n")` would report it as unfinished and
+/// append an LF the input never held.
+fn ends_with_terminator(data: &[u8], newlines: Newlines) -> bool {
     match newlines {
-        Newlines::Lf => split_by_ranges(data, state, config, manifest),
-        Newlines::Unicode => split_line_by_line(data, state, newlines, config, manifest),
+        Newlines::Lf => data.ends_with(b"\n"),
+        Newlines::Unicode => matches!(
+            data,
+            [.., b'\n' | b'\r' | 0x0B | 0x0C]
+                | [.., 0xC2, 0x85]
+                | [.., 0xE2, 0x80, 0xA8]
+                | [.., 0xE2, 0x80, 0xA9]
+        ),
     }
 }
 
-/// The prefix of `data` that fills the open chunk: everything through its `wanted`-th
-/// newline, or all of `data` when it holds fewer. `wanted` is at least 1, since a chunk
+/// Length of the first line of `data`, terminator included, or all of `data` when it holds
+/// no terminator at all.
+fn first_line_end(data: &[u8], newlines: Newlines) -> usize {
+    LineSpans::new(data, newlines)
+        .next()
+        .map_or(data.len(), |span| span.length)
+}
+
+/// The prefix of `data` that fills the open chunk: everything through its `wanted`-th line
+/// terminator, or all of `data` when it holds fewer. `wanted` is at least 1, since a chunk
 /// closes the moment it fills. Also reports how many lines that prefix carries.
-fn span_filling_chunk(data: &[u8], wanted: usize) -> (&[u8], usize) {
+fn span_filling_chunk(data: &[u8], wanted: usize, newlines: Newlines) -> (&[u8], usize) {
     debug_assert!(wanted >= 1, "a full chunk should have been closed already");
+    let mut end = 0;
     let mut seen = 0;
-    for newline in data.sz_matches(b"\n") {
+    for span in LineSpans::new(data, newlines) {
+        end = span.offset + span.length;
         seen += 1;
         if seen == wanted {
-            return (&data[..offset_within(data, newline) + newline.len()], seen);
+            break;
         }
     }
-    // The input ran out first: the tail is the chunk, and an unterminated last line still
-    // counts as a line, as it does for the line-at-a-time path below. Counting as we go
-    // rather than asking twice keeps this to one pass over the tail.
-    (data, seen + usize::from(!data.ends_with(b"\n")))
+    (&data[..end], seen)
 }
 
 /// Lines in `span`, counting an unterminated last line as one, exactly as
 /// [`span_filling_chunk`] does for the mode that counts as it goes.
-fn count_lines(span: &[u8]) -> usize {
-    if span.is_empty() {
-        return 0;
-    }
-    span.sz_matches(b"\n").count() + usize::from(!span.ends_with(b"\n"))
+fn count_lines(span: &[u8], newlines: Newlines) -> usize {
+    LineSpans::new(span, newlines).count()
 }
 
 /// The longest prefix of `data` that ends on a line boundary within `room` bytes.
@@ -457,25 +484,23 @@ fn count_lines(span: &[u8]) -> usize {
 /// something — the caller closes it and offers the line to an empty chunk, where
 /// `chunk_is_empty` lets it through whole rather than looping forever. Splitting a line is
 /// never an option, so an over-long line produces an over-budget chunk of its own.
-fn span_within_budget(data: &[u8], room: usize, chunk_is_empty: bool) -> &[u8] {
+fn span_within_budget(data: &[u8], room: usize, chunk_is_empty: bool, newlines: Newlines) -> &[u8] {
     // Everything left fits, so there is nothing to cut: returning it whole keeps the chunk
     // open for the next window instead of closing on an unterminated tail.
     if room >= data.len() {
         return data;
     }
-    match sz::rfind(&data[..room], b"\n") {
-        Some(position) => &data[..position + 1],
+    match last_cut(&data[..room], newlines.into()) {
+        Some(position) => &data[..position],
         // No boundary inside the budget: take the whole first line if this chunk is
         // otherwise empty, take nothing if it is not.
-        None if chunk_is_empty => match sz::find(data, b"\n") {
-            Some(position) => &data[..position + 1],
-            None => data,
-        },
+        None if chunk_is_empty => &data[..first_line_end(data, newlines)],
         None => &data[..0],
     }
 }
 
-/// Append `span` to the open chunk, keeping its tallies and its end-of-chunk state honest.
+/// Append `span` to the open chunk, keeping its tallies honest. Bytes reach the chunk exactly
+/// as they arrived: nothing is added, so `cat <prefix>*` reproduces the input.
 ///
 /// The span goes to the kernel in one call however large it is. Feeding it in fixed pieces
 /// was measurably faster once and is not any more — over the 5 GB corpus, 800 MB chunks
@@ -484,17 +509,14 @@ fn write_span(chunk: &mut OpenChunk, span: &[u8], lines: usize) -> io::Result<()
     chunk.file.write_all(span)?;
     chunk.lines += lines;
     chunk.bytes += span.len();
-    // An empty span says nothing about how the chunk ends, and must not overwrite what
-    // `close_chunk` reads to decide whether to restore the trailing newline.
-    if !span.is_empty() {
-        chunk.ends_with_newline = span.ends_with(b"\n");
-        chunk.wrote_data = true;
-    }
+    // An empty span is not data: a pattern chunk closing at offset 0 writes nothing, and
+    // calling that "written" would make the next chunk refuse its own delimiter.
+    chunk.wrote_data |= !span.is_empty();
     Ok(())
 }
 
-/// Copy each chunk's byte range out of `data` in one write, which is what splitting on LF
-/// is: the bytes reach the chunk exactly as they arrived.
+/// Copy each chunk's byte range out of `data` in one write, which is what splitting is: the
+/// bytes reach the chunk exactly as they arrived, whichever terminator ended them.
 fn split_by_ranges(
     data: &[u8],
     state: &mut SplitState,
@@ -507,7 +529,7 @@ fn split_by_ranges(
         // `state` again below.
         let closes = {
             let chunk = open_chunk(state, config)?;
-            let fill = config.mode.fill(rest, chunk.filled());
+            let fill = config.mode.fill(rest, chunk.filled(), config.newlines);
             debug_assert!(
                 !fill.span.is_empty() || fill.closes,
                 "a turn that writes nothing has to close a chunk, or the loop stalls"
@@ -524,64 +546,65 @@ fn split_by_ranges(
     Ok(())
 }
 
-/// Write one line at a time, re-terminating each with LF. Only `--utf8` needs this, where
-/// the seven Unicode terminators are normalized away and no range of the input would do.
-fn split_line_by_line(
-    data: &[u8],
-    state: &mut SplitState,
-    newlines: Newlines,
-    config: &SplitConfig,
-    manifest: &mut dyn Write,
-) -> io::Result<()> {
-    for line in LineIter::new(data, newlines) {
-        let filled = {
-            let chunk = open_chunk(state, config)?;
-            chunk.file.write_all(line)?;
-            chunk.file.write_all(b"\n")?;
-            chunk.lines += 1;
-            chunk.bytes += line.len() + 1;
-            chunk.wrote_data = true;
-            chunk.lines >= config.mode.line_capacity().get()
-        };
-        if filled {
-            close_chunk(state, config, manifest)?;
-        }
-    }
-
-    Ok(())
+/// The error an unmeetable `--chunk-count` raises: every chunk needs a byte of its own, so a
+/// count past the input's size can never be honoured, however the boundaries are placed.
+fn chunk_count_exceeds_input(wanted: NonZeroUsize, total: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "--chunk-count {} exceeds the input's {} bytes, which cannot yield that many chunks",
+            wanted, total
+        ),
+    )
 }
 
 /// Where to cut `total` bytes into `wanted` chunks of near-equal size, snapped forward to
 /// the next line boundary. Returns the `wanted - 1` interior cut offsets; the last chunk
-/// runs to the end.
+/// runs to the end. Fails when `wanted` exceeds the input's size, which no placement of
+/// boundaries can honour and which a plan would otherwise try to allocate for.
 ///
 /// Each boundary costs one search from its ideal offset rather than a scan of everything
 /// before it, so the whole plan is `wanted` searches over a mapped input regardless of how
 /// large it is. Snapping can collapse two boundaries onto the same offset when lines are
 /// long relative to `total / wanted`; the chunk between them is then empty, which is
 /// reported rather than skipped so that the run yields exactly `wanted` files.
-fn plan_equal_chunks(data: &[u8], wanted: NonZeroUsize) -> Vec<usize> {
+fn plan_equal_chunks(
+    data: &[u8],
+    wanted: NonZeroUsize,
+    newlines: Newlines,
+) -> io::Result<Vec<usize>> {
     let total = data.len();
-    let mut cuts = Vec::with_capacity(wanted.get().saturating_sub(1));
+    if wanted.get() > total {
+        return Err(chunk_count_exceeds_input(wanted, total));
+    }
+    let mut cuts = Vec::with_capacity(wanted.get() - 1);
     let mut previous = 0;
     for index in 1..wanted.get() {
-        // Multiplying first keeps the boundaries evenly spaced; dividing first would
-        // truncate each one and drift by up to `wanted` bytes by the last.
-        let ideal = total * index / wanted.get();
-        let cut = match sz::find(&data[ideal..], b"\n") {
-            Some(position) => ideal + position + 1,
-            None => total,
-        };
+        // Multiplying first keeps the boundaries evenly spaced, where dividing first would
+        // truncate each one; the widening is what keeps `total * index` from overflowing.
+        let ideal = (total as u128 * index as u128 / wanted.get() as u128) as usize;
+        let cut = ideal + first_line_end(&data[ideal..], newlines);
         // Boundaries never move backwards, so a chunk is never handed a negative span.
         previous = cut.max(previous);
         cuts.push(previous);
     }
-    cuts
+    Ok(cuts)
 }
 
-/// Write `data` as the ranges `cuts` describes, then the tail. Used by `--chunks`, whose
-/// boundaries are known before any byte is written, so no per-chunk searching is needed.
+/// Write `data` as the ranges `cuts` describes, then the tail. Used by `--chunk-count`,
+/// whose boundaries are known before any byte is written, so nothing is searched per chunk.
 fn split_at_offsets(
+    data: &[u8],
+    cuts: &[usize],
+    config: &SplitConfig,
+    manifest: &mut dyn Write,
+) -> io::Result<usize> {
+    let mut state = SplitState::default();
+    let written = write_ranges(data, cuts, &mut state, config, manifest);
+    finish(written, &mut state, config, manifest)
+}
+
+fn write_ranges(
     data: &[u8],
     cuts: &[usize],
     state: &mut SplitState,
@@ -591,11 +614,25 @@ fn split_at_offsets(
     let mut start = 0;
     for end in cuts.iter().copied().chain([data.len()]) {
         let span = &data[start.min(data.len())..end.min(data.len())];
-        write_span(open_chunk(state, config)?, span, count_lines(span))?;
+        let lines = count_lines(span, config.newlines);
+        write_span(open_chunk(state, config)?, span, lines)?;
         close_chunk(state, config, manifest)?;
         start = end;
     }
     Ok(())
+}
+
+/// Retire whatever chunk a run left open, whether it ended or failed, and answer how many
+/// chunk files it wrote. A failed run closes its chunk before its error surfaces, so the
+/// bytes already accepted reach the disk rather than dying in a buffer.
+fn finish(
+    result: io::Result<()>,
+    state: &mut SplitState,
+    config: &SplitConfig,
+    manifest: &mut dyn Write,
+) -> io::Result<usize> {
+    let closed = close_chunk(state, config, manifest);
+    result.and(closed).map(|()| state.file_index)
 }
 
 /// Largest header the streaming path will buffer. A header is a handful of column names,
@@ -617,7 +654,7 @@ fn header_exceeds_budget(header: usize, budget: usize) -> io::Error {
 
 /// The first records of an input, taken off before splitting begins.
 struct Header<'a> {
-    /// The header itself, with terminators normalized as the mode normalizes them.
+    /// The header itself, terminators included exactly as the input wrote them.
     bytes: Vec<u8>,
     /// What is left of the input once the header is removed.
     rest: &'a [u8],
@@ -628,48 +665,14 @@ struct Header<'a> {
     terminated: bool,
 }
 
-/// Split `data` into the first `lines` records and the rest. Under `--utf8` the header is
-/// normalized like every other line, so a chunk reads the same whichever mode wrote it.
+/// Split `data` into the first `lines` records and the rest.
 fn take_header(data: &[u8], lines: NonZeroUsize, newlines: Newlines) -> Header<'_> {
-    match newlines {
-        Newlines::Lf => {
-            let (span, seen) = span_filling_chunk(data, lines.get());
-            Header {
-                bytes: span.to_vec(),
-                rest: &data[span.len()..],
-                lines: seen,
-                terminated: span.ends_with(b"\n"),
-            }
-        }
-        Newlines::Unicode => {
-            // Terminators are normalized to LF here as they are everywhere in this mode, so
-            // the header cannot report whether its last line was terminated by inspecting
-            // the bytes it produced. Where the *next* line starts answers both questions:
-            // it is where the rest begins, and its existence is what proves the header's
-            // last line ended rather than being cut off by a window seam.
-            let mut header = Vec::new();
-            let mut seen = 0;
-            let mut lines_iter = LineIter::new(data, newlines).peekable();
-            let mut consumed = 0;
-            while let Some(line) = lines_iter.next() {
-                header.extend_from_slice(line);
-                header.push(b'\n');
-                seen += 1;
-                consumed = match lines_iter.peek() {
-                    Some(next) => offset_within(data, next),
-                    None => data.len(),
-                };
-                if seen == lines.get() {
-                    break;
-                }
-            }
-            Header {
-                bytes: header,
-                rest: &data[consumed.min(data.len())..],
-                lines: seen,
-                terminated: consumed < data.len(),
-            }
-        }
+    let (span, seen) = span_filling_chunk(data, lines.get(), newlines);
+    Header {
+        bytes: span.to_vec(),
+        rest: &data[span.len()..],
+        lines: seen,
+        terminated: ends_with_terminator(span, newlines),
     }
 }
 
@@ -688,9 +691,12 @@ fn take_header_streaming<R: Read>(
         }
         let filled = refill.filled();
         let header = take_header(filled, lines, newlines);
+        // A trailing CR may be half a CRLF whose LF is still to arrive.
+        let ambiguous = header.bytes.ends_with(b"\r") && newlines == Newlines::Unicode;
         // An unterminated last line may simply be a window cut mid-record, so it counts
         // only once the input has ended and no more of it is coming.
-        let complete = refill.at_eof() || (header.lines >= lines.get() && header.terminated);
+        let complete =
+            refill.at_eof() || (header.lines >= lines.get() && header.terminated && !ambiguous);
         let consumed = filled.len() - header.rest.len();
         let (bytes, taken) = (header.bytes, header.lines);
         if complete {
@@ -712,63 +718,46 @@ fn take_header_streaming<R: Read>(
 }
 
 /// Split a whole buffer, closing the chunk left open at the end.
-fn split_buffer(
-    data: &[u8],
-    newlines: Newlines,
-    config: &SplitConfig,
-    manifest: &mut dyn Write,
-) -> io::Result<()> {
+fn split_buffer(data: &[u8], config: &SplitConfig, manifest: &mut dyn Write) -> io::Result<usize> {
     let mut state = SplitState::default();
-    split_by_lines(data, &mut state, newlines, config, manifest)?;
-    close_chunk(&mut state, config, manifest)
+    let written = split_by_ranges(data, &mut state, config, manifest);
+    finish(written, &mut state, config, manifest)
 }
 
 // region: Streaming
 
-/// Drive [`split_by_lines`] over a reader, handing it whole-line prefixes of one reused
+/// Drive [`split_by_ranges`] over a reader, handing it whole-line prefixes of one reused
 /// window so that a pipe costs bounded memory rather than the input's size.
 fn stream_split<R: Read>(
     refill: &mut Refill<R>,
-    newlines: Newlines,
     config: &SplitConfig,
     manifest: &mut dyn Write,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let mut state = SplitState::default();
-    refill.for_each_window(newlines.into(), |window| {
-        split_by_lines(window, &mut state, newlines, config, manifest)
-    })?;
-    close_chunk(&mut state, config, manifest)
+    let written = refill.for_each_window(config.newlines.into(), |window| {
+        split_by_ranges(window, &mut state, config, manifest)
+    });
+    finish(written, &mut state, config, manifest)
 }
 
 // endregion: Streaming
 
-/// How a written chunk is announced.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Report {
-    /// Nothing, which is what a run that asked for neither format gets.
-    Silent,
-    /// A JSON Lines record carrying the tallies.
-    Json,
-    /// The path alone, NUL-terminated, for `xargs -0`.
-    NullPath,
-}
-
 /// Write one manifest record naming a file that was written.
 fn write_manifest_entry(
     output: &mut dyn Write,
-    report: Report,
+    manifest: Manifest,
     name: &str,
     lines: usize,
     bytes: usize,
     header_lines: usize,
 ) -> io::Result<()> {
-    match report {
-        Report::Silent => return Ok(()),
-        Report::NullPath => {
+    match manifest {
+        Manifest::None => return Ok(()),
+        Manifest::Paths => {
             output.write_all(name.as_bytes())?;
             return output.write_all(&[0]);
         }
-        Report::Json => {}
+        Manifest::Json => {}
     }
     output.write_all(br#"{"type":"file","data":{"path":"#)?;
     json_text_field_to(output, name.as_bytes())?;
@@ -781,131 +770,202 @@ fn write_manifest_entry(
     )
 }
 
-fn main() {
+/// Report a constraint clap cannot express, rendered as clap renders its own.
+fn reject(message: String) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+}
+
+/// Reject the combinations clap cannot: it conflicts on an argument's presence and never on
+/// its value, so anything conditioned on a value is checked here, once, before any input is
+/// read and any chunk file is created.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    // Folding is a property of the pattern, so asking for it without one is a mistake worth
+    // naming rather than a flag that quietly does nothing.
+    if args.ignore_case && args.chunk_pattern.is_none() {
+        return Err(reject(
+            "--ignore-case folds the --chunk-pattern match, so it needs a --chunk-pattern to fold"
+                .to_string(),
+        ));
+    }
+    if let Some(wanted) = args.chunk_count {
+        let width = args.suffix_length.get();
+        let nameable = u32::try_from(width)
+            .ok()
+            .and_then(|width| 26usize.checked_pow(width))
+            .unwrap_or(usize::MAX);
+        if nameable < wanted.get() {
+            return Err(reject(format!(
+                "--chunk-count {} needs a wider --suffix-length: {} characters name {} files",
+                wanted, width, nameable
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The error a `--repeat-header` swallowing the whole input raises: every line became header,
+/// so there is nothing left to head.
+fn header_exceeds_input(lines: NonZeroUsize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "--repeat-header={} takes the whole input as header, leaving no data to split",
+            lines
+        ),
+    )
+}
+
+/// Split the input, answering how the process should exit. Every failure returns rather than
+/// exiting, so the open chunk and the manifest are both flushed before the status is set.
+fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
     let args = Args::parse();
-    let mut output = stdout_writer();
-
-    let input = match get_input_streaming(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(error) => exit_with_error(&mut output, &error, "Error reading input"),
-    };
-
-    // `--chunks` is the one budget that cannot be decided a window at a time, so it names
-    // its own mode below rather than joining `SplitMode`.
-    // The delimiter outlives the config that borrows it.
-    // Folding is a property of the pattern, so asking for it without one is a mistake
-    // worth naming rather than a flag that quietly does nothing.
-    if args.ignore_case && args.pattern.is_none() {
-        let error = io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "-i/--ignore-case folds the --pattern match, so it needs a --pattern to fold",
-        );
-        exit_with_error(&mut output, &error, "Error splitting file");
+    if let Err(error) = validate(&args) {
+        error.exit();
     }
 
-    let pattern = args.pattern.clone().unwrap_or_default();
+    let named = args.input.as_deref().unwrap_or("-");
+    let input = get_input_streaming(args.input.as_deref())
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {}", named, error)))?;
+
+    // The delimiter outlives the config that borrows it.
+    let pattern = args.chunk_pattern.clone().unwrap_or_default();
     let delimiter = Delimiter {
         needle: Literal::new(pattern.as_bytes(), args.ignore_case),
     };
 
-    let mode = match (args.chunk_lines, args.chunk_bytes, &args.pattern) {
+    // `--chunk-count` is the one budget that cannot be decided a window at a time, so it
+    // reaches `split_at_offsets` rather than joining `SplitMode`.
+    let mode = match (args.chunk_lines, args.chunk_bytes, &args.chunk_pattern) {
         (Some(lines), _, _) => SplitMode::Lines(lines),
         (_, Some(bytes), _) => SplitMode::Bytes(bytes),
         (_, _, Some(_)) => SplitMode::Pattern(&delimiter),
-        // `--chunks` reaches `split_at_offsets`, which never asks the mode anything.
         _ => SplitMode::Lines(NonZeroUsize::MIN),
     };
 
-    let newlines = Newlines::from_utf8(args.utf8);
-    let result = {
-        // Silent unless `--json`, so existing scripts see no new stdout output.
-        let report = match (args.json, args.null) {
-            (true, _) => Report::Json,
-            (_, true) => Report::NullPath,
-            _ => Report::Silent,
-        };
+    // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
+    let newlines = Newlines::from_utf8(args.utf8 || args.ignore_case);
+    let written = {
         let mut discarded = io::sink();
-        let manifest: &mut dyn Write = if report == Report::Silent {
-            &mut discarded
-        } else {
-            &mut output
+        let manifest: &mut dyn Write = match args.manifest {
+            Manifest::None => &mut discarded,
+            _ => &mut *output,
         };
         // The header is taken off the input before any boundary is chosen, so every mode
         // sees only data and every chunk is opened with the header already in it.
         let mut window = input.into_window(DEFAULT_WINDOW_BYTES);
-        let (header, header_lines, taken) = match (&mut window, args.repeat_header) {
+        let (header, header_lines, taken, exhausted) = match (&mut window, args.repeat_header) {
             (InputWindow::Whole(source), Some(lines)) => {
                 let header = take_header(source.as_bytes(), lines, newlines);
                 let start = source.as_bytes().len() - header.rest.len();
-                (header.bytes, header.lines, start)
+                (header.bytes, header.lines, start, header.rest.is_empty())
             }
             (InputWindow::Stream(refill), Some(lines)) => {
-                match take_header_streaming(refill, lines, newlines) {
-                    Ok((header, seen)) => (header, seen, 0),
-                    Err(error) => exit_with_error(&mut output, &error, "Error reading header"),
-                }
+                let (header, seen) = take_header_streaming(refill, lines, newlines)?;
+                let drained = refill.at_eof() && refill.filled().is_empty();
+                (header, seen, 0, drained)
             }
-            _ => (Vec::new(), 0, 0),
+            _ => (Vec::new(), 0, 0, false),
         };
 
-        let config = SplitConfig {
-            prefix: &args.prefix,
-            mode,
-            suffix_length: args.suffix_length,
-            report,
-            header: &header,
-            header_lines,
-        };
+        // An empty input legitimately writes nothing, so only a header that ate real data
+        // is a mistake worth naming.
+        if let Some(lines) = args.repeat_header {
+            if exhausted && !header.is_empty() {
+                return Err(header_exceeds_input(lines));
+            }
+        }
 
         // A header that leaves no room for data would repeat forever without progressing.
         if let SplitMode::Bytes(budget) = mode {
             if header.len() >= budget.get() {
-                let error = header_exceeds_budget(header.len(), budget.get());
-                exit_with_error(&mut output, &error, "Error splitting file");
+                return Err(header_exceeds_budget(header.len(), budget.get()));
             }
         }
+
+        let config = SplitConfig {
+            prefix: &args.prefix,
+            mode,
+            newlines,
+            suffix_length: args.suffix_length,
+            manifest: args.manifest,
+            header: &header,
+            header_lines,
+        };
 
         match window {
             InputWindow::Whole(source) => {
                 let data = &source.as_bytes()[taken..];
-                match args.chunks {
+                match args.chunk_count {
                     Some(wanted) => {
-                        let cuts = plan_equal_chunks(data, wanted);
-                        let mut state = SplitState::default();
-                        split_at_offsets(data, &cuts, &mut state, &config, manifest)
+                        let cuts = plan_equal_chunks(data, wanted, newlines)?;
+                        split_at_offsets(data, &cuts, &config, manifest)
                     }
-                    None => split_buffer(data, newlines, &config, manifest),
+                    None => split_buffer(data, &config, manifest),
                 }
             }
-            InputWindow::Stream(mut refill) => match args.chunks {
+            InputWindow::Stream(mut refill) => match args.chunk_count {
                 // Only a genuine pipe lands here: a `< file` redirect is mapped above.
                 Some(_) => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "--chunks needs the input's size, which a pipe does not report; \
-                     redirect from a file (sz-split --chunks N < file), name the file, \
+                    "--chunk-count needs the input's size, which a pipe does not report; \
+                     redirect from a file (sz-split --chunk-count N < file), name the file, \
                      or use --chunk-bytes",
                 )),
-                None => stream_split(&mut refill, newlines, &config, manifest),
+                None => stream_split(&mut refill, &config, manifest),
             },
-        }
+        }?
     };
 
-    if let Err(error) = result.and_then(|()| output.flush()) {
-        exit_with_error(&mut output, &error, "Error splitting file");
+    output.flush()?;
+    Ok(ExitCode::from_found(written > 0))
+}
+
+fn main() {
+    let mut output = stdout_writer();
+    match run(&mut output) {
+        Ok(code) => code.exit(&mut output),
+        // A downstream `head` closing the manifest is a normal end, not a failure; a chunk
+        // file that cannot be written is the failure, and only that one exits 2.
+        Err(error) => exit_on_write_error(&mut output, &error, "sz-split"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
     use std::fs;
     use tempfile::TempDir;
 
     #[test]
+    fn finds_literal_spans_cased_and_folded() {
+        let cased = Literal::new(b"ss", false);
+        assert_eq!(
+            cased.find_in(b"aSSbss"),
+            Some(Span {
+                offset: 4,
+                length: 2
+            })
+        );
+
+        // Folded, the span covers the source bytes, so "strasse" reaches "Straße".
+        let folded = Literal::new("strasse".as_bytes(), true);
+        let found = folded.find_in("Bahnhofstraße 5".as_bytes()).unwrap();
+        assert_eq!(found.offset, 7);
+        assert_eq!(found.length, "straße".len());
+
+        // A match can be longer than the needle: one-byte "k" matches the three-byte
+        // KELVIN SIGN, so a span is never assumed to be the pattern's length.
+        let kelvin = Literal::new(b"k", true);
+        let found = kelvin.find_in("x\u{212A}y".as_bytes()).unwrap();
+        assert_eq!(found.offset, 1);
+        assert_eq!(found.length, "\u{212A}".len());
+        assert!(found.length > kelvin.pattern.len());
+    }
+
+    #[test]
     fn rejects_a_zero_count_without_naming_a_rust_type() {
-        let zero_lines = vec!["sz-split", "-l", "0"];
-        let zero_suffix = vec!["sz-split", "-l", "1", "--suffix-length", "0"];
+        let zero_lines = vec!["sz-split", "--chunk-lines", "0"];
+        let zero_suffix = vec!["sz-split", "--chunk-lines", "1", "--suffix-length", "0"];
         for arguments in [zero_lines, zero_suffix] {
             let Err(error) = Args::try_parse_from(&arguments) else {
                 panic!("{:?} must be rejected", arguments);
@@ -917,54 +977,98 @@ mod tests {
         }
 
         // Only zero reads differently; every other rejection keeps clap's wording.
-        let Err(error) = Args::try_parse_from(["sz-split", "-l", "abc"]) else {
-            panic!("-l abc must be rejected");
+        let Err(error) = Args::try_parse_from(["sz-split", "--chunk-lines", "abc"]) else {
+            panic!("--chunk-lines abc must be rejected");
         };
         assert!(
             error.to_string().contains("invalid digit found in string"),
             "{}",
             error
         );
-        assert!(Args::try_parse_from(["sz-split", "-l", "1"]).is_ok());
+        assert!(Args::try_parse_from(["sz-split", "--chunk-lines", "1"]).is_ok());
     }
 
     #[test]
-    fn pins_this_binarys_short_flags() {
-        // Each binary owns its own surface — `shared.rs` holds no clap code, so that a
-        // flag added for one tool cannot silently reshape the other ten. Nothing enforces
-        // agreement across them, so each pins its own inventory here and divergence shows
-        // up as a failing test rather than as an audit.
-        let mut shorts: Vec<char> = Args::command()
+    fn declares_no_short_flags() {
+        let mut command = Args::command();
+        command.build();
+        assert!(
+            command
+                .get_arguments()
+                .all(|argument| argument.get_short().is_none()
+                    || matches!(argument.get_short(), Some('h') | Some('V'))),
+            "only clap's own -h and -V may be short"
+        );
+    }
+
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
             .get_arguments()
-            .filter_map(|argument| argument.get_short())
+            .filter_map(|argument| argument.get_long())
             .collect();
-        shorts.sort_unstable();
         assert_eq!(
-            shorts,
-            // `-h` and `-V` are clap's own and are not listed here.
-            vec!['0', 'i', 'l', 'p'],
-            "sz-split's short flags changed; check the suite-wide meanings before keeping it"
+            longs,
+            [
+                "chunk-lines",
+                "chunk-bytes",
+                "chunk-count",
+                "chunk-pattern",
+                "ignore-case",
+                "repeat-header",
+                "utf8",
+                "suffix-length",
+                "manifest",
+                "help",
+                "version",
+            ],
+            "sz-split's flag surface changed; reconcile it against the suite vocabulary"
         );
     }
 
     #[test]
     fn requires_exactly_one_chunking_rule() {
-        // Naming none used to be impossible, since `-l` was required; the error now lists
-        // every way to say how big a chunk is.
+        // Naming none used to be impossible, since `--chunk-lines` was required; the error
+        // now lists every way to say how big a chunk is.
         let Err(error) = Args::try_parse_from(["sz-split", "f.txt"]) else {
             panic!("a run without a chunking rule must be rejected");
         };
         let rendered = error.to_string();
-        for flag in ["--chunk-lines", "--chunk-bytes", "--chunks"] {
+        for flag in ["--chunk-lines", "--chunk-bytes", "--chunk-count"] {
             assert!(rendered.contains(flag), "{}", rendered);
         }
         assert_eq!(error.exit_code(), 2, "{}", rendered);
 
         // Naming two is equally a mistake.
-        assert!(Args::try_parse_from(["sz-split", "-l", "5", "--chunks", "2"]).is_err());
-        // `--lines` stays as an alias, so shipped invocations keep working.
-        assert!(Args::try_parse_from(["sz-split", "--lines", "5"]).is_ok());
+        assert!(
+            Args::try_parse_from(["sz-split", "--chunk-lines", "5", "--chunk-count", "2"]).is_err()
+        );
+        // `lines` names a `--fields` value elsewhere, so the alias is gone.
+        assert!(Args::try_parse_from(["sz-split", "--lines", "5"]).is_err());
         assert!(Args::try_parse_from(["sz-split", "--chunk-bytes", "10K"]).is_ok());
+    }
+
+    #[test]
+    fn rejects_what_clap_cannot_express() {
+        let folding = Args::try_parse_from(["sz-split", "--chunk-lines", "5", "--ignore-case"])
+            .expect("folding without a pattern parses; `validate` is what rejects it");
+        let error = validate(&folding).unwrap_err();
+        assert!(error.to_string().contains("--chunk-pattern"), "{}", error);
+        assert!(!error.to_string().contains("-i/"), "{}", error);
+
+        // Two characters name 676 chunks, so 677 of them would fail partway through with
+        // chunks already on disk.
+        let narrow =
+            Args::try_parse_from(["sz-split", "--chunk-count", "677", "--suffix-length", "2"])
+                .unwrap();
+        let error = validate(&narrow).unwrap_err();
+        assert!(error.to_string().contains("--suffix-length"), "{}", error);
+        let wide =
+            Args::try_parse_from(["sz-split", "--chunk-count", "677", "--suffix-length", "3"])
+                .unwrap();
+        assert!(validate(&wide).is_ok());
     }
 
     #[test]
@@ -975,14 +1079,18 @@ mod tests {
             prefix: &prefix,
             mode: SplitMode::Bytes(NonZeroUsize::new(8).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
-            report: Report::Silent,
+            newlines: Newlines::Lf,
+            manifest: Manifest::None,
             header: b"",
             header_lines: 0,
         };
         // Four-byte lines: two fit the budget exactly, and the tail is its own chunk.
         let data = b"aaa\nbbb\nccc\nddd\neee\n";
-        split_buffer(data, Newlines::Lf, &config, &mut io::sink()).unwrap();
-        assert_eq!(read_chunks(&prefix), vec!["aaa\nbbb\n", "ccc\nddd\n", "eee\n"]);
+        split_buffer(data, &config, &mut io::sink()).unwrap();
+        assert_eq!(
+            read_chunks(&prefix),
+            vec!["aaa\nbbb\n", "ccc\nddd\n", "eee\n"]
+        );
     }
 
     #[test]
@@ -993,12 +1101,13 @@ mod tests {
             prefix: &prefix,
             mode: SplitMode::Bytes(NonZeroUsize::new(5).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
-            report: Report::Silent,
+            newlines: Newlines::Lf,
+            manifest: Manifest::None,
             header: b"",
             header_lines: 0,
         };
         let data = b"ab\nTHIS-LINE-IS-FAR-TOO-LONG\ncd\n";
-        split_buffer(data, Newlines::Lf, &config, &mut io::sink()).unwrap();
+        split_buffer(data, &config, &mut io::sink()).unwrap();
         let chunks = read_chunks(&prefix);
         // The long line is over budget and alone, rather than cut in half.
         assert_eq!(chunks[1], "THIS-LINE-IS-FAR-TOO-LONG\n");
@@ -1009,7 +1118,7 @@ mod tests {
     fn cuts_into_exactly_as_many_chunks_as_asked_for() {
         let temporary = TempDir::new().unwrap();
         let data = b"x\ny\n";
-        for wanted in [1usize, 2, 5] {
+        for wanted in [1usize, 2, 4] {
             let prefix = temporary
                 .path()
                 .join(format!("n{}.", wanted))
@@ -1019,19 +1128,26 @@ mod tests {
                 prefix: &prefix,
                 mode: SplitMode::Lines(NonZeroUsize::MIN),
                 suffix_length: NonZeroUsize::new(2).unwrap(),
-                report: Report::Silent,
+                newlines: Newlines::Lf,
+                manifest: Manifest::None,
                 header: b"",
                 header_lines: 0,
             };
-            let cuts = plan_equal_chunks(data, NonZeroUsize::new(wanted).unwrap());
-            let mut state = SplitState::default();
-            split_at_offsets(data, &cuts, &mut state, &config, &mut io::sink()).unwrap();
+            let cuts =
+                plan_equal_chunks(data, NonZeroUsize::new(wanted).unwrap(), Newlines::Lf).unwrap();
+            split_at_offsets(data, &cuts, &config, &mut io::sink()).unwrap();
             let chunks = read_chunks(&prefix);
             // Asking for more chunks than there are lines still yields that many files,
             // so a downstream loop over the count is safe; the surplus are empty.
             assert_eq!(chunks.len(), wanted, "asked for {}", wanted);
             assert_eq!(chunks.concat().as_bytes(), data, "asked for {}", wanted);
         }
+
+        // Past one chunk per byte the request is unmeetable, and used to allocate and loop
+        // `wanted` times before writing anything.
+        let error =
+            plan_equal_chunks(data, NonZeroUsize::new(1 << 40).unwrap(), Newlines::Lf).unwrap_err();
+        assert!(error.to_string().contains("--chunk-count"), "{}", error);
     }
 
     #[test]
@@ -1042,13 +1158,14 @@ mod tests {
             prefix: &prefix,
             mode: SplitMode::Lines(NonZeroUsize::new(2).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
-            report: Report::Silent,
+            newlines: Newlines::Lf,
+            manifest: Manifest::None,
             header: b"id,name\n",
             header_lines: 1,
         };
         // `--chunk-lines 2` promises two lines of data, so the header rides on top rather
         // than counting as one of them.
-        split_buffer(b"1,a\n2,b\n3,c\n4,d\n", Newlines::Lf, &config, &mut io::sink()).unwrap();
+        split_buffer(b"1,a\n2,b\n3,c\n4,d\n", &config, &mut io::sink()).unwrap();
         assert_eq!(
             read_chunks(&prefix),
             vec!["id,name\n1,a\n2,b\n", "id,name\n3,c\n4,d\n"]
@@ -1069,7 +1186,11 @@ mod tests {
             assert_eq!(header, whole.bytes, "capacity {}", capacity);
             assert_eq!(seen, whole.lines, "capacity {}", capacity);
             // What is left in the window is the start of the data, not of the header.
-            assert!(whole.rest.starts_with(refill.filled()), "capacity {}", capacity);
+            assert!(
+                whole.rest.starts_with(refill.filled()),
+                "capacity {}",
+                capacity
+            );
         }
     }
 
@@ -1083,13 +1204,29 @@ mod tests {
             bytes: header.len(),
             fresh: true,
         };
-        let fill = SplitMode::Bytes(budget).fill(b"1,a\n2,b\n3,c\n", filled);
+        let fill = SplitMode::Bytes(budget).fill(b"1,a\n2,b\n3,c\n", filled, Newlines::Lf);
         assert_eq!(fill.span, b"1,a\n2,b\n", "8 header bytes leave 8 of the 16");
 
         // A line budget counts data, so the same header costs it nothing.
-        let fill = SplitMode::Lines(NonZeroUsize::new(2).unwrap())
-            .fill(b"1,a\n2,b\n3,c\n", Filled::default());
+        let fill = SplitMode::Lines(NonZeroUsize::new(2).unwrap()).fill(
+            b"1,a\n2,b\n3,c\n",
+            Filled::default(),
+            Newlines::Lf,
+        );
         assert_eq!(fill.span, b"1,a\n2,b\n");
+    }
+
+    /// A config over any mode with the Unicode newline set, for the byte-fidelity test.
+    fn utf8_config<'a>(prefix: &'a str, mode: SplitMode<'a>) -> SplitConfig<'a> {
+        SplitConfig {
+            prefix,
+            mode,
+            newlines: Newlines::Unicode,
+            suffix_length: NonZeroUsize::new(2).unwrap(),
+            manifest: Manifest::None,
+            header: b"",
+            header_lines: 0,
+        }
     }
 
     /// A pattern-mode config; the delimiter is built by the caller because it borrows.
@@ -1098,7 +1235,8 @@ mod tests {
             prefix,
             mode: SplitMode::Pattern(delimiter),
             suffix_length: NonZeroUsize::new(2).unwrap(),
-            report: Report::Silent,
+            newlines: Newlines::Lf,
+            manifest: Manifest::None,
             header: b"",
             header_lines: 0,
         }
@@ -1112,13 +1250,7 @@ mod tests {
             needle: Literal::new(b">", false),
         };
         let data = b">seq1\nACGT\n>seq2\nTTTT\n";
-        split_buffer(
-            data,
-            Newlines::Lf,
-            &pattern_config(&prefix, &delimiter),
-            &mut io::sink(),
-        )
-        .unwrap();
+        split_buffer(data, &pattern_config(&prefix, &delimiter), &mut io::sink()).unwrap();
         let chunks = read_chunks(&prefix);
         // The delimiter opens its chunk, and the newline before it closes the previous one.
         assert_eq!(chunks, vec![">seq1\nACGT\n", ">seq2\nTTTT\n"]);
@@ -1136,7 +1268,6 @@ mod tests {
         // there. Input beginning with the pattern needs no cut, so no empty chunk opens.
         split_buffer(
             b">a\nx>y\n>b\n",
-            Newlines::Lf,
             &pattern_config(&prefix, &delimiter),
             &mut io::sink(),
         )
@@ -1154,13 +1285,7 @@ mod tests {
             let delimiter = Delimiter {
                 needle: Literal::new("from ".as_bytes(), ignore_case),
             };
-            split_buffer(
-                data,
-                Newlines::Lf,
-                &pattern_config(&prefix, &delimiter),
-                &mut io::sink(),
-            )
-            .unwrap();
+            split_buffer(data, &pattern_config(&prefix, &delimiter), &mut io::sink()).unwrap();
             let chunks = read_chunks(&prefix);
             assert_eq!(chunks.len(), wanted, "{}", name);
             assert_eq!(chunks.concat().as_bytes(), data, "{}", name);
@@ -1176,13 +1301,7 @@ mod tests {
             let delimiter = Delimiter {
                 needle: Literal::new(b">", false),
             };
-            split_buffer(
-                data,
-                Newlines::Lf,
-                &pattern_config(&prefix, &delimiter),
-                &mut io::sink(),
-            )
-            .unwrap();
+            split_buffer(data, &pattern_config(&prefix, &delimiter), &mut io::sink()).unwrap();
             read_chunks(&prefix)
         };
 
@@ -1199,32 +1318,32 @@ mod tests {
             };
             let config = pattern_config(&prefix, &delimiter);
             let mut refill = Refill::new(data.as_slice(), capacity);
-            stream_split(&mut refill, Newlines::Lf, &config, &mut io::sink()).unwrap();
+            stream_split(&mut refill, &config, &mut io::sink()).unwrap();
             assert_eq!(read_chunks(&prefix), whole, "capacity {}", capacity);
         }
     }
 
     #[test]
-    fn rejects_a_pattern_that_matches_everywhere_or_conflicts() {
-        let Err(error) = Args::try_parse_from(["sz-split", "-p", ""]) else {
+    fn rejects_a_pattern_that_cannot_open_a_line() {
+        let Err(error) = Args::try_parse_from(["sz-split", "--chunk-pattern", ""]) else {
             panic!("an empty pattern must be rejected");
         };
         assert!(error.to_string().contains("must not be empty"), "{}", error);
         // A pattern is a line prefix, so a newline inside one contradicts it.
-        let Err(error) = Args::try_parse_from(["sz-split", "-p", "a\nb"]) else {
+        let Err(error) = Args::try_parse_from(["sz-split", "--chunk-pattern", "a\nb"]) else {
             panic!("a pattern spanning two lines must be rejected");
         };
         assert!(error.to_string().contains("newline"), "{}", error);
-        // `--utf8` rewrites terminators, which no byte-exact split may do. Every budget
-        // but the line count reaches a path that copies ranges, so all of them refuse it.
-        assert!(Args::try_parse_from(["sz-split", "-p", ">", "--utf8"]).is_err());
-        assert!(Args::try_parse_from(["sz-split", "--chunk-bytes", "1M", "--utf8"]).is_err());
-        assert!(Args::try_parse_from(["sz-split", "--chunks", "2", "--utf8"]).is_err());
-        assert!(Args::try_parse_from(["sz-split", "-l", "5", "--utf8"]).is_ok());
-        // Folding without a pattern parses, and `main` rejects it: clap's `requires` does
-        // not fire for an argument whose group another member has already satisfied.
-        assert!(Args::try_parse_from(["sz-split", "-l", "5", "-i"]).is_ok());
-        assert!(Args::try_parse_from(["sz-split", "-p", ">", "-i"]).is_ok());
+        // `--utf8` now only says which byte sequences break a line, so every budget takes it.
+        for mode in [
+            ["--chunk-lines", "5"],
+            ["--chunk-bytes", "1M"],
+            ["--chunk-count", "2"],
+            ["--chunk-pattern", ">"],
+        ] {
+            let arguments = ["sz-split", mode[0], mode[1], "--utf8"];
+            assert!(Args::try_parse_from(arguments).is_ok(), "{:?}", arguments);
+        }
     }
 
     #[test]
@@ -1246,12 +1365,13 @@ mod tests {
     }
 
     /// A two-character-suffix config, the shape every test below splits with.
-    fn config(prefix: &str, lines_per_file: usize) -> SplitConfig<'_> {
+    fn config(prefix: &str, lines_per_file: usize, newlines: Newlines) -> SplitConfig<'_> {
         SplitConfig {
             prefix,
             mode: SplitMode::Lines(NonZeroUsize::new(lines_per_file).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
-            report: Report::Silent,
+            newlines,
+            manifest: Manifest::None,
             header: b"",
             header_lines: 0,
         }
@@ -1272,7 +1392,7 @@ mod tests {
         let prefix = temp_dir.path().join("test_").to_str().unwrap().to_string();
 
         let data = b"line1\nline2\nline3\nline4\nline5\n";
-        split_buffer(data, Newlines::Lf, &config(&prefix, 2), &mut io::sink()).unwrap();
+        split_buffer(data, &config(&prefix, 2, Newlines::Lf), &mut io::sink()).unwrap();
 
         // Check first file
         let file1 = fs::read_to_string(format!("{}aa", prefix)).unwrap();
@@ -1298,7 +1418,7 @@ mod tests {
             .to_string();
 
         let data = b"a\nb\nc\n";
-        split_buffer(data, Newlines::Lf, &config(&prefix, 1), &mut io::sink()).unwrap();
+        split_buffer(data, &config(&prefix, 1, Newlines::Lf), &mut io::sink()).unwrap();
 
         assert_eq!(fs::read_to_string(format!("{}aa", prefix)).unwrap(), "a\n");
         assert_eq!(fs::read_to_string(format!("{}ab", prefix)).unwrap(), "b\n");
@@ -1306,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn appends_newline_to_last_split_chunk() {
+    fn leaves_an_unterminated_last_line_unterminated() {
         let temp_dir = TempDir::new().unwrap();
         let prefix = temp_dir
             .path()
@@ -1315,17 +1435,15 @@ mod tests {
             .unwrap()
             .to_string();
 
+        // Appending the terminator the input never wrote used to make `cat` differ from it.
         let data = b"line1\nline2";
-        split_buffer(data, Newlines::Lf, &config(&prefix, 1), &mut io::sink()).unwrap();
+        split_buffer(data, &config(&prefix, 1, Newlines::Lf), &mut io::sink()).unwrap();
+        assert_eq!(read_chunks(&prefix), vec!["line1\n", "line2"]);
 
-        assert_eq!(
-            fs::read_to_string(format!("{}aa", prefix)).unwrap(),
-            "line1\n"
-        );
-        assert_eq!(
-            fs::read_to_string(format!("{}ab", prefix)).unwrap(),
-            "line2\n"
-        );
+        // Under the LF newline set a lone CR is not a terminator, and is still not rewritten.
+        let bare = temp_dir.path().join("cr_").to_str().unwrap().to_string();
+        split_buffer(b"\r", &config(&bare, 1, Newlines::Lf), &mut io::sink()).unwrap();
+        assert_eq!(fs::read(format!("{}aa", bare)).unwrap(), b"\r");
     }
 
     #[test]
@@ -1346,12 +1464,13 @@ mod tests {
             prefix: &prefix,
             mode: SplitMode::Lines(NonZeroUsize::new(1).unwrap()),
             suffix_length: NonZeroUsize::new(1).unwrap(),
-            report: Report::Silent,
+            newlines: Newlines::Lf,
+            manifest: Manifest::None,
             header: b"",
             header_lines: 0,
         };
 
-        let error = split_buffer(&data, Newlines::Lf, &overflowing, &mut io::sink()).unwrap_err();
+        let error = split_buffer(&data, &overflowing, &mut io::sink()).unwrap_err();
 
         let message = error.to_string();
         assert!(message.contains("--suffix-length"), "{}", message);
@@ -1381,23 +1500,83 @@ mod tests {
             .to_string();
         split_buffer(
             data,
-            Newlines::Unicode,
-            &config(&unicode_prefix, 1),
+            &config(&unicode_prefix, 1, Newlines::Unicode),
             &mut io::sink(),
         )
         .unwrap();
-        // Chunk lines are normalized to LF, whatever terminator the input broke on.
-        assert_eq!(read_chunks(&unicode_prefix), vec!["a\n", "b\n", "c\n"]);
+        // Each chunk keeps the terminator the input broke on, so nothing is rewritten.
+        assert_eq!(
+            read_chunks(&unicode_prefix),
+            vec!["a\u{2028}", "b\u{2028}", "c\n"]
+        );
 
         let byte_prefix = temp_dir.path().join("byte_").to_str().unwrap().to_string();
         split_buffer(
             data,
-            Newlines::Lf,
-            &config(&byte_prefix, 1),
+            &config(&byte_prefix, 1, Newlines::Lf),
             &mut io::sink(),
         )
         .unwrap();
         assert_eq!(read_chunks(&byte_prefix), vec!["a\u{2028}b\u{2028}c\n"]);
+    }
+
+    #[test]
+    fn preserves_every_terminator_under_utf8_in_every_mode() {
+        let temporary = TempDir::new().unwrap();
+        let delimiter = Delimiter {
+            needle: Literal::new(b"c", false),
+        };
+        // CRLF, a line separator and a CRLF-terminated tail; then an unterminated tail and a
+        // lone CR, both of which used to gain an LF the input never held.
+        for (which, data) in ["a\r\nb\u{2028}c\r\n", "a\r\nb", "\r"].iter().enumerate() {
+            let data = data.as_bytes();
+            for (name, mode) in [
+                ("lines", SplitMode::Lines(NonZeroUsize::new(2).unwrap())),
+                ("bytes", SplitMode::Bytes(NonZeroUsize::new(8).unwrap())),
+                ("pattern", SplitMode::Pattern(&delimiter)),
+            ] {
+                let whole_prefix = temporary
+                    .path()
+                    .join(format!("w{}{}.", which, name))
+                    .display()
+                    .to_string();
+                split_buffer(data, &utf8_config(&whole_prefix, mode), &mut io::sink()).unwrap();
+                let expected = read_chunks(&whole_prefix);
+                assert_eq!(expected.concat().as_bytes(), data, "{} {}", which, name);
+
+                // The whole-buffer run is the oracle: a seam anywhere must not change it.
+                for capacity in [1usize, 2, 3, 5, 8, 64] {
+                    let prefix = temporary
+                        .path()
+                        .join(format!("s{}{}{}.", which, name, capacity))
+                        .display()
+                        .to_string();
+                    let mut refill = Refill::new(data, capacity);
+                    stream_split(&mut refill, &utf8_config(&prefix, mode), &mut io::sink())
+                        .unwrap();
+                    assert_eq!(
+                        read_chunks(&prefix),
+                        expected,
+                        "{} {} at capacity {}",
+                        which,
+                        name,
+                        capacity
+                    );
+                }
+            }
+
+            // `--chunk-count` needs the input's size, so it has no streaming path to agree with.
+            let prefix = temporary
+                .path()
+                .join(format!("c{}.", which))
+                .display()
+                .to_string();
+            let config = utf8_config(&prefix, SplitMode::Lines(NonZeroUsize::MIN));
+            let wanted = NonZeroUsize::new(data.len().clamp(1, 2)).unwrap();
+            let cuts = plan_equal_chunks(data, wanted, Newlines::Unicode).unwrap();
+            split_at_offsets(data, &cuts, &config, &mut io::sink()).unwrap();
+            assert_eq!(read_chunks(&prefix).concat().as_bytes(), data, "{}", which);
+        }
     }
 
     #[test]
@@ -1418,8 +1597,7 @@ mod tests {
                 let mut whole_manifest = Vec::new();
                 split_buffer(
                     data,
-                    newlines,
-                    &config(&whole_prefix, lines_per_file),
+                    &config(&whole_prefix, lines_per_file, newlines),
                     &mut whole_manifest,
                 )
                 .unwrap();
@@ -1443,8 +1621,7 @@ mod tests {
                     let mut refill = Refill::new(data, capacity);
                     stream_split(
                         &mut refill,
-                        newlines,
-                        &config(&prefix, lines_per_file),
+                        &config(&prefix, lines_per_file, newlines),
                         &mut streamed_manifest,
                     )
                     .unwrap();
@@ -1478,8 +1655,7 @@ mod tests {
         let mut refill = Refill::new(&b""[..], 7);
         stream_split(
             &mut refill,
-            Newlines::Lf,
-            &config(&prefix, 2),
+            &config(&prefix, 2, Newlines::Lf),
             &mut io::sink(),
         )
         .unwrap();

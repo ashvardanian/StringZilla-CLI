@@ -7,25 +7,25 @@
 //!
 //! ```bash
 //! # Extract line 5
-//! sz-rows -r 5 file.txt
+//! sz-rows --rows 5 file.txt
 //!
 //! # Extract lines 10-20
-//! sz-rows -r 10-20 file.txt
+//! sz-rows --rows 10-20 file.txt
 //!
 //! # Extract first 10 lines (like head -n 10)
-//! sz-rows -r 1-10 file.txt
+//! sz-rows --rows 1-10 file.txt
 //!
 //! # Extract last 10 lines (like tail -n 10)
 //! sz-rows --tail 10 file.txt
 //!
 //! # Extract multiple specific lines
-//! sz-rows -r 1,5,10 file.txt
+//! sz-rows --rows 1,5,10 file.txt
 //!
 //! # Extract every 5th line
 //! sz-rows --every 5 file.txt
 //!
 //! # From stdin
-//! cat file.txt | sz-rows -r 5-10
+//! cat file.txt | sz-rows --rows 5-10
 //! ```
 
 use std::collections::VecDeque;
@@ -33,7 +33,7 @@ use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
-use clap::Parser;
+use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
 use stringzilla::sz;
 
 mod shared;
@@ -48,32 +48,77 @@ struct Args {
     input: Option<String>,
 
     /// Row(s) to extract: single (5), list (1,5,10), or range (10-20)
-    #[arg(short = 'r', long = "rows", conflicts_with_all = ["tail", "every"])]
+    #[arg(long, conflicts_with_all = ["tail", "every"])]
     rows: Option<String>,
 
     /// Extract last N lines (like tail -n)
-    #[arg(long = "tail", value_parser = parse_at_least_one, conflicts_with_all = ["rows", "every"])]
+    #[arg(long, value_parser = parse_at_least_one, conflicts_with_all = ["rows", "every"])]
     tail: Option<NonZeroUsize>,
 
     /// Extract every Nth line
-    #[arg(long = "every", value_parser = parse_at_least_one, conflicts_with_all = ["rows", "tail"])]
+    #[arg(long, value_parser = parse_at_least_one, conflicts_with_all = ["rows", "tail"])]
     every: Option<NonZeroUsize>,
 
-    /// Show line numbers in output
-    #[arg(short = 'n', long = "line-numbers")]
+    /// Prefix each row with its one-based line number
+    #[arg(long)]
     line_numbers: bool,
 
-    /// Enable UTF-8 mode (split on Unicode newlines: CR, CRLF, NEL, LS, PS)
+    /// Treat the input as UTF-8 text
     #[arg(long)]
     utf8: bool,
 
-    /// Emit JSON Lines, one record per output line
-    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
-    json: bool,
+    /// How records are rendered
+    #[arg(
+        long,
+        value_enum,
+        default_value = "text",
+        help_heading = "Output Formats"
+    )]
+    format: Format,
 
-    /// NUL-terminate each output line instead of newline
-    #[arg(short = '0', long, help_heading = "Output Formats")]
+    /// NUL-terminate each output record instead of newline
+    #[arg(long, help_heading = "Output Formats")]
     null: bool,
+
+    /// Suppress all output; exit 0 if any row was extracted, 1 otherwise
+    #[arg(long, conflicts_with_all = ["format", "null", "line_numbers"], help_heading = "Output Formats")]
+    quiet: bool,
+}
+
+/// How records are rendered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Format {
+    /// The row itself, terminated by a newline or a NUL.
+    Text,
+    /// JSON Lines, one record per output line.
+    Json,
+}
+
+/// Report a constraint clap cannot express, rendered as clap renders its own.
+fn reject(message: &str) -> clap::Error {
+    Args::command().error(ErrorKind::ArgumentConflict, message)
+}
+
+/// Name the file a failure happened on, so every diagnostic reads `sz-rows: <path>: <error>`.
+fn at_path(path: &str) -> impl Fn(io::Error) -> io::Error + '_ {
+    move |error| io::Error::new(error.kind(), format!("{}: {}", path, error))
+}
+
+/// The constraints clap cannot express: `conflicts_with` fires on a flag's presence,
+/// never on its value.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    if args.rows.is_none() && args.tail.is_none() && args.every.is_none() {
+        return Err(reject("must specify --rows, --tail, or --every"));
+    }
+    if args.format == Format::Json {
+        if args.line_numbers {
+            return Err(reject("--format json already carries a line number"));
+        }
+        if args.null {
+            return Err(reject("--format json cannot be combined with --null"));
+        }
+    }
+    Ok(())
 }
 
 /// Which rows to extract.
@@ -190,7 +235,7 @@ fn write_row(
     if config.json {
         output.write_all(br#"{"type":"line","data":{"path":"#)?;
         json_text_field_to(output, config.path.as_bytes())?;
-        output.write_all(br#","lines":"#)?;
+        output.write_all(br#","text":"#)?;
         json_text_field_to(output, line)?;
         write!(output, r#","line_number":{}}}}}"#, index + 1)?;
         return output.write_all(b"\n");
@@ -482,53 +527,56 @@ fn stream_rows<R: Read>(
 
 // endregion: Streaming
 
-fn main() {
+fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
     let args = Args::parse();
-    let mut output = stdout_writer();
+    if let Err(error) = validate(&args) {
+        error.exit();
+    }
 
-    // Determine row selector
-    let selector = if let Some(ref rows) = args.rows {
-        match parse_rows(rows) {
-            Ok(selector) => selector,
-            Err(message) => {
-                eprintln!("Error: {}", message);
-                ExitCode::Error.exit(&mut output);
-            }
-        }
+    let selector = if let Some(rows) = &args.rows {
+        parse_rows(rows).unwrap_or_else(|message| {
+            Args::command()
+                .error(ErrorKind::ValueValidation, message)
+                .exit()
+        })
     } else if let Some(wanted) = args.tail {
         RowSelector::Tail(wanted)
-    } else if let Some(stride) = args.every {
-        RowSelector::Forward(ForwardSelector::Every(stride))
     } else {
-        eprintln!("Error: must specify --rows, --tail, or --every");
-        ExitCode::Error.exit(&mut output);
+        RowSelector::Forward(ForwardSelector::Every(args.every.expect("validated above")))
     };
 
-    let input = match get_input_streaming(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(error) => exit_with_error(&mut output, &error, "Error reading input"),
-    };
+    let name = args.input.as_deref().unwrap_or("-");
+    let input = get_input_streaming(args.input.as_deref()).map_err(at_path(name))?;
 
     let config = OutputConfig {
-        json: args.json,
+        json: args.format == Format::Json,
         terminator: Terminator::from_null(args.null),
         show_line_numbers: args.line_numbers,
-        path: args.input.as_deref().unwrap_or("-"),
+        path: name,
     };
+
+    // A quiet run still extracts, so the row count that answers it stays honest.
+    let mut discard = io::sink();
+    let output: &mut dyn Write = if args.quiet { &mut discard } else { output };
 
     let newlines = Newlines::from_utf8(args.utf8);
-    let result = match input.into_window(DEFAULT_WINDOW_BYTES) {
+    let emitted = match input.into_window(DEFAULT_WINDOW_BYTES) {
         InputWindow::Whole(source) => {
-            extract_rows_by_selector(source.as_bytes(), &selector, newlines, &config, &mut output)
+            extract_rows_by_selector(source.as_bytes(), &selector, newlines, &config, output)?
         }
         InputWindow::Stream(mut refill) => {
-            stream_rows(&mut refill, &selector, newlines, &config, &mut output)
+            stream_rows(&mut refill, &selector, newlines, &config, output)?
         }
     };
 
-    // One flush per run: flushing inside the loop would issue one per window.
-    if let Err(error) = result.and_then(|_| output.flush()) {
-        exit_on_write_error(&mut output, &error, "Error");
+    Ok(ExitCode::from_found(emitted > 0))
+}
+
+fn main() {
+    let mut output = stdout_writer();
+    match run(&mut output) {
+        Ok(code) => code.exit(&mut output),
+        Err(error) => exit_on_write_error(&mut output, &error, "sz-rows"),
     }
 }
 
@@ -598,6 +646,123 @@ mod tests {
             self.position += taken;
             Ok(taken)
         }
+    }
+
+    #[test]
+    fn counts_rows_a_quiet_run_never_writes() {
+        // `--quiet` extracts into a sink, so the count that becomes the exit status
+        // is the same one a printing run would report.
+        let data = b"line1\nline2\nline3\n";
+        let mut discard = io::sink();
+
+        let emitted = extract_rows_by_selector(
+            data,
+            &range(0, 0),
+            Newlines::Lf,
+            &text_config(),
+            &mut discard,
+        )
+        .unwrap();
+        assert!(ExitCode::from_found(emitted > 0) == ExitCode::Success);
+
+        let emitted = extract_rows_by_selector(
+            data,
+            &indices(&[998]),
+            Newlines::Lf,
+            &text_config(),
+            &mut discard,
+        )
+        .unwrap();
+        assert!(ExitCode::from_found(emitted > 0) == ExitCode::NoResult);
+    }
+
+    #[test]
+    fn quiet_rejects_the_flags_it_would_ignore() {
+        // Under `--quiet` the exit status is the whole output, so nothing that shapes a
+        // record can reach it.
+        let rejected = [
+            vec!["sz-rows", "--rows", "1", "--quiet", "--format", "json"],
+            vec!["sz-rows", "--rows", "1", "--quiet", "--null"],
+            vec!["sz-rows", "--rows", "1", "--quiet", "--line-numbers"],
+        ];
+        for arguments in rejected {
+            assert!(
+                Args::try_parse_from(&arguments).is_err(),
+                "{:?} must be rejected",
+                arguments
+            );
+        }
+
+        // Which rows are selected still steers the status, so the selectors compose.
+        let accepted = [
+            vec!["sz-rows", "--quiet", "--tail", "3"],
+            vec!["sz-rows", "--quiet", "--every", "5"],
+            vec!["sz-rows", "--rows", "1", "--quiet", "--utf8"],
+        ];
+        for arguments in accepted {
+            assert!(
+                Args::try_parse_from(&arguments).is_ok(),
+                "{:?} must compose",
+                arguments
+            );
+        }
+    }
+
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "rows",
+                "tail",
+                "every",
+                "line-numbers",
+                "utf8",
+                "format",
+                "null",
+                "quiet",
+                "help",
+                "version",
+            ]
+        );
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    #[test]
+    fn names_the_path_a_failure_happened_on() {
+        // A missing input used to report `Error reading input: …`, naming nothing.
+        let error = at_path("missing.txt")(io::Error::from(io::ErrorKind::NotFound));
+        assert!(error.to_string().starts_with("missing.txt: "), "{}", error);
+    }
+
+    #[test]
+    fn rejects_what_json_would_silently_ignore() {
+        // `--line-numbers` used to be a no-op under JSON, which numbers every record.
+        let parsed = |arguments: &[&str]| Args::try_parse_from(arguments).unwrap();
+        assert!(validate(&parsed(&[
+            "sz-rows",
+            "--rows",
+            "1",
+            "--format",
+            "json",
+            "--line-numbers"
+        ]))
+        .is_err());
+        assert!(validate(&parsed(&[
+            "sz-rows", "--rows", "1", "--format", "json", "--null"
+        ]))
+        .is_err());
+        assert!(validate(&parsed(&["sz-rows", "--rows", "1", "--line-numbers"])).is_ok());
+        assert!(validate(&parsed(&["sz-rows", "file.txt"])).is_err());
     }
 
     #[test]
@@ -758,7 +923,7 @@ mod tests {
             String::from_utf8(output).unwrap(),
             concat!(
                 r#"{"type":"line","data":{"path":{"text":"-"},"#,
-                r#""lines":{"text":"b"},"line_number":2}}"#,
+                r#""text":{"text":"b"},"line_number":2}}"#,
                 "\n"
             )
         );

@@ -3,6 +3,10 @@
 //! A faster replacement for `wc` with proper UTF-8 support and directory traversal.
 //! Uses StringZilla for SIMD-accelerated counting operations.
 //!
+//! Counting measures rather than searches, so an empty input is a successful answer:
+//! a row of zeros and exit 0, as `wc` reports it, where the tools that search exit 1
+//! on finding nothing.
+//!
 //! # Examples
 //!
 //! ```bash
@@ -16,13 +20,13 @@
 //! sz-count src/
 //!
 //! # Human-readable output
-//! sz-count -H src/
+//! sz-count --format human src/
 //!
 //! # UTF-8 mode (count characters, Unicode whitespace/newlines)
-//! sz-count --utf8 docs/
+//! sz-count --utf8 --fields lines,words,chars docs/
 //!
 //! # Just the line count, as a bare integer for scripts
-//! sz-count -l file.txt
+//! sz-count --fields lines file.txt
 //!
 //! # Match `wc` byte-for-byte
 //! sz-count --posix file.txt
@@ -33,7 +37,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
 use ignore::{Walk, WalkBuilder};
 use stringzilla::sz;
 use stringzilla::sz::StringZillableUnary;
@@ -52,27 +56,17 @@ struct Args {
     #[arg(default_value = "-")]
     inputs: Vec<String>,
 
-    /// Print the line count
-    #[arg(short = 'l', long, help_heading = "Fields")]
-    lines: bool,
+    /// Which measurements to emit
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "lines,words,bytes",
+        help_heading = "Fields"
+    )]
+    fields: Vec<Field>,
 
-    /// Print the word count
-    #[arg(short = 'w', long, help_heading = "Fields")]
-    words: bool,
-
-    /// Print the byte count
-    #[arg(short = 'c', long, help_heading = "Fields")]
-    bytes: bool,
-
-    /// Print the character count (UTF-8 code points)
-    #[arg(short = 'm', long, help_heading = "Fields")]
-    chars: bool,
-
-    /// Print the length of the longest line, in bytes
-    #[arg(short = 'L', long, help_heading = "Fields")]
-    max_line_length: bool,
-
-    /// Enable UTF-8 mode (count characters, use Unicode whitespace/newlines)
+    /// Treat the input as UTF-8 text
     #[arg(long, help_heading = "Counting Modes")]
     utf8: bool,
 
@@ -80,21 +74,26 @@ struct Args {
     #[arg(long, conflicts_with = "utf8", help_heading = "Counting Modes")]
     posix: bool,
 
-    /// Human-readable output (use K/M/G/T suffixes)
-    #[arg(short = 'H', long, help_heading = "Output Formats")]
-    human_readable: bool,
-
-    /// Emit JSON Lines with untruncated paths and bare integers
-    #[arg(long, conflicts_with_all = ["human_readable", "no_thousands_separator"], help_heading = "Output Formats")]
-    json: bool,
-
-    /// Print plain digits in the table, without comma grouping
+    /// How records are rendered
     #[arg(
         long,
-        conflicts_with = "human_readable",
+        value_enum,
+        default_value = "table",
         help_heading = "Output Formats"
     )]
-    no_thousands_separator: bool,
+    format: Format,
+
+    /// Suppress all output; exit 0 if anything was counted, 1 otherwise
+    #[arg(long, conflicts_with_all = ["format", "fields"], help_heading = "Output Formats")]
+    quiet: bool,
+
+    /// Filter walked files by type (e.g., rust, py, js); named files are always counted
+    #[arg(long = "type", help_heading = "Traversal")]
+    file_type: Option<Vec<String>>,
+
+    /// Filter walked files by glob (e.g., "*.rs"); named files are always counted
+    #[arg(long, help_heading = "Traversal")]
+    glob: Option<Vec<String>>,
 
     /// Maximum directory depth (default: unlimited)
     #[arg(long, help_heading = "Traversal")]
@@ -107,6 +106,45 @@ struct Args {
     /// Don't respect .gitignore files
     #[arg(long, help_heading = "Traversal")]
     no_ignore: bool,
+
+    /// Follow symbolic links
+    #[arg(long, help_heading = "Traversal")]
+    follow: bool,
+}
+
+/// One measurement a row can carry, in the order [`HEADERS`] lists them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Field {
+    Lines,
+    Words,
+    Bytes,
+    Chars,
+    MaxLineLength,
+}
+
+/// How rows are rendered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Format {
+    /// Aligned columns with comma-grouped digits.
+    Table,
+    /// Aligned columns with plain digits.
+    Plain,
+    /// Aligned columns with K/M/G/T suffixes.
+    Human,
+    /// JSON Lines with untruncated paths and bare integers.
+    Json,
+}
+
+/// The one constraint clap cannot express: `conflicts_with` fires on a flag's
+/// presence, never on its value.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    if args.posix && args.fields.contains(&Field::Chars) {
+        return Err(Args::command().error(
+            ErrorKind::ArgumentConflict,
+            "--posix counts bytes, so it cannot emit --fields chars",
+        ));
+    }
+    Ok(())
 }
 
 // endregion: CLI
@@ -261,25 +299,15 @@ struct Fields {
 }
 
 impl Fields {
-    /// Read the selectors, falling back to `wc`'s default trio when none are given.
-    /// `--utf8` adds characters to that default, as it always has.
-    fn from_args(args: &Args, mode: Mode) -> Self {
-        let selected = Self {
-            lines: args.lines,
-            words: args.words,
-            bytes: args.bytes,
-            chars: args.chars,
-            max_line_length: args.max_line_length,
-        };
-        if selected.count() > 0 {
-            return selected;
-        }
+    /// Read the selectors `--fields` names.
+    fn from_selection(selection: &[Field]) -> Self {
+        let holds = |field| selection.contains(&field);
         Self {
-            lines: true,
-            words: true,
-            bytes: true,
-            chars: mode == Mode::Unicode,
-            max_line_length: false,
+            lines: holds(Field::Lines),
+            words: holds(Field::Words),
+            bytes: holds(Field::Bytes),
+            chars: holds(Field::Chars),
+            max_line_length: holds(Field::MaxLineLength),
         }
     }
 
@@ -292,14 +320,6 @@ impl Fields {
             self.chars,
             self.max_line_length,
         ]
-    }
-
-    /// How many measurements are selected.
-    fn count(self) -> usize {
-        self.selectors()
-            .into_iter()
-            .filter(|selected| *selected)
-            .count()
     }
 
     /// Whether any selected field needs the bytes themselves. Bytes alone are the
@@ -596,20 +616,7 @@ fn drained_length<R: Read>(mut refill: Refill<R>) -> io::Result<usize> {
 #[derive(Clone, Copy)]
 struct RenderConfig {
     fields: Fields,
-    human_readable: bool,
-    thousands_separator: bool,
-    json: bool,
-}
-
-impl RenderConfig {
-    fn from_args(args: &Args, fields: Fields) -> Self {
-        Self {
-            fields,
-            human_readable: args.human_readable,
-            thousands_separator: !args.no_thousands_separator,
-            json: args.json,
-        }
-    }
+    format: Format,
 }
 
 /// Format number with K/M/G/T suffixes
@@ -634,13 +641,11 @@ fn format_number<'a>(
     config: &RenderConfig,
     buffer: &'a mut [u8; 26],
 ) -> Cow<'a, str> {
-    if config.human_readable {
-        return Cow::Owned(format_human(value));
+    match config.format {
+        Format::Human => Cow::Owned(format_human(value)),
+        Format::Table => Cow::Borrowed(format_grouped_number(buffer, value)),
+        Format::Plain | Format::Json => Cow::Owned(value.to_string()),
     }
-    if !config.thousands_separator {
-        return Cow::Owned(value.to_string());
-    }
-    Cow::Borrowed(format_grouped_number(buffer, value))
 }
 
 /// Truncate path to fit within max_width, keeping the rightmost part.
@@ -737,24 +742,6 @@ fn print_row(
     output.write_all(b"\n")
 }
 
-/// Write a tree branch. Depth is bounded by the walk, and only the branch glyph
-/// varies, so the indent comes from a static slice rather than a built string.
-fn print_tree_line(
-    output: &mut dyn Write,
-    name: &str,
-    counts: &Counts,
-    config: &RenderConfig,
-    widths: &TableWidths,
-    is_last: bool,
-    depth: usize,
-) -> io::Result<()> {
-    for _ in 0..depth {
-        output.write_all(b"   ")?;
-    }
-    let branch = if is_last { "└─ " } else { "├─ " };
-    print_row(output, branch, name, counts, config, widths)
-}
-
 /// Write the separator line above the totals
 fn print_separator(
     output: &mut dyn Write,
@@ -791,14 +778,14 @@ fn print_totals(
     output.write_all(b"\n")
 }
 
-/// Write one `counts` record, with the untruncated path and bare integers.
+/// Write one `count` record, with the untruncated path and bare integers.
 fn write_counts_json(
     output: &mut dyn Write,
     path: &str,
     counts: &Counts,
     fields: Fields,
 ) -> io::Result<()> {
-    output.write_all(br#"{"type":"counts","data":{"path":"#)?;
+    output.write_all(br#"{"type":"count","data":{"path":"#)?;
     json_text_field_to(output, path.as_bytes())?;
     for (header, value) in counts.columns(fields) {
         write!(output, r#","{}":{}"#, header, value)?;
@@ -820,24 +807,86 @@ fn write_total_json(
     output.write_all(b"}}\n")
 }
 
-/// Print one input's counts, honoring the bare-integer rule for a single selector.
-fn report_single(name: &str, counts: &Counts, config: &RenderConfig) -> io::Result<()> {
-    let mut output = stdout_writer();
-    if config.json {
-        return write_counts_json(&mut output, name, counts, config.fields);
+/// One counted input.
+struct Row {
+    /// Full path, which JSON reports untruncated.
+    path: String,
+    /// What the table prints, which the tree view strips to a relative name.
+    name: String,
+    counts: Counts,
+}
+
+/// Everything one run has to print.
+struct Report {
+    rows: Vec<Row>,
+    total: Counts,
+    /// The directory the rows hang off, when a lone directory was named.
+    root: Option<String>,
+}
+
+/// Write the whole report.
+fn render(output: &mut dyn Write, report: &Report, config: &RenderConfig) -> io::Result<()> {
+    if config.format == Format::Json {
+        for row in &report.rows {
+            write_counts_json(output, &row.path, &row.counts, config.fields)?;
+        }
+        if report.rows.len() > 1 || report.root.is_some() {
+            write_total_json(output, report.rows.len(), &report.total, config.fields)?;
+        }
+        return Ok(());
     }
-    let mut columns = counts.columns(config.fields);
-    if let (Some((_, value)), None) = (columns.next(), columns.next()) {
-        // Exactly one selector and exactly one input: a bare integer, for `n=$(...)`.
-        return writeln!(output, "{}", value);
+
+    if let ([row], None) = (report.rows.as_slice(), &report.root) {
+        let mut columns = row.counts.columns(config.fields);
+        if let (Some((_, value)), None) = (columns.next(), columns.next()) {
+            // Exactly one selector and exactly one input: a bare integer, for `n=$(...)`.
+            return writeln!(output, "{}", value);
+        }
+        let widths = TableWidths {
+            name: name_width(std::iter::once((row.name.as_str(), 0))),
+            columns: column_widths(std::iter::once(&row.counts), config),
+        };
+        print_header(output, config, &widths)?;
+        return print_row(output, "", &row.name, &row.counts, config, &widths);
     }
-    let widths = TableWidths {
-        name: name_width(std::iter::once((name, 0))),
-        columns: column_widths(std::iter::once(counts), config),
+
+    let prefix = if report.root.is_some() {
+        TREE_GLYPH_WIDTH
+    } else {
+        0
     };
-    print_header(&mut output, config, &widths)?;
-    print_row(&mut output, "", name, counts, config, &widths)?;
-    output.flush()
+    let widths = TableWidths {
+        name: name_width(
+            report
+                .root
+                .iter()
+                .map(|root| (root.as_str(), 0))
+                .chain(report.rows.iter().map(|row| (row.name.as_str(), prefix))),
+        ),
+        columns: column_widths(
+            report
+                .rows
+                .iter()
+                .map(|row| &row.counts)
+                .chain([&report.total]),
+            config,
+        ),
+    };
+
+    print_header(output, config, &widths)?;
+    if let Some(root) = &report.root {
+        print_row(output, "", root, &report.total, config, &widths)?;
+    }
+    for (index, row) in report.rows.iter().enumerate() {
+        let branch = match (&report.root, index + 1 == report.rows.len()) {
+            (None, _) => "",
+            (Some(_), true) => "└─ ",
+            (Some(_), false) => "├─ ",
+        };
+        print_row(output, branch, &row.name, &row.counts, config, &widths)?;
+    }
+    print_separator(output, config, &widths)?;
+    print_totals(output, &report.total, config, &widths)
 }
 
 // endregion: Rendering
@@ -851,235 +900,237 @@ fn walk(path: &Path, args: &Args) -> Walk {
         .hidden(!args.hidden)
         .git_ignore(!args.no_ignore)
         .git_global(!args.no_ignore)
-        .git_exclude(!args.no_ignore);
+        .git_exclude(!args.no_ignore)
+        .follow_links(args.follow);
     if let Some(depth) = args.max_depth {
         builder.max_depth(Some(depth));
+    }
+    if let Some(names) = &args.file_type {
+        let mut types = ignore::types::TypesBuilder::new();
+        types.add_defaults();
+        for name in names {
+            types.select(name);
+        }
+        match types.build() {
+            Ok(matcher) => {
+                builder.types(matcher);
+            }
+            Err(error) => eprintln!("sz-count: invalid --type: {}", error),
+        }
     }
     builder.build()
 }
 
-/// Collect the files a directory holds, honoring the ignore and depth options.
-fn walk_files(path: &Path, args: &Args) -> Vec<PathBuf> {
-    walk(path, args)
-        .flatten()
-        .filter(is_readable_entry)
-        .map(|entry| entry.path().to_path_buf())
+/// Compile each `--glob` once, so a malformed one is reported here rather than
+/// silently matching nothing on every file of the walk.
+fn compile_globs(patterns: &[String]) -> Vec<glob::Pattern> {
+    patterns
+        .iter()
+        .filter_map(|pattern| match glob::Pattern::new(pattern) {
+            Ok(compiled) => Some(compiled),
+            Err(error) => {
+                eprintln!("sz-count: invalid glob '{}': {}", pattern, error);
+                None
+            }
+        })
         .collect()
 }
 
-/// Process a directory recursively
-fn process_directory(
-    path: &Path,
-    counter: Counter,
-    config: &RenderConfig,
-    args: &Args,
-) -> io::Result<()> {
-    let mut entries = Vec::new();
-    let mut total = Counts::default();
+/// Whether a walked file passes the `--glob` filter, which matches either the whole
+/// path or the file name, as `sz-find` does.
+fn glob_selects(globs: &Option<Vec<glob::Pattern>>, path: &Path) -> bool {
+    let Some(globs) = globs else {
+        return true;
+    };
+    let path_text = path.to_string_lossy();
+    let name_text = path.file_name().unwrap_or_default().to_string_lossy();
+    globs
+        .iter()
+        .any(|pattern| pattern.matches(&path_text) || pattern.matches(&name_text))
+}
 
+/// The files a directory holds, sorted, with every walk failure warned about.
+fn walk_files(
+    path: &Path,
+    args: &Args,
+    globs: &Option<Vec<glob::Pattern>>,
+    failures: &mut usize,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
     for result in walk(path, args) {
-        let entry = result.map_err(io::Error::other)?;
-        if !is_readable_entry(&entry) {
+        match result {
+            Ok(entry) if is_readable_entry(&entry) && glob_selects(globs, entry.path()) => {
+                paths.push(entry.path().to_path_buf())
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("sz-count: {}", error);
+                *failures += 1;
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// What one command-line input turned out to name.
+enum Resolved {
+    Stdin,
+    File(PathBuf),
+    Directory(PathBuf),
+}
+
+/// Resolve every input, warning on the ones that cannot be stat'ed and counting them,
+/// so a missing file no longer abandons the inputs beside it.
+fn resolve_inputs(args: &Args, failures: &mut usize) -> Vec<Resolved> {
+    let mut resolved = Vec::new();
+    for input in &args.inputs {
+        if input == "-" {
+            resolved.push(Resolved::Stdin);
             continue;
         }
-        let entry_path = entry.path();
-        match counter.count_file(entry_path) {
-            Ok(counts) => {
-                total.add(&counts);
-                entries.push((entry_path.to_path_buf(), counts));
-            }
-            Err(error) => {
-                eprintln!(
-                    "Warning: failed to read {}: {}",
-                    entry_path.display(),
-                    error
-                );
-            }
-        }
-    }
-
-    if entries.is_empty() {
-        eprintln!("No files found in {}", path.display());
-        return Ok(());
-    }
-
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut output = stdout_writer();
-    if config.json {
-        for (entry_path, counts) in &entries {
-            write_counts_json(
-                &mut output,
-                &entry_path.to_string_lossy(),
-                counts,
-                config.fields,
-            )?;
-        }
-        return write_total_json(&mut output, entries.len(), &total, config.fields);
-    }
-
-    // The directory summary heads the table, and each entry hangs off it behind a branch
-    // glyph, so the names are gathered before the widths that have to cover them all.
-    let path_text = path.to_string_lossy();
-    let directory_display: Cow<'_, str> = if path_text.ends_with('/') {
-        path_text
-    } else {
-        Cow::Owned(format!("{}/", path_text))
-    };
-    let names: Vec<String> = entries
-        .iter()
-        .map(|(entry_path, _)| {
-            entry_path
-                .strip_prefix(path)
-                .unwrap_or(entry_path)
-                .display()
-                .to_string()
-        })
-        .collect();
-
-    let widths = TableWidths {
-        name: name_width(
-            std::iter::once((directory_display.as_ref(), 0))
-                .chain(names.iter().map(|name| (name.as_str(), TREE_GLYPH_WIDTH))),
-        ),
-        columns: column_widths(
-            entries.iter().map(|(_, counts)| counts).chain([&total]),
-            config,
-        ),
-    };
-    print_header(&mut output, config, &widths)?;
-    print_row(&mut output, "", &directory_display, &total, config, &widths)?;
-
-    for (index, ((_, counts), name)) in entries.iter().zip(&names).enumerate() {
-        let is_last = index == entries.len() - 1;
-        print_tree_line(&mut output, name, counts, config, &widths, is_last, 0)?;
-    }
-
-    print_separator(&mut output, config, &widths)?;
-    print_totals(&mut output, &total, config, &widths)?;
-    output.flush()
-}
-
-/// Process multiple files
-fn process_multiple_files(
-    paths: &[PathBuf],
-    counter: Counter,
-    config: &RenderConfig,
-) -> io::Result<()> {
-    let mut results = Vec::new();
-    let mut total = Counts::default();
-
-    for path in paths {
-        match counter.count_file(path) {
-            Ok(counts) => {
-                total.add(&counts);
-                results.push((path.clone(), counts));
-            }
-            Err(error) => {
-                eprintln!("Warning: failed to read {}: {}", path.display(), error);
-            }
-        }
-    }
-
-    if results.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "No files found"));
-    }
-
-    let mut output = stdout_writer();
-    if config.json {
-        for (path, counts) in &results {
-            write_counts_json(&mut output, &path.to_string_lossy(), counts, config.fields)?;
-        }
-        return write_total_json(&mut output, results.len(), &total, config.fields);
-    }
-
-    let names: Vec<Cow<'_, str>> = results
-        .iter()
-        .map(|(path, _)| path.to_string_lossy())
-        .collect();
-    let widths = TableWidths {
-        name: name_width(names.iter().map(|name| (name.as_ref(), 0))),
-        columns: column_widths(
-            results.iter().map(|(_, counts)| counts).chain([&total]),
-            config,
-        ),
-    };
-    print_header(&mut output, config, &widths)?;
-    for (path, counts) in &results {
-        print_row(
-            &mut output,
-            "",
-            &path.to_string_lossy(),
-            counts,
-            config,
-            &widths,
-        )?;
-    }
-    print_separator(&mut output, config, &widths)?;
-    print_totals(&mut output, &total, config, &widths)?;
-    output.flush()
-}
-
-// endregion: Input Processing
-
-fn main() {
-    let args = Args::parse();
-    let mode = Mode::from_args(args.posix, args.utf8);
-    let fields = Fields::from_args(&args, mode);
-    let counter = Counter::new(mode, fields);
-    let config = RenderConfig::from_args(&args, fields);
-    let mut stdout = io::stdout();
-
-    // Handle stdin
-    if args.inputs.len() == 1 && args.inputs[0] == "-" {
-        match counter.count_stdin() {
-            Ok(counts) => {
-                if let Err(error) = report_single("-", &counts, &config) {
-                    exit_on_write_error(&mut stdout, &error, "Error writing output");
-                }
-            }
-            Err(error) => exit_with_error(&mut stdout, &error, "Error reading stdin"),
-        }
-        return;
-    }
-
-    // Resolve paths
-    let mut files = Vec::new();
-    let mut directories = Vec::new();
-
-    for input in &args.inputs {
         let path = Path::new(input);
         // One stat answers both questions, and reports why an unreadable path is
         // unreadable rather than calling every failure a missing file.
         match fs::metadata(path) {
-            Ok(metadata) if metadata.is_dir() => directories.push(path.to_path_buf()),
-            Ok(_) => files.push(path.to_path_buf()),
-            Err(error) => exit_with_error(&mut stdout, &error, &format!("Error reading {}", input)),
+            Ok(metadata) if metadata.is_dir() => resolved.push(Resolved::Directory(path.into())),
+            Ok(_) => resolved.push(Resolved::File(path.into())),
+            Err(error) => {
+                eprintln!("sz-count: {}: {}", input, error);
+                *failures += 1;
+            }
         }
     }
+    resolved
+}
 
-    let outcome = if directories.is_empty() && files.len() == 1 {
-        match counter.count_file(&files[0]) {
-            Ok(counts) => report_single(&files[0].display().to_string(), &counts, &config),
-            Err(error) => exit_with_error(
-                &mut stdout,
-                &error,
-                &format!("Error reading {}", files[0].display()),
-            ),
+/// Count `path`, folding it into `report` or warning about why it could not be read.
+fn push_row(
+    report: &mut Report,
+    counter: Counter,
+    path: &Path,
+    name: String,
+    failures: &mut usize,
+) {
+    match counter.count_file(path) {
+        Ok(counts) => {
+            report.total.add(&counts);
+            report.rows.push(Row {
+                path: path.to_string_lossy().into_owned(),
+                name,
+                counts,
+            });
         }
-    } else if directories.len() == 1 && files.is_empty() {
-        // A lone directory gets the tree view, with per-file rows under a summary.
-        process_directory(&directories[0], counter, &config, &args)
-    } else {
-        // Anything else is a flat list: directories contribute the files they hold.
-        for directory in &directories {
-            files.extend(walk_files(directory, &args));
+        Err(error) => {
+            eprintln!("sz-count: {}: {}", path.display(), error);
+            *failures += 1;
         }
-        process_multiple_files(&files, counter, &config)
+    }
+}
+
+/// Count every input, in the order they were named.
+fn gather(args: &Args, counter: Counter, failures: &mut usize) -> Report {
+    let globs = args.glob.as_deref().map(compile_globs);
+    let resolved = resolve_inputs(args, failures);
+    let mut report = Report {
+        rows: Vec::new(),
+        total: Counts::default(),
+        root: None,
     };
 
-    if let Err(error) = outcome {
-        exit_on_write_error(&mut stdout, &error, "Error");
+    // A lone directory gets the tree view, with per-file rows under a summary.
+    if let [Resolved::Directory(directory)] = resolved.as_slice() {
+        let text = directory.to_string_lossy().into_owned();
+        report.root = Some(if text.ends_with('/') {
+            text
+        } else {
+            format!("{}/", text)
+        });
+        for path in walk_files(directory, args, &globs, failures) {
+            let name = path
+                .strip_prefix(directory)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            push_row(&mut report, counter, &path, name, failures);
+        }
+        return report;
+    }
+
+    for input in &resolved {
+        match input {
+            Resolved::Stdin => match counter.count_stdin() {
+                Ok(counts) => {
+                    report.total.add(&counts);
+                    report.rows.push(Row {
+                        path: "-".to_string(),
+                        name: "-".to_string(),
+                        counts,
+                    });
+                }
+                Err(error) => {
+                    eprintln!("sz-count: -: {}", error);
+                    *failures += 1;
+                }
+            },
+            Resolved::File(path) => {
+                let name = path.display().to_string();
+                push_row(&mut report, counter, path, name, failures);
+            }
+            Resolved::Directory(directory) => {
+                for path in walk_files(directory, args, &globs, failures) {
+                    let name = path.display().to_string();
+                    push_row(&mut report, counter, &path, name, failures);
+                }
+            }
+        }
+    }
+    report
+}
+
+/// The status a finished run reports. Nothing readable did not complete; nothing
+/// counted completed and found nothing.
+fn outcome(report: &Report, failures: usize) -> ExitCode {
+    if !report.rows.is_empty() {
+        ExitCode::Success
+    } else if failures > 0 {
+        ExitCode::Error
+    } else {
+        ExitCode::NoResult
+    }
+}
+
+// endregion: Input Processing
+
+fn run(output: &mut dyn Write) -> io::Result<ExitCode> {
+    let args = Args::parse();
+    if let Err(error) = validate(&args) {
+        error.exit();
+    }
+
+    let mode = Mode::from_args(args.posix, args.utf8);
+    let fields = Fields::from_selection(&args.fields);
+    let counter = Counter::new(mode, fields);
+
+    let mut failures = 0;
+    let report = gather(&args, counter, &mut failures);
+    let code = outcome(&report, failures);
+
+    if code == ExitCode::Success && !args.quiet {
+        let config = RenderConfig {
+            fields,
+            format: args.format,
+        };
+        render(output, &report, &config)?;
+    }
+    Ok(code)
+}
+
+fn main() {
+    let mut output = stdout_writer();
+    match run(&mut output) {
+        Ok(code) => code.exit(&mut output),
+        Err(error) => exit_on_write_error(&mut output, &error, "sz-count"),
     }
 }
 
@@ -1377,24 +1428,142 @@ mod tests {
     #[test]
     fn defaults_to_the_wc_field_trio() {
         let args = Args::parse_from(["sz-count", "file.txt"]);
-        let fields = Fields::from_args(&args, Mode::Ascii);
-        assert_eq!(fields.count(), 3);
-        assert!(fields.lines && fields.words && fields.bytes);
-        assert!(!fields.chars && !fields.max_line_length);
+        let fields = Fields::from_selection(&args.fields);
+        assert_eq!(fields.selectors(), [true, true, true, false, false]);
     }
 
     #[test]
-    fn utf8_adds_chars_to_the_default_fields() {
+    fn utf8_leaves_the_default_fields_alone() {
+        // `--utf8` used to append characters silently; they are asked for by name now.
         let args = Args::parse_from(["sz-count", "--utf8", "file.txt"]);
-        assert_eq!(Fields::from_args(&args, Mode::Unicode).count(), 4);
+        let fields = Fields::from_selection(&args.fields);
+        assert_eq!(fields.selectors(), [true, true, true, false, false]);
     }
 
     #[test]
-    fn selectors_replace_the_defaults() {
-        let args = Args::parse_from(["sz-count", "-l", "file.txt"]);
-        let fields = Fields::from_args(&args, Mode::Ascii);
-        assert_eq!(fields.count(), 1);
-        assert!(fields.lines && !fields.words && !fields.bytes);
+    fn reads_one_comma_separated_field_list() {
+        let args = Args::parse_from(["sz-count", "--fields", "lines,max-line-length", "file.txt"]);
+        let fields = Fields::from_selection(&args.fields);
+        assert_eq!(fields.selectors(), [true, false, false, false, true]);
+        assert!(Args::try_parse_from(["sz-count", "--fields", "maxline"]).is_err());
+    }
+
+    #[test]
+    fn rejects_characters_under_posix() {
+        // `--posix` promises byte-for-byte `wc`, which never counts code points.
+        let args = Args::parse_from(["sz-count", "--posix", "--fields", "chars", "file.txt"]);
+        assert!(validate(&args).is_err());
+        let args = Args::parse_from(["sz-count", "--posix", "file.txt"]);
+        assert!(validate(&args).is_ok());
+    }
+
+    #[test]
+    fn reports_the_exit_status_of_a_finished_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let counted = |arguments: &[&str], failures: &mut usize| {
+            let args = Args::parse_from(arguments);
+            let fields = Fields::from_selection(&args.fields);
+            gather(&args, Counter::new(Mode::Ascii, fields), failures)
+        };
+        let directory_path = directory.path().to_str().unwrap();
+
+        // An empty directory completed and found nothing.
+        let mut failures = 0;
+        let report = counted(&["sz-count", "--quiet", directory_path], &mut failures);
+        assert!(outcome(&report, failures) == ExitCode::NoResult);
+
+        // A readable file found something, however quiet the run.
+        let file = directory.path().join("a.txt");
+        fs::write(&file, b"a b\n").unwrap();
+        let mut failures = 0;
+        let report = counted(
+            &["sz-count", "--quiet", file.to_str().unwrap()],
+            &mut failures,
+        );
+        assert!(outcome(&report, failures) == ExitCode::Success);
+
+        // A missing input warns and still counts its neighbour, so only the run that
+        // read nothing at all is incomplete.
+        let mut failures = 0;
+        let report = counted(
+            &[
+                "sz-count",
+                "--quiet",
+                "no-such-file",
+                file.to_str().unwrap(),
+            ],
+            &mut failures,
+        );
+        assert_eq!(report.rows.len(), 1);
+        assert!(outcome(&report, failures) == ExitCode::Success);
+
+        let mut failures = 0;
+        let report = counted(&["sz-count", "--quiet", "no-such-file"], &mut failures);
+        assert!(outcome(&report, failures) == ExitCode::Error);
+    }
+
+    #[test]
+    fn quiet_rejects_the_flags_it_would_ignore() {
+        // Under `--quiet` the exit status is the whole output, so nothing that shapes a
+        // measurement or a table can reach it.
+        let rejected = [
+            vec!["sz-count", "--quiet", "--format", "json"],
+            vec!["sz-count", "--quiet", "--fields", "lines"],
+        ];
+        for arguments in rejected {
+            assert!(
+                Args::try_parse_from(&arguments).is_err(),
+                "{:?} must be rejected",
+                arguments
+            );
+        }
+
+        // What the input is, and which files are walked, both still steer the status.
+        let accepted = [
+            vec!["sz-count", "--quiet", "--utf8"],
+            vec!["sz-count", "--quiet", "--posix"],
+            vec!["sz-count", "--quiet", "--glob", "*.rs"],
+            vec!["sz-count", "--quiet", "--max-depth", "1"],
+        ];
+        for arguments in accepted {
+            assert!(
+                Args::try_parse_from(&arguments).is_ok(),
+                "{:?} must compose",
+                arguments
+            );
+        }
+    }
+
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "fields",
+                "utf8",
+                "posix",
+                "format",
+                "quiet",
+                "type",
+                "glob",
+                "max-depth",
+                "hidden",
+                "no-ignore",
+                "follow",
+                "help",
+                "version",
+            ]
+        );
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
     }
 
     #[test]
@@ -1465,6 +1634,7 @@ mod tests {
         let mut output = Vec::new();
         write_counts_json(&mut output, &long_path, &counts, fields).unwrap();
         let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with(r#"{"type":"count","#), "{}", text);
         assert!(text.contains(&long_path), "path must not be truncated");
         assert!(text.contains(r#""lines":2,"words":3,"bytes":14}}"#));
         assert!(!text.contains("chars"));

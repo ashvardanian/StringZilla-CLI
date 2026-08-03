@@ -4,7 +4,7 @@
 //! - Markdown (`.md`, `.markdown`): headings, code blocks, tables, blockquotes, images
 //! - C (`.c`, `.h`): includes, function declarations, function definitions
 //!
-//! File type is taken from the extension or forced with `-t {md,c,h}`.
+//! The parser is taken from the extension or forced with `--language {md,c,h}`.
 //!
 //! # Examples
 //!
@@ -12,43 +12,27 @@
 //! # Outline a Markdown file
 //! sz-outline README.md
 //!
-//! # Verbose output with line numbers
-//! sz-outline -v README.md
+//! # Add line numbers and byte offsets
+//! sz-outline --detail positions README.md
 //!
-//! # Most verbose with block details
-//! sz-outline -vv src/main.c
+//! # Add block sizes and nested blocks
+//! sz-outline --detail blocks src/main.c
 //!
-//! # Force file type
-//! sz-outline -t md document.txt
+//! # Force the parser
+//! sz-outline --language md document.txt
 //! ```
 
 use std::borrow::Cow;
 use std::io::{self, Write};
 use std::path::Path;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz::{find, StringZillableUnary};
 
 mod shared;
 use shared::*;
 
 // region: Data Structures
-
-/// Verbosity level for output
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum Verbosity {
-    Names = 0,       // v0: names only
-    LineNumbers = 1, // v1: add line numbers and byte offsets
-    Detailed = 2,    // v2: add block sizes, inner blocks
-}
-
-/// File type determined by extension
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FileType {
-    Markdown,
-    CSource,
-    CHeader,
-}
 
 /// Types of outline elements
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,65 +151,90 @@ struct Fence<'a> {
 
 // region: CLI Interface
 
+/// How much of each element the human renderer prints
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
+enum Detail {
+    Headings,
+    Positions,
+    Blocks,
+}
+
+/// Which parser reads the input
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Language {
+    Md,
+    C,
+    H,
+}
+
+/// How records are rendered
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Format {
+    Text,
+    Json,
+}
+
 /// Extract structural outline from source files
 #[derive(Parser)]
 #[command(name = "sz-outline")]
 #[command(version, about = "SIMD-accelerated file outlining", long_about = None)]
 struct Args {
     /// Input file (use '-' or omit for stdin)
-    #[arg(default_value = "-")]
-    input: String,
+    input: Option<String>,
 
-    /// Verbosity level: -v for line numbers/offsets, -vv for block details
-    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
-    verbose: u8,
+    /// Force the parser instead of detecting it from the extension
+    #[arg(long, value_enum, required_unless_present = "input")]
+    language: Option<Language>,
 
-    /// Force file type detection (md, c, h)
-    #[arg(short = 't', long = "type")]
-    file_type: Option<String>,
+    /// How much of each element to print
+    #[arg(long, value_enum, default_value = "headings")]
+    detail: Detail,
 
-    /// Emit JSON Lines, flat records linked by parent_line
-    #[arg(long, help_heading = "Output Formats")]
-    json: bool,
+    /// Treat the input as UTF-8 text
+    #[arg(long)]
+    utf8: bool,
+
+    /// How records are rendered
+    #[arg(
+        long,
+        value_enum,
+        default_value = "text",
+        help_heading = "Output Formats"
+    )]
+    format: Format,
+
+    /// Suppress all output; exit 0 if any element was found, 1 otherwise
+    #[arg(long, conflicts_with_all = ["detail", "format"], help_heading = "Output Formats")]
+    quiet: bool,
 }
 
 // endregion: CLI Interface
 
-// region: File Type Detection
+// region: Language Detection
 
-/// File type from the path's extension, or `None` when the extension is not outlined.
-fn detect_file_type(path: &str) -> Option<FileType> {
+/// Language from the path's extension, or `None` when the extension is not outlined.
+fn detect_language(path: &str) -> Option<Language> {
     match Path::new(path).extension()?.to_str()? {
-        "md" | "markdown" => Some(FileType::Markdown),
-        "c" => Some(FileType::CSource),
-        "h" => Some(FileType::CHeader),
+        "md" | "markdown" => Some(Language::Md),
+        "c" => Some(Language::C),
+        "h" => Some(Language::H),
         _ => None,
     }
 }
 
-/// File type from the `--type` argument, or `None` when the name is not outlined.
-fn parse_file_type(name: &str) -> Option<FileType> {
-    match name.to_lowercase().as_str() {
-        "md" | "markdown" => Some(FileType::Markdown),
-        "c" => Some(FileType::CSource),
-        "h" => Some(FileType::CHeader),
-        _ => None,
-    }
-}
-
-// endregion: File Type Detection
+// endregion: Language Detection
 
 // region: Markdown Parser
 
 /// Parse Markdown file and extract outline elements
-fn parse_markdown<'a>(data: &'a [u8], verbosity: Verbosity) -> Vec<OutlineElement<'a>> {
+fn parse_markdown<'a>(data: &'a [u8], newlines: Newlines) -> Vec<OutlineElement<'a>> {
     let mut elements: Vec<OutlineElement<'a>> = Vec::new();
     let mut line_number = 0usize;
     let mut current_section: Option<usize> = None;
     let mut open_code_block: Option<OpenCodeBlock<'a>> = None;
     let mut open_block: Option<OpenBlock> = None;
 
-    for line in LineIter::new(data, Newlines::Lf) {
+    for line in LineIter::new(data, newlines) {
         line_number += 1;
         let line_start = offset_within(data, line);
         let line_len = line.len();
@@ -255,9 +264,7 @@ fn parse_markdown<'a>(data: &'a [u8], verbosity: Verbosity) -> Vec<OutlineElemen
                     line_start + line_len - closed.start.offset,
                     line_number - closed.start.line + 1,
                 );
-                if verbosity >= Verbosity::Detailed {
-                    push_element(&mut elements, current_section, element);
-                }
+                push_element(&mut elements, current_section, element);
             } else if open_code_block.is_none() {
                 close_block(&mut elements, &mut open_block, current_section, interrupted);
                 open_code_block = Some(OpenCodeBlock {
@@ -288,56 +295,53 @@ fn parse_markdown<'a>(data: &'a [u8], verbosity: Verbosity) -> Vec<OutlineElemen
             );
             current_section = Some(elements.len() - 1);
         }
-        // Blocks below headings are only reported at the most verbose level.
-        else if verbosity >= Verbosity::Detailed {
-            // Image: `![alt](url)`
-            if let Some(alt) = parse_image(line) {
-                close_block(&mut elements, &mut open_block, current_section, interrupted);
-                let element = OutlineElement::new(
-                    ElementKind::Image {
-                        alt: Cow::Borrowed(alt),
-                    },
-                    Cow::Borrowed(alt),
-                    line_number,
-                    line_start,
-                )
-                .with_length(line_len, 1);
-                push_element(&mut elements, current_section, element);
-            }
-            // Blockquote: starts with `>`
-            else if trimmed.starts_with(b">") {
-                open_or_extend(
-                    &mut elements,
-                    &mut open_block,
-                    current_section,
-                    Block::Blockquote,
-                    start,
-                );
-            }
-            // Table: contains `|`
-            else if !trimmed.is_empty() && find(trimmed, b"|").is_some() {
-                open_or_extend(
-                    &mut elements,
-                    &mut open_block,
-                    current_section,
-                    Block::Table,
-                    start,
-                );
-            }
-            // Blank line ends the open block
-            else if trimmed.is_empty() {
-                close_block(&mut elements, &mut open_block, current_section, interrupted);
-            }
-            // Anything else is paragraph text
-            else {
-                open_or_extend(
-                    &mut elements,
-                    &mut open_block,
-                    current_section,
-                    Block::Paragraph,
-                    start,
-                );
-            }
+        // Image: `![alt](url)`
+        else if let Some(alt) = parse_image(line) {
+            close_block(&mut elements, &mut open_block, current_section, interrupted);
+            let element = OutlineElement::new(
+                ElementKind::Image {
+                    alt: Cow::Borrowed(alt),
+                },
+                Cow::Borrowed(alt),
+                line_number,
+                line_start,
+            )
+            .with_length(line_len, 1);
+            push_element(&mut elements, current_section, element);
+        }
+        // Blockquote: starts with `>`
+        else if trimmed.starts_with(b">") {
+            open_or_extend(
+                &mut elements,
+                &mut open_block,
+                current_section,
+                Block::Blockquote,
+                start,
+            );
+        }
+        // Table: contains `|`
+        else if !trimmed.is_empty() && find(trimmed, b"|").is_some() {
+            open_or_extend(
+                &mut elements,
+                &mut open_block,
+                current_section,
+                Block::Table,
+                start,
+            );
+        }
+        // Blank line ends the open block
+        else if trimmed.is_empty() {
+            close_block(&mut elements, &mut open_block, current_section, interrupted);
+        }
+        // Anything else is paragraph text
+        else {
+            open_or_extend(
+                &mut elements,
+                &mut open_block,
+                current_section,
+                Block::Paragraph,
+                start,
+            );
         }
     }
 
@@ -467,7 +471,7 @@ fn parse_image(line: &[u8]) -> Option<&[u8]> {
 // region: C Parser
 
 /// Parse C/C++ source file and extract outline elements
-fn parse_c<'a>(data: &'a [u8], _verbosity: Verbosity) -> Vec<OutlineElement<'a>> {
+fn parse_c<'a>(data: &'a [u8], newlines: Newlines) -> Vec<OutlineElement<'a>> {
     let mut elements: Vec<OutlineElement<'a>> = Vec::new();
     let mut line_number = 0usize;
 
@@ -480,7 +484,7 @@ fn parse_c<'a>(data: &'a [u8], _verbosity: Verbosity) -> Vec<OutlineElement<'a>>
     let mut in_multiline_comment = false;
     let mut pending_signature: Option<(usize, usize, Vec<u8>)> = None;
 
-    for line in LineIter::new(data, Newlines::Lf) {
+    for line in LineIter::new(data, newlines) {
         line_number += 1;
         let line_start = offset_within(data, line);
         let line_end = line_start + line.len();
@@ -814,16 +818,30 @@ fn element_kind_name(kind: &ElementKind<'_>) -> &'static str {
     }
 }
 
+/// Whether `detail` prints this element. Below `blocks` only the structural elements
+/// print — headings, includes and functions — so both renderers drop the same records.
+fn selects(kind: &ElementKind<'_>, detail: Detail) -> bool {
+    detail >= Detail::Blocks
+        || matches!(
+            kind,
+            ElementKind::Heading { .. }
+                | ElementKind::Include { .. }
+                | ElementKind::FunctionDeclaration
+                | ElementKind::FunctionDefinition
+        )
+}
+
 /// Write one element as a flat JSON Lines record. Children are emitted as their own
 /// records carrying `parent_line`, rather than nested, which keeps `jq` filters simple.
 fn write_element_json(
     out: &mut dyn Write,
     element: &OutlineElement<'_>,
     parent_line: Option<usize>,
+    detail: Detail,
 ) -> io::Result<()> {
     out.write_all(br#"{"type":"element","data":{"kind":""#)?;
     out.write_all(element_kind_name(&element.kind).as_bytes())?;
-    out.write_all(br#"","name":"#)?;
+    out.write_all(br#"","text":"#)?;
     json_text_field_to(out, &element.name)?;
 
     match &element.kind {
@@ -851,7 +869,9 @@ fn write_element_json(
     out.write_all(b"}}\n")?;
 
     for child in &element.children {
-        write_element_json(out, child, Some(element.line_number))?;
+        if selects(&child.kind, detail) {
+            write_element_json(out, child, Some(element.line_number), detail)?;
+        }
     }
     Ok(())
 }
@@ -859,20 +879,20 @@ fn write_element_json(
 fn write_element(
     out: &mut dyn Write,
     element: &OutlineElement<'_>,
-    verbosity: Verbosity,
-    file_type: FileType,
+    detail: Detail,
+    language: Language,
     column: usize,
 ) -> io::Result<()> {
-    match file_type {
-        FileType::Markdown => write_markdown_element(out, element, verbosity, column),
-        FileType::CSource | FileType::CHeader => write_c_element(out, element, verbosity, column),
+    match language {
+        Language::Md => write_markdown_element(out, element, detail, column),
+        Language::C | Language::H => write_c_element(out, element, detail, column),
     }
 }
 
 fn write_markdown_element(
     out: &mut dyn Write,
     element: &OutlineElement<'_>,
-    verbosity: Verbosity,
+    detail: Detail,
     column: usize,
 ) -> io::Result<()> {
     // `Cow<[u8]>` is not `Display`; `from_utf8_lossy` borrows for valid UTF-8.
@@ -881,9 +901,9 @@ fn write_markdown_element(
         ElementKind::Heading { level } => {
             // Headings are levels 1..=6 — slice a static run, no allocation.
             let prefix = &"######"[..(*level as usize).min(6)];
-            match verbosity {
-                Verbosity::Names => writeln!(out, "{} {}", prefix, name)?,
-                Verbosity::LineNumbers => writeln!(
+            match detail {
+                Detail::Headings => writeln!(out, "{} {}", prefix, name)?,
+                Detail::Positions => writeln!(
                     out,
                     "{} {:width$} [L{}, @{}]",
                     prefix,
@@ -892,7 +912,7 @@ fn write_markdown_element(
                     element.byte_offset,
                     width = column.saturating_sub(prefix.len() + 1)
                 )?,
-                Verbosity::Detailed => {
+                Detail::Blocks => {
                     let end_line = element.line_number + element.line_count - 1;
                     if element.line_count > 1 {
                         writeln!(
@@ -924,14 +944,9 @@ fn write_markdown_element(
                 }
             }
         }
-        ElementKind::CodeBlock { .. } => {
-            if verbosity >= Verbosity::Detailed {
-                // A fence before the first heading has no parent, and prints in the same
-                // branch column as one that does.
-                write_child_block(out, element, column)?;
-            }
-        }
-        _ => {}
+        // A block before the first heading has no parent, and prints in the same
+        // branch column as one that does.
+        _ => write_child_block(out, element, column)?,
     }
     Ok(())
 }
@@ -946,7 +961,7 @@ const INCLUDE_KEYWORD: &str = "#include ";
 /// Where the bracketed detail column starts: one past the longest name the run will print,
 /// its prefix included. A fixed column instead leaves every short name stranded from its
 /// own detail, and shoves the details of a long one out of the column the rest share.
-fn detail_column(elements: &[OutlineElement<'_>], verbosity: Verbosity) -> usize {
+fn detail_column(elements: &[OutlineElement<'_>], detail: Detail) -> usize {
     let mut column = 0;
     for element in elements {
         let name = String::from_utf8_lossy(&element.name).chars().count();
@@ -955,9 +970,12 @@ fn detail_column(elements: &[OutlineElement<'_>], verbosity: Verbosity) -> usize
             // The path prints inside its `<>` or `""` delimiters.
             ElementKind::Include { .. } => INCLUDE_KEYWORD.len() + name + 2,
             ElementKind::FunctionDeclaration | ElementKind::FunctionDefinition => name,
-            _ => CHILD_BRANCH.len() + child_label(element).chars().count(),
+            _ if detail >= Detail::Blocks => {
+                CHILD_BRANCH.len() + child_label(element).chars().count()
+            }
+            _ => 0,
         });
-        if verbosity >= Verbosity::Detailed {
+        if detail >= Detail::Blocks {
             for child in &element.children {
                 column = column.max(CHILD_BRANCH.len() + child_label(child).chars().count());
             }
@@ -1018,7 +1036,7 @@ fn write_child_block(
 fn write_c_element(
     out: &mut dyn Write,
     element: &OutlineElement<'_>,
-    verbosity: Verbosity,
+    detail: Detail,
     column: usize,
 ) -> io::Result<()> {
     // `Cow<[u8]>` is not `Display`; `from_utf8_lossy` borrows for valid UTF-8.
@@ -1026,11 +1044,11 @@ fn write_c_element(
     match &element.kind {
         ElementKind::Include { is_system } => {
             let (open, close) = if *is_system { ("<", ">") } else { ("\"", "\"") };
-            match verbosity {
-                Verbosity::Names => {
+            match detail {
+                Detail::Headings => {
                     writeln!(out, "{}{}{}{}", INCLUDE_KEYWORD, open, name, close)?;
                 }
-                Verbosity::LineNumbers | Verbosity::Detailed => {
+                Detail::Positions | Detail::Blocks => {
                     // Build the delimited path, so the pad measures the field the reader sees.
                     let path = format!("{}{}{}", open, name, close);
                     writeln!(
@@ -1045,9 +1063,9 @@ fn write_c_element(
                 }
             }
         }
-        ElementKind::FunctionDeclaration => match verbosity {
-            Verbosity::Names => writeln!(out, "{:width$} [declaration]", name, width = column)?,
-            Verbosity::LineNumbers => writeln!(
+        ElementKind::FunctionDeclaration => match detail {
+            Detail::Headings => writeln!(out, "{:width$} [declaration]", name, width = column)?,
+            Detail::Positions => writeln!(
                 out,
                 "{:width$} [L{}, @{}, declaration]",
                 name,
@@ -1055,7 +1073,7 @@ fn write_c_element(
                 element.byte_offset,
                 width = column
             )?,
-            Verbosity::Detailed => writeln!(
+            Detail::Blocks => writeln!(
                 out,
                 "{:width$} [L{}, @{}, {}B, declaration]",
                 name,
@@ -1065,9 +1083,9 @@ fn write_c_element(
                 width = column
             )?,
         },
-        ElementKind::FunctionDefinition => match verbosity {
-            Verbosity::Names => writeln!(out, "{:width$} [definition]", name, width = column)?,
-            Verbosity::LineNumbers => {
+        ElementKind::FunctionDefinition => match detail {
+            Detail::Headings => writeln!(out, "{:width$} [definition]", name, width = column)?,
+            Detail::Positions => {
                 let end_line = element.line_number + element.line_count - 1;
                 writeln!(
                     out,
@@ -1079,7 +1097,7 @@ fn write_c_element(
                     width = column
                 )?;
             }
-            Verbosity::Detailed => {
+            Detail::Blocks => {
                 let end_line = element.line_number + element.line_count - 1;
                 writeln!(
                     out,
@@ -1103,55 +1121,76 @@ fn write_c_element(
 
 // region: Main
 
+/// Report a constraint clap cannot express, rendered as clap renders its own.
+fn reject(message: &str) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::InvalidValue, message)
+}
+
+/// Every constraint that depends on an argument's *value*, which clap cannot declare.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    let path = args.input.as_deref().unwrap_or("-");
+    if args.language.or_else(|| detect_language(path)).is_none() {
+        return Err(reject(&format!(
+            "cannot outline '{}', use --language (md, c, h)",
+            path
+        )));
+    }
+    Ok(())
+}
+
 fn main() {
+    let mut stdout = io::stdout();
+    match run() {
+        Ok(code) => code.exit(&mut stdout),
+        Err(error) => exit_on_write_error(&mut stdout, &error, "sz-outline"),
+    }
+}
+
+fn run() -> io::Result<ExitCode> {
     let args = Args::parse();
+    if let Err(error) = validate(&args) {
+        error.exit();
+    }
+
     let mut handle = stdout_writer();
+    let path = args.input.as_deref().unwrap_or("-");
+    let language = args
+        .language
+        .or_else(|| detect_language(path))
+        .expect("validated");
 
-    let verbosity = match args.verbose {
-        0 => Verbosity::Names,
-        1 => Verbosity::LineNumbers,
-        _ => Verbosity::Detailed,
+    // The mmap is borrowed, not copied.
+    let input = get_input(Some(path))
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {}", path, error)))?;
+    let newlines = Newlines::from_utf8(args.utf8);
+    let elements = match language {
+        Language::Md => parse_markdown(input.as_bytes(), newlines),
+        Language::C | Language::H => parse_c(input.as_bytes(), newlines),
     };
 
-    // Determine file type
-    let detected = match args.file_type {
-        Some(ref name) => parse_file_type(name),
-        None if args.input != "-" => detect_file_type(&args.input),
-        None => {
-            eprintln!("Error: cannot detect file type from stdin, use --type");
-            ExitCode::Error.exit(&mut handle);
-        }
-    };
-    let Some(file_type) = detected else {
-        eprintln!("Error: unknown file type, use --type to specify (md, c, h)");
-        ExitCode::Error.exit(&mut handle);
-    };
+    // The exit code answers what was printed, not what was parsed, so a document
+    // whose every element `--detail` drops exits 1 rather than 0.
+    let outlined = elements
+        .iter()
+        .filter(|element| selects(&element.kind, args.detail));
+    if args.quiet {
+        return Ok(ExitCode::from_found(outlined.count() > 0));
+    }
 
-    // Get input — mmap is borrowed, not copied.
-    let input = get_input(Some(&args.input))
-        .unwrap_or_else(|error| exit_with_error(&mut handle, &error, "Error reading input"));
-    let data = input.as_bytes();
-
-    // Parse based on file type
-    let elements = match file_type {
-        FileType::Markdown => parse_markdown(data, verbosity),
-        FileType::CSource | FileType::CHeader => parse_c(data, verbosity),
-    };
-
-    let column = detail_column(&elements, verbosity);
-    for element in &elements {
-        let written = if args.json {
-            write_element_json(&mut handle, element, None)
-        } else {
-            write_element(&mut handle, element, verbosity, file_type, column)
+    let column = detail_column(&elements, args.detail);
+    let mut emitted = false;
+    for element in outlined {
+        emitted = true;
+        let written = match args.format {
+            Format::Json => write_element_json(&mut handle, element, None, args.detail),
+            Format::Text => write_element(&mut handle, element, args.detail, language, column),
         };
         if let Err(error) = written {
-            if error.kind() == io::ErrorKind::BrokenPipe {
-                break;
-            }
-            exit_with_error(&mut handle, &error, "Error writing output");
+            exit_on_write_error(&mut handle, &error, "sz-outline");
         }
     }
+    handle.flush()?;
+    Ok(ExitCode::from_found(emitted))
 }
 
 // endregion: Main
@@ -1161,15 +1200,121 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
-    fn takes_no_utf8_flag() {
-        // Both parsers break on LF, so there is no Unicode newline set to ask for: a
-        // `--utf8` that changed line numbering on U+2028 would be a hazard, not a feature.
-        let Err(error) = Args::try_parse_from(["sz-outline", "--utf8", "README.md"]) else {
-            panic!("--utf8 must be rejected");
+    fn declares_no_short_flags() {
+        assert!(Args::command()
+            .get_arguments()
+            .all(|a| a.get_short().is_none() || matches!(a.get_short(), Some('h') | Some('V'))));
+    }
+
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|a| a.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            ["language", "detail", "utf8", "format", "quiet", "help", "version"]
+        );
+    }
+
+    #[test]
+    fn requires_a_language_only_for_stdin() {
+        assert!(Args::try_parse_from(["sz-outline", "README.md"]).is_ok());
+        assert!(Args::try_parse_from(["sz-outline", "--language", "md"]).is_ok());
+        let Err(error) = Args::try_parse_from(["sz-outline"]) else {
+            panic!("stdin needs --language");
         };
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        // A typo is a usage error rather than a runtime message naming the flag you used.
+        let Err(error) = Args::try_parse_from(["sz-outline", "--language", "rust", "a.txt"]) else {
+            panic!("unknown language must be rejected");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn breaks_lines_on_unicode_newlines_only_under_utf8() {
+        let markdown = "# One\u{2028}# Two\n".as_bytes();
+        assert_eq!(parse_markdown(markdown, Newlines::Unicode).len(), 2);
+        // LF-only splitting swallows the separator into the first heading's text.
+        assert_eq!(parse_markdown(markdown, Newlines::Lf).len(), 1);
+    }
+
+    #[test]
+    fn defaults_the_rendering_options_and_still_conflicts_with_quiet() {
+        let args = Args::try_parse_from(["sz-outline", "README.md"]).unwrap();
+        assert_eq!(args.detail, Detail::Headings);
+        assert_eq!(args.format, Format::Text);
+        // Defaulted values are not "present", so the conflicts survive the defaults.
+        assert!(Args::try_parse_from(["sz-outline", "--quiet", "README.md"]).is_ok());
+        for flag in [["--detail", "blocks"], ["--format", "json"]] {
+            let argv = ["sz-outline", "--quiet", flag[0], flag[1], "README.md"];
+            assert!(Args::try_parse_from(argv).is_err(), "{:?}", argv);
+        }
+    }
+
+    #[test]
+    fn rejects_an_extension_it_cannot_outline() {
+        let args = Args::try_parse_from(["sz-outline", "notes.txt"]).unwrap();
+        assert!(validate(&args).is_err());
+        assert!(validate(&Args::try_parse_from(["sz-outline", "notes.md"]).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn detail_decides_what_either_renderer_emits() {
+        // Both the exit code and `--format json` used to ignore `--detail` entirely.
+        let markdown = b"just a paragraph\n";
+        let elements = parse_markdown(markdown, Newlines::Lf);
+        assert_eq!(elements.len(), 1);
+        assert!(!selects(&elements[0].kind, Detail::Headings));
+        assert!(selects(&elements[0].kind, Detail::Blocks));
+
+        let records = |detail| {
+            let markdown = b"# Head\n\n```rust\ncode\n```\n";
+            let elements = parse_markdown(markdown, Newlines::Lf);
+            let mut printed = Vec::new();
+            for element in elements.iter().filter(|e| selects(&e.kind, detail)) {
+                write_element_json(&mut printed, element, None, detail).unwrap();
+            }
+            String::from_utf8(printed).unwrap().lines().count()
+        };
+        assert_eq!(records(Detail::Headings), 1);
+        assert_eq!(records(Detail::Blocks), 2);
+    }
+
+    #[test]
+    fn records_every_block_regardless_of_detail() {
+        // The parser is unconditional; `--detail` filters at the renderer instead.
+        let markdown = b"# Head\n\n```rust\ncode\n```\n\n> quoted\n";
+        let elements = parse_markdown(markdown, Newlines::Lf);
+        let kinds: Vec<&ElementKind<'_>> = elements[0].children.iter().map(|c| &c.kind).collect();
+        assert!(
+            matches!(kinds[0], ElementKind::CodeBlock { .. }),
+            "{:?}",
+            kinds
+        );
+        assert!(matches!(kinds[1], ElementKind::Blockquote), "{:?}", kinds);
+
+        // Yet the heading-only rendering still prints one line per heading.
+        let mut printed = Vec::new();
+        write_element(
+            &mut printed,
+            &elements[0],
+            Detail::Headings,
+            Language::Md,
+            detail_column(&elements, Detail::Headings),
+        )
+        .unwrap();
+        assert_eq!(printed, b"# Head\n");
     }
 
     #[test]
@@ -1177,18 +1322,11 @@ mod tests {
         // A heading wider than any fixed column, beside one far narrower, and a child
         // block whose branch glyphs count toward the same column.
         let data = b"# Short\n\nA paragraph.\n\n## A heading long enough to outgrow a fixed forty-column pad\n";
-        let elements = parse_markdown(data, Verbosity::Detailed);
-        let column = detail_column(&elements, Verbosity::Detailed);
+        let elements = parse_markdown(data, Newlines::Lf);
+        let column = detail_column(&elements, Detail::Blocks);
         let mut printed = Vec::new();
         for element in &elements {
-            write_element(
-                &mut printed,
-                element,
-                Verbosity::Detailed,
-                FileType::Markdown,
-                column,
-            )
-            .unwrap();
+            write_element(&mut printed, element, Detail::Blocks, Language::Md, column).unwrap();
         }
 
         let text = String::from_utf8(printed).unwrap();
@@ -1294,7 +1432,7 @@ mod tests {
     #[test]
     fn parses_markdown_headings_into_elements() {
         let md = b"# Title\n\nSome text.\n\n## Section\n\n```rust\ncode\n```\n";
-        let elements = parse_markdown(md, Verbosity::Names);
+        let elements = parse_markdown(md, Newlines::Lf);
 
         assert_eq!(elements.len(), 2);
         assert!(matches!(
@@ -1312,7 +1450,7 @@ mod tests {
         // A quote line ends the table above it, so the two spans stay disjoint
         // instead of the quote nesting inside a still-open table.
         let markdown = b"# Head\n\n| a | b |\n| - | - |\n> quoted\n\ntail\n";
-        let elements = parse_markdown(markdown, Verbosity::Detailed);
+        let elements = parse_markdown(markdown, Newlines::Lf);
         let blocks = &elements[0].children;
 
         for pair in blocks.windows(2) {
@@ -1349,7 +1487,7 @@ mod tests {
     fn markdown_block_at_end_of_input_stops_at_the_last_byte() {
         // Without a trailing newline the final block must not claim a byte past the end.
         let markdown = b"# Head\n\nparagraph";
-        let elements = parse_markdown(markdown, Verbosity::Detailed);
+        let elements = parse_markdown(markdown, Newlines::Lf);
         let paragraph = &elements[0].children[0];
 
         assert!(matches!(paragraph.kind, ElementKind::Paragraph));
@@ -1360,7 +1498,7 @@ mod tests {
 
         // With the trailing newline the block owns it, and still ends at the last byte.
         let terminated = b"# Head\n\nparagraph\n";
-        let elements = parse_markdown(terminated, Verbosity::Detailed);
+        let elements = parse_markdown(terminated, Newlines::Lf);
         let paragraph = &elements[0].children[0];
         assert_eq!(
             paragraph.byte_offset + paragraph.byte_length,
@@ -1371,7 +1509,7 @@ mod tests {
     #[test]
     fn parses_c_includes_and_functions() {
         let c = b"#include <stdio.h>\n\nint main(void) {\n    return 0;\n}\n";
-        let elements = parse_c(c, Verbosity::Names);
+        let elements = parse_c(c, Newlines::Lf);
 
         assert_eq!(elements.len(), 2);
         assert!(matches!(
