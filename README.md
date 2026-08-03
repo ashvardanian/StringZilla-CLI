@@ -418,7 +418,9 @@ What `sz-split` adds either way is `--utf8`, which breaks on the Unicode newline
 ## `sz-outline`: File Outliner for LLMs
 
 > [!WARNING]
-> This tool is being designed without a prior-art reference, so expect it to change a lot even in minor releases.
+> This one is being reimplemented and is excluded from the default build.
+> Enable it with `cargo build --release --features outline`.
+> It is being designed without a prior-art reference, so expect it to change a lot even in minor releases.
 
 Extract structural outlines from source files for LLM context windows.
 When feeding large files to language models, you often need a high-level overview without the full content.
