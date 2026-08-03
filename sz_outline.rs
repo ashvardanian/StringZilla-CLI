@@ -861,10 +861,11 @@ fn write_element(
     element: &OutlineElement<'_>,
     verbosity: Verbosity,
     file_type: FileType,
+    column: usize,
 ) -> io::Result<()> {
     match file_type {
-        FileType::Markdown => write_markdown_element(out, element, verbosity),
-        FileType::CSource | FileType::CHeader => write_c_element(out, element, verbosity),
+        FileType::Markdown => write_markdown_element(out, element, verbosity, column),
+        FileType::CSource | FileType::CHeader => write_c_element(out, element, verbosity, column),
     }
 }
 
@@ -872,6 +873,7 @@ fn write_markdown_element(
     out: &mut dyn Write,
     element: &OutlineElement<'_>,
     verbosity: Verbosity,
+    column: usize,
 ) -> io::Result<()> {
     // `Cow<[u8]>` is not `Display`; `from_utf8_lossy` borrows for valid UTF-8.
     let name = String::from_utf8_lossy(&element.name);
@@ -883,53 +885,50 @@ fn write_markdown_element(
                 Verbosity::Names => writeln!(out, "{} {}", prefix, name)?,
                 Verbosity::LineNumbers => writeln!(
                     out,
-                    "{} {:40} [L{}, @{}]",
-                    prefix, name, element.line_number, element.byte_offset
+                    "{} {:width$} [L{}, @{}]",
+                    prefix,
+                    name,
+                    element.line_number,
+                    element.byte_offset,
+                    width = column.saturating_sub(prefix.len() + 1)
                 )?,
                 Verbosity::Detailed => {
                     let end_line = element.line_number + element.line_count - 1;
                     if element.line_count > 1 {
                         writeln!(
                             out,
-                            "{} {:40} [L{}-{}, @{}, {}B]",
+                            "{} {:width$} [L{}-{}, @{}, {}B]",
                             prefix,
                             name,
                             element.line_number,
                             end_line,
                             element.byte_offset,
-                            element.byte_length
+                            element.byte_length,
+                            width = column.saturating_sub(prefix.len() + 1)
                         )?;
                     } else {
                         writeln!(
                             out,
-                            "{} {:40} [L{}, @{}, {}B]",
+                            "{} {:width$} [L{}, @{}, {}B]",
                             prefix,
                             name,
                             element.line_number,
                             element.byte_offset,
-                            element.byte_length
+                            element.byte_length,
+                            width = column.saturating_sub(prefix.len() + 1)
                         )?;
                     }
                     for child in &element.children {
-                        write_child_block(out, child)?;
+                        write_child_block(out, child, column)?;
                     }
                 }
             }
         }
-        ElementKind::CodeBlock { language } => {
+        ElementKind::CodeBlock { .. } => {
             if verbosity >= Verbosity::Detailed {
-                let info = language
-                    .as_ref()
-                    .map(|bytes| String::from_utf8_lossy(bytes));
-                let label = info.as_deref().unwrap_or("code");
-                writeln!(
-                    out,
-                    "  - {} [L{}-{}, {}B]",
-                    label,
-                    element.line_number,
-                    element.line_number + element.line_count - 1,
-                    element.byte_length
-                )?;
+                // A fence before the first heading has no parent, and prints in the same
+                // branch column as one that does.
+                write_child_block(out, element, column)?;
             }
         }
         _ => {}
@@ -937,9 +936,40 @@ fn write_markdown_element(
     Ok(())
 }
 
-fn write_child_block(out: &mut dyn Write, element: &OutlineElement<'_>) -> io::Result<()> {
-    // Constant labels borrow; only code and image build a small owned label for the {:36} pad.
-    let label: Cow<str> = match &element.kind {
+/// The branch a child block hangs off, written once so the column it occupies is the
+/// string's own length rather than a number that can drift from it.
+const CHILD_BRANCH: &str = "  - ";
+
+/// The keyword an include prints behind, on the same terms.
+const INCLUDE_KEYWORD: &str = "#include ";
+
+/// Where the bracketed detail column starts: one past the longest name the run will print,
+/// its prefix included. A fixed column instead leaves every short name stranded from its
+/// own detail, and shoves the details of a long one out of the column the rest share.
+fn detail_column(elements: &[OutlineElement<'_>], verbosity: Verbosity) -> usize {
+    let mut column = 0;
+    for element in elements {
+        let name = String::from_utf8_lossy(&element.name).chars().count();
+        column = column.max(match &element.kind {
+            ElementKind::Heading { level } => (*level as usize).min(6) + 1 + name,
+            // The path prints inside its `<>` or `""` delimiters.
+            ElementKind::Include { .. } => INCLUDE_KEYWORD.len() + name + 2,
+            ElementKind::FunctionDeclaration | ElementKind::FunctionDefinition => name,
+            _ => CHILD_BRANCH.len() + child_label(element).chars().count(),
+        });
+        if verbosity >= Verbosity::Detailed {
+            for child in &element.children {
+                column = column.max(CHILD_BRANCH.len() + child_label(child).chars().count());
+            }
+        }
+    }
+    column
+}
+
+/// The label a child block prints under its heading, owned only for the two kinds that
+/// carry a name of their own.
+fn child_label<'a>(element: &'a OutlineElement<'_>) -> Cow<'a, str> {
+    match &element.kind {
         ElementKind::CodeBlock { language } => match language {
             Some(bytes) => Cow::Owned(format!("code ({})", String::from_utf8_lossy(bytes))),
             None => Cow::Borrowed("code"),
@@ -951,22 +981,36 @@ fn write_child_block(out: &mut dyn Write, element: &OutlineElement<'_>) -> io::R
         }
         ElementKind::Paragraph => Cow::Borrowed("paragraph"),
         _ => Cow::Borrowed("block"),
-    };
+    }
+}
+
+fn write_child_block(
+    out: &mut dyn Write,
+    element: &OutlineElement<'_>,
+    column: usize,
+) -> io::Result<()> {
+    let label = child_label(element);
 
     if element.line_count > 1 {
         writeln!(
             out,
-            "  - {:36} [L{}-{}, {}B]",
+            "{}{:width$} [L{}-{}, {}B]",
+            CHILD_BRANCH,
             label,
             element.line_number,
             element.line_number + element.line_count - 1,
-            element.byte_length
+            element.byte_length,
+            width = column.saturating_sub(CHILD_BRANCH.len())
         )
     } else {
         writeln!(
             out,
-            "  - {:36} [L{}, {}B]",
-            label, element.line_number, element.byte_length
+            "{}{:width$} [L{}, {}B]",
+            CHILD_BRANCH,
+            label,
+            element.line_number,
+            element.byte_length,
+            width = column.saturating_sub(CHILD_BRANCH.len())
         )
     }
 }
@@ -975,6 +1019,7 @@ fn write_c_element(
     out: &mut dyn Write,
     element: &OutlineElement<'_>,
     verbosity: Verbosity,
+    column: usize,
 ) -> io::Result<()> {
     // `Cow<[u8]>` is not `Display`; `from_utf8_lossy` borrows for valid UTF-8.
     let name = String::from_utf8_lossy(&element.name);
@@ -983,53 +1028,69 @@ fn write_c_element(
             let (open, close) = if *is_system { ("<", ">") } else { ("\"", "\"") };
             match verbosity {
                 Verbosity::Names => {
-                    writeln!(out, "#include {}{}{}", open, name, close)?;
+                    writeln!(out, "{}{}{}{}", INCLUDE_KEYWORD, open, name, close)?;
                 }
                 Verbosity::LineNumbers | Verbosity::Detailed => {
-                    // Build the padded `<path>` field (small, per include) for {:36}.
+                    // Build the delimited path, so the pad measures the field the reader sees.
                     let path = format!("{}{}{}", open, name, close);
                     writeln!(
                         out,
-                        "#include {:36} [L{}, @{}]",
-                        path, element.line_number, element.byte_offset
+                        "{}{:width$} [L{}, @{}]",
+                        INCLUDE_KEYWORD,
+                        path,
+                        element.line_number,
+                        element.byte_offset,
+                        width = column.saturating_sub(INCLUDE_KEYWORD.len())
                     )?;
                 }
             }
         }
         ElementKind::FunctionDeclaration => match verbosity {
-            Verbosity::Names => writeln!(out, "{:44} [declaration]", name)?,
+            Verbosity::Names => writeln!(out, "{:width$} [declaration]", name, width = column)?,
             Verbosity::LineNumbers => writeln!(
                 out,
-                "{:44} [L{}, @{}, declaration]",
-                name, element.line_number, element.byte_offset
+                "{:width$} [L{}, @{}, declaration]",
+                name,
+                element.line_number,
+                element.byte_offset,
+                width = column
             )?,
             Verbosity::Detailed => writeln!(
                 out,
-                "{:44} [L{}, @{}, {}B, declaration]",
-                name, element.line_number, element.byte_offset, element.byte_length
+                "{:width$} [L{}, @{}, {}B, declaration]",
+                name,
+                element.line_number,
+                element.byte_offset,
+                element.byte_length,
+                width = column
             )?,
         },
         ElementKind::FunctionDefinition => match verbosity {
-            Verbosity::Names => writeln!(out, "{:44} [definition]", name)?,
+            Verbosity::Names => writeln!(out, "{:width$} [definition]", name, width = column)?,
             Verbosity::LineNumbers => {
                 let end_line = element.line_number + element.line_count - 1;
                 writeln!(
                     out,
-                    "{:44} [L{}-{}, @{}, definition]",
-                    name, element.line_number, end_line, element.byte_offset
+                    "{:width$} [L{}-{}, @{}, definition]",
+                    name,
+                    element.line_number,
+                    end_line,
+                    element.byte_offset,
+                    width = column
                 )?;
             }
             Verbosity::Detailed => {
                 let end_line = element.line_number + element.line_count - 1;
                 writeln!(
                     out,
-                    "{:44} [L{}-{}, @{}, {}B, {} lines, definition]",
+                    "{:width$} [L{}-{}, @{}, {}B, {} lines, definition]",
                     name,
                     element.line_number,
                     end_line,
                     element.byte_offset,
                     element.byte_length,
-                    element.line_count
+                    element.line_count,
+                    width = column
                 )?;
             }
         },
@@ -1077,11 +1138,12 @@ fn main() {
         FileType::CSource | FileType::CHeader => parse_c(data, verbosity),
     };
 
+    let column = detail_column(&elements, verbosity);
     for element in &elements {
         let written = if args.json {
             write_element_json(&mut handle, element, None)
         } else {
-            write_element(&mut handle, element, verbosity, file_type)
+            write_element(&mut handle, element, verbosity, file_type, column)
         };
         if let Err(error) = written {
             if error.kind() == io::ErrorKind::BrokenPipe {
@@ -1108,6 +1170,40 @@ mod tests {
             panic!("--utf8 must be rejected");
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn aligns_details_past_the_longest_name() {
+        // A heading wider than any fixed column, beside one far narrower, and a child
+        // block whose branch glyphs count toward the same column.
+        let data = b"# Short\n\nA paragraph.\n\n## A heading long enough to outgrow a fixed forty-column pad\n";
+        let elements = parse_markdown(data, Verbosity::Detailed);
+        let column = detail_column(&elements, Verbosity::Detailed);
+        let mut printed = Vec::new();
+        for element in &elements {
+            write_element(
+                &mut printed,
+                element,
+                Verbosity::Detailed,
+                FileType::Markdown,
+                column,
+            )
+            .unwrap();
+        }
+
+        let text = String::from_utf8(printed).unwrap();
+        let details: Vec<usize> = text
+            .lines()
+            .map(|line| line.find(" [").expect("every row carries its detail"))
+            .collect();
+        assert!(details.len() >= 3, "{}", text);
+        assert!(
+            details.windows(2).all(|pair| pair[0] == pair[1]),
+            "details start in different columns:\n{}",
+            text
+        );
+        // Sized to the longest name, not to a constant.
+        assert_eq!(details[0], column, "{}", text);
     }
 
     #[test]
