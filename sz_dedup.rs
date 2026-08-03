@@ -386,7 +386,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["in_place", "dry_run"])]
     output: Option<String>,
 
-    /// Rewrite the input file itself, so symlinks and hardlinks survive; a failure during the final copy leaves the new content in a named temporary file
+    /// Rewrite the input file, swapping the result in atomically once it is on disk
     #[arg(long, conflicts_with_all = ["dry_run", "null", "quiet"])]
     in_place: bool,
 
@@ -476,7 +476,7 @@ fn run() -> io::Result<ExitCode> {
             rendering: Rendering::Verbatim,
             path: name,
         };
-        write_replacing(path, |output| {
+        write_replacing("sz-dedup", path, |output| {
             dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
         })
         .map_err(at_path(path))?
@@ -730,7 +730,7 @@ mod tests {
         fs::write(&path, b"a\nb\na\n").unwrap();
         let config = verbatim_config();
 
-        write_replacing(path.to_str().unwrap(), |output| {
+        write_replacing("sz-dedup", path.to_str().unwrap(), |output| {
             dedup_to_writer(&fs::read(&path).unwrap(), output, false, false, &config)
         })
         .unwrap();
@@ -749,10 +749,11 @@ mod tests {
         let path = directory.path().join("lines.txt");
         fs::write(&path, b"original\n").unwrap();
 
-        let failed: io::Result<()> = write_replacing(path.to_str().unwrap(), |output| {
-            output.write_all(b"partial\n")?;
-            Err(io::Error::other("interrupted"))
-        });
+        let failed: io::Result<()> =
+            write_replacing("sz-dedup", path.to_str().unwrap(), |output| {
+                output.write_all(b"partial\n")?;
+                Err(io::Error::other("interrupted"))
+            });
 
         assert!(failed.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"original\n");
@@ -765,7 +766,7 @@ mod tests {
         fs::write(&path, b"").unwrap();
         let config = verbatim_config();
 
-        let counts = write_replacing(path.to_str().unwrap(), |output| {
+        let counts = write_replacing("sz-dedup", path.to_str().unwrap(), |output| {
             dedup_to_writer(b"", output, false, false, &config)
         })
         .unwrap();

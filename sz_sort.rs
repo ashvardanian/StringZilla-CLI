@@ -248,7 +248,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["in_place", "dry_run"])]
     output: Option<String>,
 
-    /// Rewrite the input file itself, so symlinks and hardlinks survive; a failure during the final copy leaves the new content in a named temporary file
+    /// Rewrite the input file, swapping the result in atomically once it is on disk
     #[arg(long, conflicts_with_all = ["dry_run", "null", "quiet"])]
     in_place: bool,
 
@@ -373,7 +373,7 @@ fn run() -> io::Result<ExitCode> {
         write_sorted(&lines, &permutation, order, &config, &mut io::sink())?
     } else if args.in_place {
         let path = args.input.as_deref().expect("validated");
-        write_replacing(path, |output| {
+        write_replacing("sz-sort", path, |output| {
             write_sorted(&lines, &permutation, order, &config, output)
         })
         .map_err(at_path(path))?
@@ -683,7 +683,10 @@ mod tests {
         let path = directory.path().join("lines.txt");
         fs::write(&path, b"b\na\n").unwrap();
 
-        write_replacing(path.to_str().unwrap(), |output| output.write_all(b"a\nb\n")).unwrap();
+        write_replacing("sz-sort", path.to_str().unwrap(), |output| {
+            output.write_all(b"a\nb\n")
+        })
+        .unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"a\nb\n");
         let leftovers: Vec<_> = fs::read_dir(directory.path())
@@ -694,12 +697,44 @@ mod tests {
     }
 
     #[test]
+    fn swaps_by_rename_but_keeps_a_hardlinked_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::TempDir::new().unwrap();
+
+        // Unlinked: the swap is a rename, so the path gets a new inode and the replacement
+        // is atomic.
+        let plain = directory.path().join("plain.txt");
+        fs::write(&plain, b"b\na\n").unwrap();
+        let before = fs::metadata(&plain).unwrap().ino();
+        write_replacing("sz-sort", plain.to_str().unwrap(), |output| {
+            output.write_all(b"a\nb\n")
+        })
+        .unwrap();
+        assert_ne!(fs::metadata(&plain).unwrap().ino(), before);
+
+        // Hardlinked: renaming would strand the other name on the old content, so the inode
+        // is rewritten instead and both names see the result.
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        fs::write(&first, b"b\na\n").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+        let before = fs::metadata(&first).unwrap().ino();
+        write_replacing("sz-sort", first.to_str().unwrap(), |output| {
+            output.write_all(b"a\nb\n")
+        })
+        .unwrap();
+        assert_eq!(fs::metadata(&first).unwrap().ino(), before);
+        assert_eq!(fs::read(&second).unwrap(), b"a\nb\n");
+    }
+
+    #[test]
     fn leaves_the_input_untouched_when_the_rewrite_fails() {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("lines.txt");
         fs::write(&path, b"original\n").unwrap();
 
-        let failed: io::Result<()> = write_replacing(path.to_str().unwrap(), |output| {
+        let failed: io::Result<()> = write_replacing("sz-sort", path.to_str().unwrap(), |output| {
             output.write_all(b"partial\n")?;
             Err(io::Error::other("interrupted"))
         });

@@ -55,7 +55,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["in_place", "dry_run", "quiet"])]
     output: Option<String>,
 
-    /// Rewrite the input file itself, so symlinks and hardlinks survive; a failure during the final copy leaves the new content in a named temporary file
+    /// Rewrite the input file, swapping the result in atomically once it is on disk
     #[arg(long, conflicts_with_all = ["dry_run", "quiet"])]
     in_place: bool,
 
@@ -206,7 +206,7 @@ fn run() -> io::Result<ExitCode> {
         .expect("writing to a sink cannot fail")
     } else if args.in_place {
         let path = args.input.as_deref().expect("validated");
-        write_replacing(path, |output| {
+        write_replacing("sz-replace", path, |output| {
             replace_all_to(data, pattern, replacement, args.ignore_case, output)
         })
         .map_err(at_path(path))?
@@ -441,7 +441,7 @@ mod tests {
         let path = directory.path().join("text.txt");
         fs::write(&path, b"hello hello").unwrap();
 
-        let count = write_replacing(path.to_str().unwrap(), |output| {
+        let count = write_replacing("sz-replace", path.to_str().unwrap(), |output| {
             replace_all_to(b"hello hello", b"hello", b"hi", false, output)
         })
         .unwrap();
@@ -461,10 +461,11 @@ mod tests {
         let path = directory.path().join("text.txt");
         fs::write(&path, b"original").unwrap();
 
-        let failed: io::Result<()> = write_replacing(path.to_str().unwrap(), |output| {
-            output.write_all(b"partial")?;
-            Err(io::Error::other("interrupted"))
-        });
+        let failed: io::Result<()> =
+            write_replacing("sz-replace", path.to_str().unwrap(), |output| {
+                output.write_all(b"partial")?;
+                Err(io::Error::other("interrupted"))
+            });
 
         assert!(failed.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"original");

@@ -186,22 +186,27 @@ pub fn is_readable_entry(entry: &ignore::DirEntry) -> bool {
     }
 }
 
-/// Rewrite `path` through a sibling temporary file, renamed over it once the write has
-/// reached the disk, then copied back over the original inode so symlinks and hardlinks
-/// survive. In-place editing that truncates first loses the file outright when the process
-/// dies mid-write; here the complete result exists before the target is touched.
+/// Rewrite `path` through a sibling temporary file that replaces it only once the new
+/// content has reached the disk, so a crash leaves either the old file or the new one.
+///
+/// The swap is a rename, which is atomic but gives the path a new inode. That severs any
+/// hardlink, so a file carrying more than one link is instead copied back over the original
+/// inode — preserving the link at the cost of a window where the file is neither version.
+/// Symlinks survive either way, since `path` is resolved before anything is written.
 #[allow(dead_code)]
 pub fn write_replacing<T>(
+    tool: &str,
     path: &str,
     write: impl FnOnce(&mut dyn Write) -> io::Result<T>,
 ) -> io::Result<T> {
     // Resolve first: editing through a symlink must change the file it names, not replace
     // the link with a regular file.
     let resolved = std::fs::canonicalize(path)?;
-    // Opening for writing now is the authoritative permission check — a read-only target
-    // fails here rather than being silently rewritten — and this handle is where the new
-    // content lands, so the inode and any hardlinks to it survive.
-    let mut target = OpenOptions::new().write(true).open(&resolved)?;
+    // A rename needs only write permission on the directory, so it would happily replace a
+    // file the caller cannot write. Opening the target settles that question the way the
+    // kernel would, before anything is created.
+    let target = OpenOptions::new().write(true).open(&resolved)?;
+    let metadata = target.metadata()?;
     let directory = resolved.parent().unwrap_or(Path::new("."));
     let (mut temporary, temporary_path) = create_temporary(directory)?;
 
@@ -210,6 +215,7 @@ pub fn write_replacing<T>(
         let value = write(&mut writer)?;
         writer.flush()?;
         drop(writer);
+        let _ = temporary.set_permissions(metadata.permissions());
         temporary.sync_all()?;
         temporary.seek(io::SeekFrom::Start(0))?;
         Ok(value)
@@ -223,9 +229,24 @@ pub fn write_replacing<T>(
         }
     };
 
-    // The one window where the target is neither the old content nor the new. The complete
-    // result is already durable in the temporary, so a failure here keeps it and names it
-    // rather than deleting the only copy.
+    if !is_hardlinked(&metadata) {
+        return match std::fs::rename(&temporary_path, &resolved) {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary_path);
+                Err(error)
+            }
+        };
+    }
+
+    eprintln!(
+        "{tool}: warning: {path} has other hardlinks, so it is rewritten in place rather \
+         than replaced; an interrupted run can leave it truncated"
+    );
+
+    // The one window where the file is neither version. The result is already durable in the
+    // temporary, so a failure here keeps it and names it rather than deleting the only copy.
+    let mut target = target;
     let copied = (|| {
         target.set_len(0)?;
         io::copy(&mut temporary, &mut target)?;
@@ -244,6 +265,20 @@ pub fn write_replacing<T>(
                 temporary_path.display()
             ),
         )),
+    }
+}
+
+/// Whether replacing this file by rename would detach it from other names for the same
+/// inode. Platforms that do not report a link count take the atomic path.
+fn is_hardlinked(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::nlink(metadata) > 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
     }
 }
 
