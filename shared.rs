@@ -335,6 +335,55 @@ pub fn offset_within(data: &[u8], segment: &[u8]) -> usize {
 
 // endregion: Line Iteration
 
+// region: Literal Search
+
+/// A matched byte range, in the coordinates of the haystack it was found in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+pub struct Span {
+    pub offset: usize,
+    pub length: usize,
+}
+
+/// A literal needle in the form its search kernel wants. Case folding is decided once, and
+/// the uncased metadata is analyzed once rather than on every call.
+///
+/// Under folding a match is not the needle's length: the kernel compares folded text, so
+/// "strasse" matches "Straße" and the span is the source bytes, not the needle's. Callers
+/// that compute an offset from a match are unaffected; callers that need to know how far a
+/// match can reach ask [`Literal::max_match_len`].
+#[allow(dead_code)]
+pub struct Literal<'a> {
+    pattern: &'a [u8],
+    folded: Option<sz::Utf8UncasedNeedle<'a>>,
+}
+
+#[allow(dead_code)]
+impl<'a> Literal<'a> {
+    /// Analyze `pattern` once. `ignore_case` selects full Unicode case folding.
+    pub fn new(pattern: &'a [u8], ignore_case: bool) -> Self {
+        Self {
+            pattern,
+            folded: ignore_case.then(|| sz::Utf8UncasedNeedle::new(pattern)),
+        }
+    }
+
+    /// The leftmost match at or after the start of `data`.
+    #[inline]
+    pub fn find_in(&self, data: &[u8]) -> Option<Span> {
+        match &self.folded {
+            Some(needle) => sz::utf8_uncased_search(data, needle)
+                .map(|(offset, length)| Span { offset, length }),
+            None => sz::find(data, self.pattern).map(|offset| Span {
+                offset,
+                length: self.pattern.len(),
+            }),
+        }
+    }
+}
+
+// endregion: Literal Search
+
 // region: Streaming Windows
 
 /// Starting [`Refill`] capacity: large enough to amortize the read syscall, small enough
@@ -731,6 +780,54 @@ pub fn parse_at_least_one(value: &str) -> Result<NonZeroUsize, String> {
     NonZeroUsize::new(count).ok_or_else(|| "must be at least 1".to_string())
 }
 
+/// Parse a byte budget: bare digits count bytes, a bare letter or a `B` suffix is decimal
+/// (`K` is 1000), and an `i` is binary (`Ki` is 1024) — the distinction `ls -h` and `df -h`
+/// draw. Matching is case-insensitive, so `10mb`, `10MB` and `10Mb` agree.
+///
+/// Zero shares [`parse_at_least_one`]'s wording, since a budget of nothing is unsatisfiable
+/// for the same reason a count of nothing is. Overflow is reported rather than saturated:
+/// silently clamping `99E` to one chunk would look like it worked.
+#[allow(dead_code)]
+pub fn parse_size(value: &str) -> Result<NonZeroUsize, String> {
+    let trimmed = value.trim();
+    let digits_len = trimmed
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, unit) = trimmed.split_at(digits_len);
+
+    let unit = unit.trim();
+    let scale: usize = match unit.to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KB" => 1_000,
+        "KI" | "KIB" => 1 << 10,
+        "M" | "MB" => 1_000_000,
+        "MI" | "MIB" => 1 << 20,
+        "G" | "GB" => 1_000_000_000,
+        "GI" | "GIB" => 1 << 30,
+        "T" | "TB" => 1_000_000_000_000,
+        "TI" | "TIB" => 1 << 40,
+        // Quote what was typed rather than the folded form, so the message points at the
+        // input the reader can see.
+        _ => {
+            return Err(format!(
+                "`{}` is not a size suffix; use K, M, G, T for powers of 1000 or Ki, Mi, Gi, Ti for powers of 1024",
+                unit
+            ))
+        }
+    };
+
+    // `digits` holds only ASCII digits by construction, so a parse failure here means the
+    // count outran `usize` rather than that it was malformed — the same answer the
+    // multiply below gives, and one a reader can act on.
+    let too_large = || format!("`{}` is larger than this platform can address", trimmed);
+    let count: usize = match digits {
+        "" => return Err(format!("`{}` is not a number", trimmed)),
+        digits => digits.parse().map_err(|_| too_large())?,
+    };
+    let bytes = count.checked_mul(scale).ok_or_else(too_large)?;
+    NonZeroUsize::new(bytes).ok_or_else(|| "must be at least 1".to_string())
+}
+
 // endregion: Argument Parsing
 
 // region: Process Exit Conventions
@@ -951,6 +1048,58 @@ mod tests {
             last_cut("a\u{0085}b".as_bytes(), CutAfter::LineTerminators),
             Some(3)
         );
+    }
+
+    #[test]
+    fn finds_literal_spans_cased_and_folded() {
+        let cased = Literal::new(b"ss", false);
+        assert_eq!(
+            cased.find_in(b"aSSbss"),
+            Some(Span {
+                offset: 4,
+                length: 2
+            })
+        );
+
+        // Folded, the span covers the source bytes, so "strasse" reaches "Straße".
+        let folded = Literal::new("strasse".as_bytes(), true);
+        let found = folded.find_in("Bahnhofstraße 5".as_bytes()).unwrap();
+        assert_eq!(found.offset, 7);
+        assert_eq!(found.length, "straße".len());
+
+        // The span need not be the needle's length at all: the one-byte "k" matches the
+        // three-byte KELVIN SIGN, which is the expansion `max_match_len` has to cover.
+        let kelvin = Literal::new(b"k", true);
+        let found = kelvin.find_in("x\u{212A}y".as_bytes()).unwrap();
+        assert_eq!(found.offset, 1);
+        assert_eq!(found.length, "\u{212A}".len());
+        assert!(found.length > kelvin.pattern.len());
+    }
+
+    #[test]
+    fn reads_byte_budgets_with_decimal_and_binary_suffixes() {
+        let size = |text: &str| parse_size(text).map(NonZeroUsize::get);
+        assert_eq!(size("512"), Ok(512));
+        assert_eq!(size("10K"), Ok(10_000));
+        assert_eq!(size("10KB"), Ok(10_000));
+        assert_eq!(size("10Ki"), Ok(10_240));
+        assert_eq!(size("10KiB"), Ok(10_240));
+        // The suffix is case-insensitive, and surrounding space is ignored.
+        assert_eq!(size("10mb"), size("10MB"));
+        assert_eq!(size(" 10M "), size("10M"));
+        // A budget of nothing reads like a count of nothing.
+        assert_eq!(size("0"), Err("must be at least 1".to_string()));
+        // Unknown suffixes and overflow name the offending text rather than a Rust type.
+        assert!(size("10Q").unwrap_err().contains("`Q`"));
+        assert!(size("10 furlongs").unwrap_err().contains("furlongs"));
+        // A count too wide for `usize` is a size problem, not a syntax one, whether it
+        // outruns the type on its own or only once the suffix scales it.
+        assert!(size("99999999999999999999T")
+            .unwrap_err()
+            .contains("larger than"));
+        assert!(size("99999999999T").unwrap_err().contains("larger than"));
+        // A suffix with no count in front of it is the syntax error.
+        assert!(size("MB").unwrap_err().contains("is not a number"));
     }
 
     #[test]

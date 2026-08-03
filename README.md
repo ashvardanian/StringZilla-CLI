@@ -21,37 +21,39 @@ It provides the following subcommands:
 - [`sz-sort`](#sz-sort-sort-lines): stable sort in `LC_ALL=C` byte order, 3-4x faster than GNU `sort`
 - [`sz-rows`](#sz-rows-extract-rows): rows by index, range, stride, or tail, replacing `sed -n`, `head`, `tail`, and `awk NR==N`
 - [`sz-cols`](#sz-cols-extract-columns): columns in the order you name them — `-f 3,1`, which `cut` cannot do
-- [`sz-split`](#sz-split-split-file-into-smaller-ones): splits by line count, `--utf8` on Unicode newlines, `--json` manifest of what it wrote
+- [`sz-split`](#sz-split-split-file-into-smaller-ones): splits by lines, bytes, or a delimiter line, 5x faster than `csplit`
 - [`sz-outline`](#sz-outline-file-outliner-for-llms): experimental tool for sampling file sections for LLM contexts
 
 <details>
 <summary>In the examples below it's compared to the following tools on macOS</summary>
 
 ```bash
-$ alias bsd-grep=/usr/bin/grep              # BSD grep 2.6.0
-$ alias gnu-grep=/opt/homebrew/bin/ggrep    # GNU grep 3.12
-$ alias ripgrep=/opt/homebrew/bin/rg        # ripgrep 15.2.0
-$ alias bsd-wc=/usr/bin/wc                  # BSD wc, Apple text_cmds-199
-$ alias gnu-wc=/opt/homebrew/bin/gwc        # GNU coreutils 9.11
-$ alias uu-wc=/opt/homebrew/bin/uu-wc       # uutils coreutils 0.9.0
-$ alias bsd-sed=/usr/bin/sed                # BSD sed, Apple text_cmds-199
-$ alias gnu-sed=/opt/homebrew/bin/gsed      # GNU sed 4.10
-$ alias sd=/opt/homebrew/bin/sd             # sd 1.0.0
-$ alias bsd-cut=/usr/bin/cut                # BSD cut, Apple text_cmds-199
-$ alias gnu-cut=/opt/homebrew/bin/gcut      # GNU coreutils 9.11
-$ alias bsd-awk=/usr/bin/awk                # BSD awk, Apple awk-40
-$ alias gnu-awk=/opt/homebrew/bin/gawk      # GNU awk 5.4.1
-$ alias mawk=/opt/homebrew/bin/mawk         # mawk 1.3.4
-$ alias xsv=/opt/homebrew/bin/xsv           # xsv 0.13.0
-$ alias apple-perl=/usr/bin/perl            # Perl 5.34, Unicode 13.0
-$ alias perl=/opt/homebrew/bin/perl         # Perl 5.42.2, Unicode 16.0
-$ alias bsd-tr=/usr/bin/tr                  # BSD tr, Apple text_cmds-199
-$ alias gnu-tr=/opt/homebrew/bin/gtr        # GNU coreutils 9.11
-$ alias bsd-sort=/usr/bin/sort              # BSD sort, Apple text_cmds-199
-$ alias gnu-sort=/opt/homebrew/bin/gsort    # GNU coreutils 9.11
-$ alias uu-sort=/opt/homebrew/bin/uu-sort   # uutils coreutils 0.9.0
-$ alias bsd-split=/usr/bin/split            # BSD split, Apple text_cmds-199
-$ alias gnu-split=/opt/homebrew/bin/gsplit  # GNU coreutils 9.11
+$ alias bsd-grep=/usr/bin/grep                # BSD grep 2.6.0
+$ alias gnu-grep=/opt/homebrew/bin/ggrep      # GNU grep 3.12
+$ alias ripgrep=/opt/homebrew/bin/rg          # ripgrep 15.2.0
+$ alias bsd-wc=/usr/bin/wc                    # BSD wc, Apple text_cmds-199
+$ alias gnu-wc=/opt/homebrew/bin/gwc          # GNU coreutils 9.11
+$ alias uu-wc=/opt/homebrew/bin/uu-wc         # uutils coreutils 0.9.0
+$ alias bsd-sed=/usr/bin/sed                  # BSD sed, Apple text_cmds-199
+$ alias gnu-sed=/opt/homebrew/bin/gsed        # GNU sed 4.10
+$ alias sd=/opt/homebrew/bin/sd               # sd 1.0.0
+$ alias bsd-cut=/usr/bin/cut                  # BSD cut, Apple text_cmds-199
+$ alias gnu-cut=/opt/homebrew/bin/gcut        # GNU coreutils 9.11
+$ alias bsd-awk=/usr/bin/awk                  # BSD awk, Apple awk-40
+$ alias gnu-awk=/opt/homebrew/bin/gawk        # GNU awk 5.4.1
+$ alias mawk=/opt/homebrew/bin/mawk           # mawk 1.3.4
+$ alias xsv=/opt/homebrew/bin/xsv             # xsv 0.13.0
+$ alias apple-perl=/usr/bin/perl              # Perl 5.34, Unicode 13.0
+$ alias perl=/opt/homebrew/bin/perl           # Perl 5.42.2, Unicode 16.0
+$ alias bsd-tr=/usr/bin/tr                    # BSD tr, Apple text_cmds-199
+$ alias gnu-tr=/opt/homebrew/bin/gtr          # GNU coreutils 9.11
+$ alias bsd-sort=/usr/bin/sort                # BSD sort, Apple text_cmds-199
+$ alias gnu-sort=/opt/homebrew/bin/gsort      # GNU coreutils 9.11
+$ alias uu-sort=/opt/homebrew/bin/uu-sort     # uutils coreutils 0.9.0
+$ alias bsd-split=/usr/bin/split              # BSD split, Apple text_cmds-199
+$ alias gnu-split=/opt/homebrew/bin/gsplit    # GNU coreutils 9.11
+$ alias bsd-csplit=/usr/bin/csplit            # BSD csplit, Apple text_cmds-199
+$ alias gnu-csplit=/opt/homebrew/bin/gcsplit  # GNU coreutils 9.11
 ```
 
 </details>
@@ -384,36 +386,48 @@ Resident size is the one column that flatters the others, since `sz-dedup` maps 
 
 ## `sz-split`: Split File into Smaller Ones
 
-The `split` utility on Linux can be used to split a file into smaller ones.
-The current prototype only splits by line counts.
+A chunk can be a line count, a byte budget, a share of the whole, or a delimiter line.
+Only the first has an equivalent in `split`; the last is what `csplit` exists for.
 
 ```bash
-$ sz-split -l 100000 large.csv part.   # 100k lines per chunk (replaces: split -l)
-$ sz-split -l 100000 --utf8 large.csv  # break on the Unicode newline set, not LF alone
-$ sz-split -l 100000 --suffix-length 3 large.csv part.  # part.aaa, part.aab, ...
-$ sz-split -l 100000 --json large.csv part.  # a JSON Lines manifest of what was written
+$ sz-split --chunk-lines 100000 large.csv part.  # 100k lines per chunk (replaces: split -l)
+$ sz-split --chunk-bytes 100MB  large.csv part.  # 100 MB shards, never splitting a line
+$ sz-split --chunks 16          large.csv part.  # one chunk per core, cut at line ends
+$ sz-split --pattern '>'        seqs.fa   rec.   # a new chunk at each line starting with >
+$ sz-split --repeat-header --chunk-bytes 100MB large.csv  # every shard keeps the CSV header
+$ sz-split --chunk-lines 100000 --json large.csv part.    # a manifest of what was written
 ```
+
+A line is never split, whatever the budget: one longer than `--chunk-bytes` becomes an over-budget chunk of its own.
+A chunk is a contiguous range of the input, so LF mode copies that range whole rather than re-emitting each line:
 
 ```bash
-$ bsd-split -l 200000 xlsum.csv bsd. # 🐌 3.21 s — 6 files
-$ sz-split  -l 200000 xlsum.csv sz.  # ⚡ 1.48 s — 6 files
-$ gnu-split -l 200000 xlsum.csv gnu. # ⚡ 0.96 s — 6 files
+$ bsd-split -l 200000 xlsum.csv            bsd. # 🐌 3.11 s — 1.6 GB/s
+$ gnu-split -l 200000 xlsum.csv            gnu. # ⚡ 0.71 s — 7.1 GB/s
+$ sz-split  --chunk-lines 200000 xlsum.csv sz.  # ⚡ 0.70 s — 7.2 GB/s
 ```
 
-Splitting is the one job here whose cost is set by the shape of the input rather than its size.
-A chunk is a contiguous range of the input, so LF mode copies that range whole rather than re-emitting each line, which matters most where lines are short and numerous:
+That matters most where lines are short and numerous, and BSD `split` never finished this one:
 
 ```bash
 $ sz-segment --split-whitespaces xlsum.csv > xlsum-words.txt # 523,228,731 lines of 9.6 bytes
 
-$ gnu-split -l 35000000 xlsum-words.txt gnu. # 🐌 4.95 s — 15 files
-$ sz-split  -l 35000000 xlsum-words.txt sz.  # ⚡ 3.67 s — 15 files
+$ gnu-split -l 35000000 xlsum-words.txt            gnu. # 🐌 4.93 s — 1.0 GB/s
+$ sz-split  --chunk-lines 35000000 xlsum-words.txt sz.  # ⚡ 3.65 s — 1.4 GB/s
 ```
 
-At 5 KB per line both tools spend their time writing rather than scanning, and `split` keeps a slight edge.
-At 9.6 bytes the order reverses, because `split` re-emits half a billion lines where `sz-split` copies fifteen ranges.
-The BSD `split` macOS ships is missing from the second block because it never finished it.
-What `sz-split` adds either way is `--utf8`, which breaks on the Unicode newline set instead of LF alone — the one mode that still walks line by line, since it rewrites every terminator to LF — and `--json`, which emits a manifest of the files written.
+Splitting around a delimiter is where the gap is widest, since `csplit` runs a regex engine over every line.
+All three write byte-identical files over 600 MB of FASTA in 2,000 records:
+
+```bash
+$ bsd-csplit -f b. -n 4 seqs.fa '/^>/'               '{1998}' # 🐌 1.85 s — 0.33 GB/s
+$ gnu-csplit -z -f g. -b '%04d' seqs.fa '/^>/'       '{*}'    # 🐌 1.19 s — 0.51 GB/s
+$ sz-split   --pattern '>' --suffix-length 4 seqs.fa s.       # ⚡ 0.22 s — 2.8 GB/s
+```
+
+The pattern is literal and anchored to a line start, so a `>` inside a sequence line is not a boundary; `-i` folds case for it.
+`--chunks N` needs a file rather than a pipe, since it asks the input for its size.
+`--repeat-header` is the one flag that stops `cat <prefix>*` reproducing the input.
 
 ## `sz-outline`: File Outliner for LLMs
 
