@@ -160,7 +160,7 @@ fn write_line(
     position: usize,
 ) -> io::Result<()> {
     if config.format == Format::Json {
-        return write_line_record(output, config.path, line, position);
+        return write_line_record(output, config.path, line, position, None);
     }
     output.write_all(line)?;
     output.write_all(&[config.terminator.as_byte()])

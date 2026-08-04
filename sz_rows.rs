@@ -67,6 +67,10 @@ struct Args {
     )]
     fields: Vec<Field>,
 
+    /// How many characters of a line hash to print [default: 8]
+    #[arg(long, value_parser = parse_hash_width, help_heading = "Output Formats")]
+    hash_width: Option<usize>,
+
     /// Treat the input as UTF-8 text
     #[arg(long)]
     utf8: bool,
@@ -94,6 +98,8 @@ struct Args {
 enum Field {
     /// The 1-based line number
     LineNumbers,
+    /// A hash of the line's content, which survives edits elsewhere in the file
+    LineHashes,
 }
 
 /// How records are rendered.
@@ -116,6 +122,11 @@ fn reject(message: impl std::fmt::Display) -> clap::Error {
 fn validate(args: &Args) -> Result<(), clap::Error> {
     if args.rows.is_none() && args.tail.is_none() && args.every.is_none() {
         return Err(reject("must specify --rows, --tail, or --every"));
+    }
+    if args.hash_width.is_some() && !args.fields.contains(&Field::LineHashes) {
+        return Err(reject(
+            "--hash-width sizes a line hash, so it needs --fields line-hashes",
+        ));
     }
     if args.format == Format::Json {
         if args.fields.contains(&Field::LineNumbers) {
@@ -228,23 +239,44 @@ struct OutputConfig<'a> {
     json: bool,
     terminator: Terminator,
     show_line_numbers: bool,
+    show_line_hashes: bool,
+    hash_width: usize,
     /// Input name carried into the JSON envelope.
     path: &'a str,
 }
 
+impl OutputConfig<'_> {
+    /// The hash naming a line, when a record was asked to carry one. Taken from the whole
+    /// line rather than the bytes a row prints, so it agrees with `sz-find`.
+    #[inline]
+    fn naming(&self, line: &NamedLine) -> Option<u64> {
+        self.show_line_hashes.then(|| line.hash())
+    }
+}
+
 /// Write one extracted row. `index` is zero-based; records report it one-based.
+///
+/// `hash` names the line and its terminator together, which `write_row`'s caller has and
+/// this does not — a row is printed without whatever ended it.
 fn write_row(
     output: &mut dyn Write,
     config: &OutputConfig,
     line: &[u8],
     index: usize,
+    hash: Option<u64>,
 ) -> io::Result<()> {
+    let mut buffer = [0u8; HASH_CHARS];
+    let named = hash.map(|hash| format_hash(&mut buffer, hash, config.hash_width));
+
     if config.json {
-        return write_line_record(output, config.path, line, index);
+        return write_line_record(output, config.path, line, index, named);
     }
 
     if config.show_line_numbers {
         write!(output, "{}:", index + 1)?;
+    }
+    if let Some(named) = named {
+        write!(output, "{named}:")?;
     }
     output.write_all(line)?;
     output.write_all(&[config.terminator.as_byte()])
@@ -344,14 +376,15 @@ fn extract_forward(
     state: &mut RowsState,
     output: &mut dyn Write,
 ) -> io::Result<ControlFlow<()>> {
-    for line in LineIter::new(data, newlines) {
+    for named in named_lines(data, newlines) {
+        let line = named.line;
         if selector.exhausted(state) {
             return Ok(ControlFlow::Break(()));
         }
         let index = state.next_index;
         state.next_index += 1;
         if selector.takes(index, state) {
-            write_row(output, config, line, index)?;
+            write_row(output, config, line, index, config.naming(&named))?;
             state.emitted += 1;
         }
     }
@@ -389,8 +422,15 @@ fn extract_data(
                 } else {
                     0
                 };
-                for (index_in_span, line) in LineIter::new(&data[start..], newlines).enumerate() {
-                    write_row(output, config, line, first_index + index_in_span)?;
+                for (index_in_span, named) in named_lines(&data[start..], newlines).enumerate() {
+                    let line = named.line;
+                    write_row(
+                        output,
+                        config,
+                        line,
+                        first_index + index_in_span,
+                        config.naming(&named),
+                    )?;
                     state.emitted += 1;
                 }
                 debug_assert_eq!(
@@ -404,16 +444,16 @@ fn extract_data(
             // from a forward walk into a ring — O(N) memory, not O(file).
             Newlines::Unicode => {
                 let wanted = wanted.get();
-                let mut ring: VecDeque<(usize, &[u8])> =
+                let mut ring: VecDeque<(usize, NamedLine)> =
                     VecDeque::with_capacity(wanted.min(TAIL_RING_RESERVE));
-                for (index, line) in LineIter::new(data, newlines).enumerate() {
+                for (index, named) in named_lines(data, newlines).enumerate() {
                     if ring.len() == wanted {
                         ring.pop_front();
                     }
-                    ring.push_back((index, line));
+                    ring.push_back((index, named));
                 }
-                for (index, line) in ring {
-                    write_row(output, config, line, index)?;
+                for (index, named) in ring {
+                    write_row(output, config, named.line, index, config.naming(&named))?;
                     state.emitted += 1;
                 }
             }
@@ -437,8 +477,9 @@ struct TailRing {
     wanted: NonZeroUsize,
     /// Absolute zero-based index of the oldest retained line.
     first_index: usize,
-    /// The retained lines, oldest first.
-    lines: VecDeque<Vec<u8>>,
+    /// The retained lines, oldest first, each with the hash naming it. The hash is kept
+    /// rather than the terminator it covers, since bounding memory is what the ring is for.
+    lines: VecDeque<(Vec<u8>, Option<u64>)>,
 }
 
 impl TailRing {
@@ -452,22 +493,24 @@ impl TailRing {
     }
 
     /// Retain `line`, evicting the oldest when the ring is full and reusing its buffer.
-    fn push(&mut self, line: &[u8]) {
+    fn push(&mut self, line: &[u8], hash: Option<u64>) {
         let mut buffer = if self.lines.len() == self.wanted.get() {
             self.first_index += 1;
-            self.lines.pop_front().unwrap_or_default()
+            self.lines
+                .pop_front()
+                .map_or_else(Vec::new, |(buffer, _)| buffer)
         } else {
             Vec::new()
         };
         buffer.clear();
         buffer.extend_from_slice(line);
-        self.lines.push_back(buffer);
+        self.lines.push_back((buffer, hash));
     }
 
     /// Write the retained lines in arrival order, numbered absolutely.
     fn write_to(&self, config: &OutputConfig, output: &mut dyn Write) -> io::Result<usize> {
-        for (offset, line) in self.lines.iter().enumerate() {
-            write_row(output, config, line, self.first_index + offset)?;
+        for (offset, (line, hash)) in self.lines.iter().enumerate() {
+            write_row(output, config, line, self.first_index + offset, *hash)?;
         }
         Ok(self.lines.len())
     }
@@ -501,8 +544,8 @@ fn extract_tail_stream<R: Read>(
 ) -> io::Result<usize> {
     let mut ring = TailRing::new(wanted);
     refill.for_each_window(newlines.into(), |window| {
-        for line in LineIter::new(window, newlines) {
-            ring.push(line);
+        for named in named_lines(window, newlines) {
+            ring.push(named.line, config.naming(&named));
         }
         Ok(())
     })?;
@@ -547,6 +590,8 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         json: args.format == Format::Json,
         terminator: Terminator::from_null(args.null),
         show_line_numbers: args.fields.contains(&Field::LineNumbers),
+        show_line_hashes: args.fields.contains(&Field::LineHashes),
+        hash_width: args.hash_width.unwrap_or(DEFAULT_HASH_WIDTH),
         path: name,
     };
 
@@ -588,6 +633,8 @@ mod tests {
             json: false,
             terminator: Terminator::Newline,
             show_line_numbers: false,
+            show_line_hashes: false,
+            hash_width: DEFAULT_HASH_WIDTH,
             path: "-",
         }
     }
@@ -725,7 +772,16 @@ mod tests {
         assert_eq!(
             longs,
             [
-                "rows", "tail", "every", "fields", "utf8", "format", "null", "quiet", "help",
+                "rows",
+                "tail",
+                "every",
+                "fields",
+                "hash-width",
+                "utf8",
+                "format",
+                "null",
+                "quiet",
+                "help",
                 "version",
             ]
         );
@@ -1149,7 +1205,7 @@ mod tests {
         refill
             .for_each_window(CutAfter::LineFeed, |window| {
                 for line in LineIter::new(window, Newlines::Lf) {
-                    ring.push(line);
+                    ring.push(line, None);
                 }
                 Ok(())
             })
@@ -1158,7 +1214,7 @@ mod tests {
         // Three retained lines out of ten thousand, however many windows they spanned.
         assert_eq!(ring.lines.len(), 3);
         assert_eq!(ring.first_index, 9_997);
-        let retained: usize = ring.lines.iter().map(|line| line.capacity()).sum();
+        let retained: usize = ring.lines.iter().map(|(line, _)| line.capacity()).sum();
         assert!(retained < 128, "ring held {} bytes", retained);
     }
 

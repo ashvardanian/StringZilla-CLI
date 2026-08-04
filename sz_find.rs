@@ -100,6 +100,10 @@ struct Args {
     )]
     fields: Vec<Field>,
 
+    /// How many characters of a line hash to print [default: 8]
+    #[arg(long, value_parser = parse_hash_width, help_heading = "Output Formats")]
+    hash_width: Option<usize>,
+
     /// Match the pattern anywhere or only as a whole word
     #[arg(
         long = "match",
@@ -212,6 +216,10 @@ enum Field {
     ColumnNumbers,
     /// The line's byte offset from the start of the input
     ByteOffsets,
+    /// A hash of the line's content, which survives edits elsewhere in the file
+    LineHashes,
+    /// A hash of the whole file, as `sz-replace --expect-hash` compares against
+    FileHash,
 }
 
 /// Which record kind the run emits.
@@ -293,20 +301,53 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
         }
     }
 
+    // Sizing a hash that is never printed is inert for every value of the flag.
+    if args.hash_width.is_some() && !args.fields.contains(&Field::LineHashes) {
+        return Err(reject(
+            "--hash-width sizes a line hash, so it needs --fields line-hashes".to_string(),
+        ));
+    }
+
+    // A multiline match crosses lines, so no single line holds a column to point at, and
+    // every record would report column one.
+    if args.multiline && args.fields.contains(&Field::ColumnNumbers) {
+        return Err(reject(
+            "--multiline matches across lines, so --fields column-numbers has no column \
+             to resolve"
+                .to_string(),
+        ));
+    }
+
+    // A whole-file hash has nowhere to go in a stream of per-line records: it would have to
+    // repeat on every one. The two shapes that name a file once are the place for it.
+    if args.fields.contains(&Field::FileHash) && !(args.format == Format::Json || args.heading) {
+        return Err(reject(
+            "--fields file-hash names a whole file, so it needs --format json or --heading"
+                .to_string(),
+        ));
+    }
+
     // `--color auto` is the default, so any other value is an explicit request.
     let colored = !matches!(args.color, ColorChoice::Auto);
     let carried: Vec<(bool, &str)> = match args.format {
         // JSON escapes nothing, names its file in every record and reproduces whole lines.
-        // JSON names its file in every record and reproduces whole lines, and it emits the
-        // position of each unasked, so naming one is inert.
+        // It also emits `line_number` and `absolute_offset` on every record, so naming those
+        // is inert — the two hashes are not, since neither is emitted unasked.
         Format::Json => vec![
             (args.null, "--null"),
             (args.heading, "--heading"),
             (colored, "--color"),
             (args.max_line_length.is_some(), "--max-line-length"),
-            (!args.fields.is_empty(), "--fields"),
+            (
+                args.fields.iter().any(|field| {
+                    matches!(
+                        field,
+                        Field::LineNumbers | Field::ColumnNumbers | Field::ByteOffsets
+                    )
+                }),
+                "--fields",
+            ),
         ],
-        // Vimgrep names its file, line and column in every record.
         // Vimgrep names its file, line and column in every record, and a fifth column would
         // be a different format wearing its name.
         Format::Vimgrep => vec![
@@ -361,6 +402,7 @@ struct Colors {
     line_number: &'static str,
     column: &'static str,
     byte_offset: &'static str,
+    hash: &'static str,
     match_highlight: &'static str,
     reset: &'static str,
     separator: &'static str,
@@ -373,6 +415,7 @@ impl Colors {
             line_number: "\x1b[32m",       // Green
             column: "\x1b[32m",            // Green (same as line number)
             byte_offset: "\x1b[36m",       // Cyan
+            hash: "\x1b[33m",              // Yellow
             match_highlight: "\x1b[1;31m", // Bold red
             reset: "\x1b[0m",
             separator: "\x1b[36m", // Cyan
@@ -385,6 +428,7 @@ impl Colors {
             line_number: "",
             column: "",
             byte_offset: "",
+            hash: "",
             match_highlight: "",
             reset: "",
             separator: "",
@@ -411,6 +455,10 @@ struct OutputConfig {
     line_numbers: bool,
     column_numbers: bool,
     byte_offsets: bool,
+    line_hashes: bool,
+    file_hash: bool,
+    /// How many characters of a line hash are printed.
+    hash_width: usize,
     only_matches: bool,
     max_line_length: Option<usize>,
     /// Whether columns and `--max-line-length` are counted in characters rather than bytes.
@@ -425,6 +473,16 @@ struct OutputConfig {
 }
 
 impl OutputConfig {
+    /// Whether a record carries a prefix that has to be resolved per line, which is what
+    /// makes `--multiline` print its region line by line rather than as one slice.
+    ///
+    /// Columns are absent because a multiline region holds none to resolve, which
+    /// `validate` refuses outright rather than printing column one for every line.
+    #[inline]
+    fn annotates_lines(&self) -> bool {
+        self.line_numbers || self.byte_offsets || self.line_hashes
+    }
+
     /// Collapse the output flags into the form every emitter reads. `is_terminal` answers
     /// what `--color auto` asks of the destination, which only `main` can see.
     fn new(args: &Args, show: Show, multiple_inputs: bool, is_terminal: bool) -> Self {
@@ -458,6 +516,9 @@ impl OutputConfig {
             line_numbers: carries(Field::LineNumbers) || output_format == OutputFormat::Vimgrep,
             column_numbers: carries(Field::ColumnNumbers) || output_format == OutputFormat::Vimgrep,
             byte_offsets: carries(Field::ByteOffsets),
+            line_hashes: carries(Field::LineHashes),
+            file_hash: carries(Field::FileHash),
+            hash_width: args.hash_width.unwrap_or(DEFAULT_HASH_WIDTH),
             only_matches,
             max_line_length: args.max_line_length.map(NonZeroUsize::get),
             character_units: uses_unicode(args.utf8, args.ignore_case),
@@ -809,6 +870,8 @@ struct FileResult {
 struct ContextLine {
     line_number: usize,
     span: Range<usize>,
+    /// Where the line's terminator ends, so a held line can still be named.
+    whole_end: usize,
 }
 
 /// The look-behind ring, pending after-context and group separator that the context
@@ -858,6 +921,9 @@ struct FindState {
     /// `--byte-offsets` and the JSON and vimgrep formats absolute across a streamed run.
     window_base: usize,
     printed_heading: bool,
+    /// The whole file's hash, when `--fields file-hash` asked for one. Set where the file
+    /// is opened, since the heading is written long before the last window is read.
+    file_hash: Option<u64>,
     /// Grown on the first highlighted line and reused for every later one.
     highlight_buffer: Vec<u8>,
     context: ContextState,
@@ -871,6 +937,7 @@ impl FindState {
             lines_searched: 0,
             window_base: 0,
             printed_heading: false,
+            file_hash: None,
             highlight_buffer: Vec::new(),
             context: ContextState::new(lines),
         }
@@ -907,6 +974,9 @@ fn search_data(
         return search_multiline(data, name, search, path, output, max_reached);
     }
     let mut state = FindState::new(path.context());
+    if path.config().is_some_and(|config| config.file_hash) {
+        state.file_hash = Some(content_hash(data));
+    }
     // One window spans the whole input, so there is nothing left to stop for.
     let _ = search_window(data, name, search, path, &mut state, output, max_reached)?;
     print_json_end(output, name, path, &state)?;
@@ -950,6 +1020,8 @@ fn tally_window(
     state: &mut FindState,
     max_reached: &mut bool,
 ) -> ControlFlow<()> {
+    // Counting reads nothing a line's terminator could tell it, so it takes the cheaper
+    // iterator: `named_lines` looks one line ahead to find where each one ends.
     for line in LineIter::new(window, search.newlines) {
         // Counted before the limit is tested, so `--summary` includes the line that trips the cap.
         state.lines_searched += 1;
@@ -983,8 +1055,10 @@ fn print_window(
         name,
         search,
         config,
+        file_hash: state.file_hash,
     };
-    for line in LineIter::new(window, search.newlines) {
+    for named in named_lines(window, search.newlines) {
+        let line = named.line;
         // Counted before the limit is tested, so `--summary` includes the line that trips the cap.
         state.lines_searched += 1;
         if state.exhausted(search) {
@@ -999,10 +1073,9 @@ fn print_window(
 
         let record = LineRecord {
             line,
+            whole: named.whole,
             line_number: state.lines_searched,
-            // Taken from the slice itself. Accumulating `line.len() + 1` assumes a
-            // one-byte terminator and is wrong by one per CR, two per LS or PS.
-            byte_offset: state.window_base + offset_within(window, line),
+            byte_offset: state.window_base + named.offset,
             is_match: true,
         };
         emitter.file_heading(&mut state.printed_heading)?;
@@ -1027,8 +1100,10 @@ fn print_context_window(
         name,
         search,
         config,
+        file_hash: state.file_hash,
     };
-    for line in LineIter::new(window, search.newlines) {
+    for named in named_lines(window, search.newlines) {
+        let line = named.line;
         // Counted before the limit is tested, so `--summary` includes the line that trips the cap.
         state.lines_searched += 1;
         if state.exhausted(search) {
@@ -1037,9 +1112,7 @@ fn print_context_window(
         }
 
         let line_number = state.lines_searched;
-        // Taken from the slice itself. Accumulating `line.len() + 1` assumes a
-        // one-byte terminator and is wrong by one per CR, two per LS or PS.
-        let line_start = offset_within(window, line);
+        let line_start = named.offset;
         let byte_offset = state.window_base + line_start;
 
         if search.selects(line) {
@@ -1067,6 +1140,7 @@ fn print_context_window(
                 if state.context.is_unprinted(buffered.line_number) {
                     emitter.line(LineRecord {
                         line: &window[buffered.span.start..buffered.span.end],
+                        whole: &window[buffered.span.start..buffered.whole_end],
                         line_number: buffered.line_number,
                         byte_offset: state.window_base + buffered.span.start,
                         is_match: false,
@@ -1078,6 +1152,7 @@ fn print_context_window(
             emitter.match_line(
                 LineRecord {
                     line,
+                    whole: named.whole,
                     line_number,
                     byte_offset,
                     is_match: true,
@@ -1089,6 +1164,7 @@ fn print_context_window(
         } else if state.context.pending_after > 0 {
             emitter.line(LineRecord {
                 line,
+                whole: named.whole,
                 line_number,
                 byte_offset,
                 is_match: false,
@@ -1105,6 +1181,7 @@ fn print_context_window(
             state.context.behind.push_back(ContextLine {
                 line_number,
                 span: line_start..line_start + line.len(),
+                whole_end: line_start + named.whole.len(),
             });
         }
     }
@@ -1162,6 +1239,8 @@ fn search_multiline(
         name,
         search,
         config,
+        // Taken here rather than from the state below, which this path builds afterwards.
+        file_hash: config.file_hash.then(|| content_hash(data)),
     });
 
     // Each region carries its own surrounding lines, so this path keeps no look-behind
@@ -1247,16 +1326,16 @@ fn search_multiline(
             }
 
             let region = &data[actual_start..region_end];
-            if emitter.config.line_numbers
-                || emitter.config.byte_offsets
+            if emitter.config.annotates_lines()
                 || emitter.config.output_format != OutputFormat::Standard
             {
                 let line_number = line_numbers.line_at(data, actual_start);
-                for (index, line) in LineIter::new(region, Newlines::Lf).enumerate() {
+                for (index, named) in named_lines(region, Newlines::Lf).enumerate() {
                     emitter.line(LineRecord {
-                        line,
+                        line: named.line,
+                        whole: named.whole,
                         line_number: line_number + index,
-                        byte_offset: actual_start + offset_within(region, line),
+                        byte_offset: actual_start + named.offset,
                         is_match: true,
                     })?;
                 }
@@ -1288,6 +1367,8 @@ fn search_multiline(
 /// the window, so those two keep every byte. `--after-context` alone only reaches forward.
 fn can_stream(search: &Search, path: &SearchPath) -> bool {
     !search.multiline
+        // A file's hash covers bytes the heading is written long before a stream reaches.
+        && !path.config().is_some_and(|config| config.file_hash)
         && match path {
             SearchPath::Tally { .. } | SearchPath::Print(_) => true,
             SearchPath::PrintContext(_, context) => context.before == 0,
@@ -1332,6 +1413,9 @@ fn search_stream<R: Read>(
 #[derive(Clone, Copy)]
 struct LineRecord<'a> {
     line: &'a [u8],
+    /// The line and its terminator, which is what names it. Distinct from `line`, which is
+    /// what the record prints and matches against.
+    whole: &'a [u8],
     line_number: usize,
     byte_offset: usize,
     /// False for a surrounding context line, which prints `-` where a match prints `:`.
@@ -1345,6 +1429,8 @@ struct Emitter<'a, 'p> {
     name: &'a str,
     search: &'a Search<'p>,
     config: &'a OutputConfig,
+    /// The whole file's hash, printed once beside its name rather than on every record.
+    file_hash: Option<u64>,
 }
 
 impl Emitter<'_, '_> {
@@ -1353,20 +1439,35 @@ impl Emitter<'_, '_> {
         if *printed {
             return Ok(());
         }
-        let (name, config) = (self.name, self.config);
+        let (name, config, file_hash) = (self.name, self.config, self.file_hash);
         match config.output_format {
             OutputFormat::Heading => {
-                writeln!(
+                write!(
                     self.output,
                     "{}{}{}",
                     config.colors.name, name, config.colors.reset
                 )?;
+                // Beside the name, which is the only place a whole-file value belongs in a
+                // stream of per-line records.
+                if let Some(hash) = file_hash {
+                    // Two spaces rather than `:`, which would read as a `file:line` prefix,
+                    // and outside the colour span as every other column's separator is.
+                    write!(
+                        self.output,
+                        "  {}{hash:016x}{}",
+                        config.colors.hash, config.colors.reset
+                    )?;
+                }
+                self.output.write_all(b"\n")?;
                 *printed = true;
             }
             OutputFormat::Json => {
                 self.output
                     .write_all(br#"{"type":"begin","data":{"path":"#)?;
                 json_text_field_to(self.output, name.as_bytes())?;
+                if let Some(hash) = file_hash {
+                    write!(self.output, r#","file_hash":"{hash:016x}""#)?;
+                }
                 self.output.write_all(b"}}\n")?;
                 *printed = true;
             }
@@ -1480,6 +1581,21 @@ impl Emitter<'_, '_> {
                         colors.byte_offset, record.byte_offset, colors.reset, separator
                     )?;
                 }
+                // Last of the prefix, because it names the line rather than locating it, and
+                // because leaving the positional columns contiguous keeps `cut -d:` working.
+                if config.line_hashes {
+                    let mut buffer = [0u8; HASH_CHARS];
+                    write!(
+                        self.output,
+                        "{}{}{}{}",
+                        colors.hash,
+                        // The line as it was read, never `body`: that may carry highlight
+                        // codes or be trimmed, and neither is what the name refers to.
+                        format_hash(&mut buffer, content_hash(record.whole), config.hash_width),
+                        colors.reset,
+                        separator
+                    )?;
+                }
                 self.write_content(record, body)?;
                 self.output.write_all(&[config.terminator])
             }
@@ -1498,10 +1614,11 @@ impl Emitter<'_, '_> {
             json_text_field_to(self.output, record.line)?;
             write!(
                 self.output,
-                r#","line_number":{},"absolute_offset":{}}}}}"#,
+                r#","line_number":{},"absolute_offset":{}"#,
                 record.line_number, record.byte_offset
             )?;
-            self.output.write_all(b"\n")
+            self.json_line_hash(record.whole)?;
+            self.output.write_all(b"}}\n")
         } else if !config.locates_matches {
             // An inverted match holds no position, so it carries no submatches.
             self.output
@@ -1511,9 +1628,11 @@ impl Emitter<'_, '_> {
             json_text_field_to(self.output, record.line)?;
             write!(
                 self.output,
-                r#","line_number":{},"absolute_offset":{},"submatches":[]}}}}"#,
+                r#","line_number":{},"absolute_offset":{}"#,
                 record.line_number, record.byte_offset
             )?;
+            self.json_line_hash(record.whole)?;
+            self.output.write_all(br#","submatches":[]}}"#)?;
             self.output.write_all(b"\n")
         } else {
             self.output
@@ -1523,9 +1642,11 @@ impl Emitter<'_, '_> {
             json_text_field_to(self.output, record.line)?;
             write!(
                 self.output,
-                r#","line_number":{},"absolute_offset":{},"submatches":["#,
+                r#","line_number":{},"absolute_offset":{}"#,
                 record.line_number, record.byte_offset
             )?;
+            self.json_line_hash(record.whole)?;
+            self.output.write_all(br#","submatches":["#)?;
 
             for (index, found) in search.matcher.matches(record.line).enumerate() {
                 if index > 0 {
@@ -1543,6 +1664,22 @@ impl Emitter<'_, '_> {
 
             self.output.write_all(b"]}}\n")
         }
+    }
+
+    /// Write the `"line_hash"` field every JSON record carries.
+    ///
+    /// Unconditional, as `line_number` and `absolute_offset` already are: a machine schema
+    /// that changes shape with a flag makes every consumer handle both.
+    fn json_line_hash(&mut self, line: &[u8]) -> io::Result<()> {
+        if !self.config.line_hashes {
+            return Ok(());
+        }
+        let mut buffer = [0u8; HASH_CHARS];
+        write!(
+            self.output,
+            r#","line_hash":"{}""#,
+            format_hash(&mut buffer, content_hash(line), self.config.hash_width)
+        )
     }
 
     /// Write a line's content, reduced to the matches themselves under `--show matches`.
@@ -2088,6 +2225,9 @@ mod tests {
             line_numbers: false,
             column_numbers: false,
             byte_offsets: false,
+            line_hashes: false,
+            file_hash: false,
+            hash_width: DEFAULT_HASH_WIDTH,
             only_matches: false,
             max_line_length: None,
             character_units: false,
@@ -2202,6 +2342,7 @@ mod tests {
                 "show",
                 "format",
                 "fields",
+                "hash-width",
                 "match",
                 "ignore-case",
                 "before-context",
@@ -2262,8 +2403,7 @@ mod tests {
             vec!["--quiet", "--format", "json"],
             vec!["--quiet", "--null"],
             vec!["--quiet", "--fields", "line-numbers"],
-            vec!["--quiet", "--fields", "column-numbers"],
-            vec!["--quiet", "--fields", "byte-offsets"],
+            vec!["--quiet", "--fields", "line-hashes"],
             vec!["--quiet", "--heading"],
             vec!["--quiet", "--color", "always"],
             vec!["--quiet", "--max-line-length", "10"],
@@ -2274,9 +2414,12 @@ mod tests {
             vec!["--format", "json", "--heading"],
             vec!["--format", "json", "--color", "always"],
             vec!["--format", "json", "--max-line-length", "10"],
+            // JSON emits the position of every record unasked, so naming it is inert.
+            vec!["--format", "json", "--fields", "line-numbers"],
+            vec!["--format", "json", "--fields", "byte-offsets"],
             vec!["--format", "vimgrep", "--heading"],
             vec!["--format", "vimgrep", "--fields", "line-numbers"],
-            vec!["--format", "vimgrep", "--fields", "byte-offsets"],
+            vec!["--format", "vimgrep", "--fields", "line-hashes"],
             vec!["--format", "vimgrep", "--color", "always"],
             vec!["--show", "count", "--fields", "line-numbers"],
             vec!["--show", "count", "--heading"],
@@ -2294,6 +2437,21 @@ mod tests {
         assert!(accepts(&["--show", "count", "--null"]));
         assert!(accepts(&["--show", "count", "--format", "json"]));
         assert!(accepts(&["--quiet", "--summary", "--max-matches", "2"]));
+        // A whole-file hash is the one field JSON does not already emit, so it is the one
+        // `--fields` value that form accepts.
+        assert!(accepts(&["--format", "json", "--fields", "file-hash"]));
+        // Neither hash is emitted unasked, so both are meaningful under JSON.
+        assert!(accepts(&["--format", "json", "--fields", "line-hashes"]));
+        assert!(accepts(&[
+            "--format",
+            "json",
+            "--fields",
+            "line-hashes,file-hash"
+        ]));
+        assert!(accepts(&["--heading", "--fields", "file-hash"]));
+        // Plain text and vimgrep have nowhere to put it but every record.
+        assert!(!accepts(&["--fields", "file-hash"]));
+        assert!(!accepts(&["--format", "vimgrep", "--fields", "file-hash"]));
 
         assert!(validate(&Args::try_parse_from(["sz-find", ""]).unwrap()).is_err());
         // Zero is a whole-run no-op rather than a limit.
@@ -3026,6 +3184,7 @@ mod tests {
         config.line_numbers = true;
         config.byte_offsets = true;
         config.column_numbers = true;
+        config.line_hashes = true;
         let path = SearchPath::Print(config);
         let search = make_search(b"error");
 
@@ -3035,11 +3194,18 @@ mod tests {
             assert_eq!(streamed, expected, "capacity {}", capacity);
         }
         // The last line starts well past any of the tiny windows, so a window-relative
-        // offset would report it near zero.
+        // offset would report it near zero — and the hash is the same either way, since it
+        // names the line's content rather than where the reader happened to be.
         let text = String::from_utf8(expected).unwrap();
         let last = text.lines().last().unwrap();
         let offset = SEAM_CORPUS.len() - b"zeta error last".len();
-        assert_eq!(last, format!("8:6:{}:zeta error last", offset));
+        let mut buffer = [0u8; HASH_CHARS];
+        let name = format_hash(
+            &mut buffer,
+            content_hash(b"zeta error last"),
+            DEFAULT_HASH_WIDTH,
+        );
+        assert_eq!(last, format!("8:6:{offset}:{name}:zeta error last"));
     }
 
     #[test]
@@ -3154,6 +3320,272 @@ mod tests {
         assert_eq!(result.match_count, 1);
         assert!(max_reached);
         assert_eq!(output, b"error one\n");
+    }
+
+    /// Test helper: the hashes a run printed, in order, given one column of them.
+    ///
+    /// Split on both separators, since a context line ends its columns with `-` where a
+    /// matching line ends them with `:`.
+    fn printed_hashes(output: &[u8], column: usize) -> Vec<String> {
+        String::from_utf8(output.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split([':', '-']).nth(column).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn names_a_line_the_same_under_both_newline_sets() {
+        // `gamma error two` ends in CRLF. A name covers the line's terminator, and a line
+        // spans to the start of the next one in either newline set, so both readings name
+        // the same bytes — with no special case anywhere.
+        let mut config = make_config();
+        config.line_hashes = true;
+        let path = SearchPath::Print(config);
+
+        let mut lf = make_search(b"error");
+        lf.newlines = Newlines::Lf;
+        let mut unicode = make_search(b"error");
+        unicode.newlines = Newlines::Unicode;
+
+        let (under_lf, ..) = search_whole(SEAM_CORPUS, &lf, &path);
+        let (under_unicode, ..) = search_whole(SEAM_CORPUS, &unicode, &path);
+
+        let expected = {
+            let mut buffer = [0u8; HASH_CHARS];
+            format_hash(
+                &mut buffer,
+                content_hash(b"gamma error two\r\n"),
+                DEFAULT_HASH_WIDTH,
+            )
+            .to_string()
+        };
+        for (mode, output) in [("lf", under_lf), ("unicode", under_unicode)] {
+            let named: Vec<_> = printed_hashes(&output, 0);
+            assert!(
+                named.contains(&expected),
+                "under {mode} the CRLF line was named {named:?}, not {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn prints_the_names_the_library_derives() {
+        // The producing half of the handshake. What this binary prints is all that
+        // `sz-replace --match line-hash` and `--expect-hash` have to go on, and neither can
+        // observe the other's arithmetic, so each side is pinned against `shared` instead.
+        let mut config = make_config();
+        config.output_format = OutputFormat::Json;
+        config.line_hashes = true;
+        config.file_hash = true;
+        let corpus = b"alpha\nbeta error\ngamma\n";
+
+        let (output, ..) = search_whole(corpus, &make_search(b"error"), &SearchPath::Print(config));
+        let text = String::from_utf8(output).unwrap();
+
+        let mut buffer = [0u8; HASH_CHARS];
+        // A line's name covers its terminator, so this is the whole line, not its text.
+        let name = format_hash(
+            &mut buffer,
+            content_hash(b"beta error\n"),
+            DEFAULT_HASH_WIDTH,
+        );
+        assert!(text.contains(&format!(r#""line_hash":"{name}""#)), "{text}");
+        assert!(
+            text.contains(&format!(r#""file_hash":"{:016x}""#, content_hash(corpus))),
+            "{text}"
+        );
+        // And both are in the form the consuming side parses.
+        assert!(parse_hash_prefix(name).is_ok());
+        assert!(parse_content_hash(&format!("{:016x}", content_hash(corpus))).is_ok());
+    }
+
+    #[test]
+    fn names_the_same_line_identically_wherever_it_sits() {
+        // Content-derived, not position-derived: the two identical lines share a name and the
+        // one between them does not, whatever their line numbers are.
+        let mut config = make_config();
+        config.line_hashes = true;
+        let path = SearchPath::Print(config);
+        let search = make_search(b"error");
+
+        let corpus = b"dup error\nother error\ndup error\n";
+        let (output, ..) = search_whole(corpus, &search, &path);
+        let named = printed_hashes(&output, 0);
+
+        assert_eq!(named.len(), 3);
+        assert_eq!(named[0], named[2]);
+        assert_ne!(named[0], named[1]);
+    }
+
+    #[test]
+    fn names_an_empty_line_and_a_context_line() {
+        // Both are lines an agent may want to address, so neither may be skipped: an empty
+        // line is nameable, and a context record carries a name as a match record does.
+        let mut config = make_config();
+        config.line_hashes = true;
+        let path = SearchPath::PrintContext(
+            config,
+            Context {
+                before: 1,
+                after: 0,
+            },
+        );
+        let search = make_search(b"beta");
+
+        let (output, ..) = search_whole(b"alpha\n\nbeta error\n", &search, &path);
+        let named = printed_hashes(&output, 0);
+
+        assert_eq!(named.len(), 2, "a context line and its match");
+        let mut buffer = [0u8; HASH_CHARS];
+        assert_eq!(
+            named[0],
+            format_hash(&mut buffer, content_hash(b"\n"), DEFAULT_HASH_WIDTH)
+        );
+    }
+
+    #[test]
+    fn names_the_line_rather_than_what_it_prints() {
+        // The name refers to the bytes in the file, so trimming, highlighting or reducing the
+        // record to its matches must not move it — the same rule the column already obeys.
+        let search = make_search(b"error");
+        let corpus = b"alpha error one\n";
+
+        let mut plain = make_config();
+        plain.line_hashes = true;
+        let (expected, ..) = search_whole(corpus, &search, &SearchPath::Print(plain));
+        let expected = printed_hashes(&expected, 0);
+
+        let mut colored = plain;
+        colored.colors = Colors::enabled();
+        colored.highlight = true;
+        let mut trimmed = plain;
+        trimmed.max_line_length = Some(4);
+        let mut reduced = plain;
+        reduced.only_matches = true;
+
+        for (label, config) in [
+            ("colored", colored),
+            ("trimmed", trimmed),
+            ("reduced", reduced),
+        ] {
+            let (output, ..) = search_whole(corpus, &search, &SearchPath::Print(config));
+            let text = String::from_utf8(output).unwrap();
+            assert!(
+                text.contains(&expected[0]),
+                "{label} named the line {text:?}, not {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn carries_a_line_hash_in_every_json_record_kind() {
+        // A consumer reads one schema, not one per record type, so a `--context` run must not
+        // hand it records that sometimes carry the field and sometimes do not.
+        let mut config = make_config();
+        config.output_format = OutputFormat::Json;
+        config.line_hashes = true;
+        let search = make_search(b"beta");
+
+        let path = SearchPath::PrintContext(
+            config,
+            Context {
+                before: 1,
+                after: 1,
+            },
+        );
+        let (output, ..) = search_whole(b"alpha\nbeta error\ngamma\n", &search, &path);
+        let text = String::from_utf8(output).unwrap();
+
+        for kind in [r#""type":"match""#, r#""type":"context""#] {
+            let carried = text
+                .lines()
+                .filter(|line| line.contains(kind))
+                .all(|line| line.contains(r#""line_hash":""#));
+            assert!(carried, "a {kind} record carried no line_hash:\n{text}");
+        }
+
+        // And the inverted form, whose records carry no submatches to hide behind.
+        let mut inverted = make_search(b"beta");
+        inverted.invert_match = true;
+        let mut config = make_config();
+        config.output_format = OutputFormat::Json;
+        config.line_hashes = true;
+        config.locates_matches = false;
+        let (output, ..) = search_whole(b"alpha\nbeta\n", &inverted, &SearchPath::Print(config));
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains(r#""line_hash":""#), "{text}");
+        assert!(text.contains(r#""submatches":[]"#), "{text}");
+    }
+
+    #[test]
+    fn never_streams_a_run_that_names_the_whole_file() {
+        // The heading is written on the first match, long before a stream reaches the bytes
+        // the file's hash covers, so the pipe is held instead.
+        let mut config = make_config();
+        config.output_format = OutputFormat::Json;
+        config.file_hash = true;
+        assert!(!can_stream(
+            &make_search(b"error"),
+            &SearchPath::Print(config)
+        ));
+    }
+
+    #[test]
+    fn names_the_whole_file_once_beside_its_name() {
+        let search = make_search(b"error");
+        let corpus = b"alpha error one\nbeta error two\n";
+        let expected = format!("{:016x}", content_hash(corpus));
+
+        let mut json = make_config();
+        json.output_format = OutputFormat::Json;
+        json.file_hash = true;
+        let (output, ..) = search_whole(corpus, &search, &SearchPath::Print(json));
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(
+            text.matches(&format!(r#""file_hash":"{expected}""#))
+                .count(),
+            1,
+            "the file's hash belongs on the one record that names the file:\n{text}"
+        );
+
+        let mut heading = make_config();
+        heading.output_format = OutputFormat::Heading;
+        heading.file_hash = true;
+        let (output, ..) = search_whole(corpus, &search, &SearchPath::Print(heading));
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text.matches(&expected).count(), 1, "{text}");
+        // The token it prints is the one `sz-replace --expect-hash` accepts.
+        assert!(parse_content_hash(&expected).is_ok());
+    }
+
+    #[test]
+    fn annotates_every_line_of_a_multiline_region() {
+        // Asking only for hashes still has to divide the region into lines; the condition
+        // that decides used to list the other two columns by hand and would print a raw blob.
+        let mut config = make_config();
+        config.line_hashes = true;
+        let mut search = make_search(b"beta\ngamma");
+        search.multiline = true;
+
+        let (output, ..) = search_whole(
+            b"alpha\nbeta\ngamma\ndelta\n",
+            &search,
+            &SearchPath::Print(config),
+        );
+        let text = String::from_utf8(output).unwrap();
+
+        let mut buffer = [0u8; HASH_CHARS];
+        for line in [&b"beta\n"[..], &b"gamma\n"[..]] {
+            let name = format_hash(&mut buffer, content_hash(line), DEFAULT_HASH_WIDTH);
+            assert!(
+                text.contains(&format!(
+                    "{name}:{}",
+                    String::from_utf8_lossy(line).trim_end()
+                )),
+                "the region printed without naming its lines:\n{text}"
+            );
+        }
     }
 }
 

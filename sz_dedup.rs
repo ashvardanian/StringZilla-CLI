@@ -301,7 +301,7 @@ fn write_line(
     index: usize,
 ) -> io::Result<()> {
     match config.rendering {
-        Rendering::Json => write_line_record(output, config.path, line, index),
+        Rendering::Json => write_line_record(output, config.path, line, index, None),
         Rendering::Verbatim => output.write_all(span),
         Rendering::Terminated(terminator) => {
             output.write_all(line)?;

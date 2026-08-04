@@ -59,7 +59,9 @@ $ alias gnu-csplit=/opt/homebrew/bin/gcsplit  # GNU coreutils 9.11
 
 </details>
 
-## `sz-find`: Unicode Aware Substring Search
+## Tools
+
+### `sz-find`: Unicode Aware Substring Search
 
 A `grep`-like tool using literal substring matching (not regex) for maximum speed.
 Unlike `grep` and `ripgrep`, `sz-find` performs __full Unicode-compliant case folding__ for case-insensitive search, correctly handling all 1M+ defined characters.
@@ -74,7 +76,7 @@ $ sz-find --multiline $'hello\nworld' file.txt                 # match across li
 $ sz-find --utf8 "pattern" file.txt                            # break lines on the Unicode newline set
 ```
 
-`--show` picks which records a run emits; `--fields` picks which columns each of them carries, comma-separated: `line-numbers`, `column-numbers`, `byte-offsets`.
+`--show` picks which records a run emits; `--fields` picks which columns each of them carries, comma-separated: `line-numbers`, `column-numbers`, `byte-offsets`, `line-hashes`, `file-hash`.
 
 Beyond the flags above, `sz-find` also covers most of the `grep`/`ripgrep` surface: whole-word matching (`--match word`), inverted matches (`--invert-match`), only-matching output (`--show matches`), recursive directory walking with `.gitignore` awareness, type/glob filters (`--type`, `--glob`), and `--format json`/`--format vimgrep` output.
 
@@ -104,7 +106,7 @@ GNU grep folds the dotless "ı" into "i", sweeping in "atışı", "tartışıld�
 Its extra results are the wrong ones twice over.
 The difference matters for legal documents, German/Swiss news, Turkish text, or any content mixing scripts.
 
-## `sz-count`: Word Count
+### `sz-count`: Word Count
 
 The `wc` utility on Linux counts lines, words, and bytes.
 A word is a maximal run of non-whitespace, exactly as in `wc -w`; `sz-count` uses the same rule, so it is a drop-in replacement rather than a different measurement.
@@ -157,7 +159,7 @@ $ sz-count --format json xlsum.csv           # JSON Lines, bare integers, untrun
 
 The table truncates long paths and groups digits for humans; `--format json` does neither, so a pipeline or a model gets the path and the number intact.
 
-## `sz-replace`: Substring Replacement
+### `sz-replace`: Substring Replacement
 
 A literal-match alternative to `sed 's/old/new/g'`, with __full Unicode case folding__ on `--ignore-case`.
 Reads from a file or stdin and writes to stdout, a file, or back in-place.
@@ -167,7 +169,13 @@ $ sz-replace "old" "new" file.txt                      # to stdout (replaces: se
 $ sz-replace --in-place "old" "new" file.txt           # rewrite the file (replaces: sed -i)
 $ sz-replace --ignore-case "strasse" "street" file.txt # also rewrites "Straße"
 $ sz-replace --dry-run "old" "new" file.txt            # count what would change, without writing
+$ sz-replace --occurrences first "old" "new" file.txt  # the leftmost match in the file alone
+$ sz-replace --occurrences one "old" "new" file.txt    # exactly one, or exit 3 and change nothing
 ```
+
+`--occurrences all` is the default and is what the tool has always done.
+Note `first` means the first match in the *file*, where `sed 's/old/new/'` means the first on every *line*.
+`one` turns "I expect this to be unique" from an assumption into an assertion, which is what makes it safe to hand a pattern to something that cannot look at the file first.
 
 Substituting one literal for another over the same 5 GB, every tool below writes byte-identical output:
 
@@ -182,7 +190,9 @@ $ sz-replace error fault                  < xlsum.csv # ⚡  0.36 s — 13.8 GB/
 
 Given "strasse", `sz-replace --ignore-case` rewrites "Bahnhofstraße", where `gnu-sed -I`, `sd` and `ripgrep -i` all leave it untouched.
 
-## `sz-cols`: Extract Columns
+`--match line-hash` reads the pattern as a line name rather than a substring, and `--expect-hash` refuses an edit built on a stale read — see [Workflows](#workflows).
+
+### `sz-cols`: Extract Columns
 
 The `cut` utility and `awk '{print $N}'` are commonly used to extract columns from delimited text.
 `sz-cols` provides a simpler, more intuitive syntax with SIMD-accelerated delimiter scanning.
@@ -226,7 +236,7 @@ Output matches `mawk` byte for byte, and costs nothing over the single-field row
 Splitting on a byte is not the same as parsing CSV, though.
 Most fields in this corpus are quoted and contain commas, so `xsv`, which honours the quoting, disagrees with every other row above on roughly four lines in five.
 
-## `sz-rows`: Extract Rows
+### `sz-rows`: Extract Rows
 
 The `sed -n 'Np'`, `head -n N`, `tail -n N`, and `awk 'NR==N'` commands are commonly used to extract specific lines.
 `sz-rows` unifies all these use cases with a single, intuitive interface.
@@ -258,7 +268,7 @@ The margin over `mawk` is thin; the outlier is GNU `sed`, five times slower here
 
 `--tail` is the exception: like `tail -n`, it seeks from the end rather than scanning, so both return in a millisecond regardless of file size.
 
-## `sz-segment-utf8`: Unicode Text Segmentation
+### `sz-segment-utf8`: Unicode Text Segmentation
 
 Splitting text into words or sentences the way Unicode defines them is something no standard command-line tool does, and the one that attempts characters gets the Indic scripts wrong.
 Coreutils has nothing, ICU ships `genbrk` and `uconv` but neither segments text, and the NLP libraries that do are abbreviation heuristics rather than the standard.
@@ -318,7 +328,7 @@ UAX-29 sentences are the standard applied deterministically, with no dictionary:
 Both match ICU exactly: over a 2 MB multilingual sample its break iterators return the same 9,260,355 graphemes and 81,510 sentences.
 Both are also places `punkt` or `pysbd` read more naturally — the trade is spec-correct segmentation across every script, not better English.
 
-## `sz-sort`: Sort Lines
+### `sz-sort`: Sort Lines
 
 A stable, Unicode-correct `sort` built on StringZilla's `argsort`.
 Comparison is unsigned byte-wise, which for valid UTF-8 is exactly Unicode code-point order, so `--utf8` only governs newline handling and output is byte-identical to `LC_ALL=C sort`.
@@ -354,7 +364,7 @@ Both alternatives are pinned to one thread; left to itself `uu-sort` spreads ove
 Resident sizes are not comparable as printed, since `sz-sort` maps the input where the others stream.
 Its index is the smallest of the three per line, but unbounded: GNU caps its buffer and spills to temporary files, which is most of why it trails.
 
-## `sz-dedup`: Deduplicate Lines
+### `sz-dedup`: Deduplicate Lines
 
 Drop repeated lines, keeping the first of each, __without sorting__.
 `uniq` collapses only adjacent duplicates and so needs sorted input, and `sort -u` gets there by discarding the original order; the idiom that actually preserves order is `awk '!seen[$0]++'`.
@@ -384,7 +394,7 @@ Resident size flatters the others: it maps its input, where `awk` and `perl` str
 
 `uniq` is absent because on unsorted input it returns almost every line.
 
-## `sz-split`: Split File into Smaller Ones
+### `sz-split`: Split File into Smaller Ones
 
 A chunk can be a line count, a byte budget, a share of the whole, or a delimiter line.
 Only the first has an equivalent in `split`; the last is what `csplit` exists for.
@@ -429,7 +439,7 @@ The pattern is literal and anchored to a line start, so a `>` inside a sequence 
 `--chunk-count N` needs a file rather than a pipe, since it asks the input for its size.
 `--repeat-header` is the one flag that stops `cat <prefix>*` reproducing the input.
 
-## `sz-outline`: File Outliner for LLMs
+### `sz-outline`: File Outliner for LLMs
 
 > [!WARNING]
 > This one is being reimplemented and is excluded from the default build.
@@ -500,7 +510,7 @@ Every bracketed detail starts in one column, sized to the longest name the run p
 
 Function signatures are normalized (whitespace collapsed) and categorized as declarations (`;`) or definitions (`{}`).
 
-## `sz-fuzzy-find`: Fuzzy Substring Search
+### `sz-fuzzy-find`: Fuzzy Substring Search
 
 > [!WARNING]
 > This one is being reimplemented and is excluded from the default build.
@@ -539,7 +549,7 @@ Over 50 MB of multilingual news, one query, 225 matching lines:
 
 `fzf` is there for scale rather than parity: it matches characters in order with gaps, so it finds `W-a-s-h-i-n-g-t-o-n` and misses `Washigton`.
 
-### Scoring models (`--cost`)
+#### Scoring models (`--cost`)
 
 Beyond uniform edit distance, scoring can reflect _how_ characters get confused.
 These route through Smith-Waterman with a `byte_to_class[256]` + `class_substitution_costs[32][32]` matrix, and use a normalized `--min-similarity` (0..1, where 1.0 is exact) instead of `--max-distance`:
@@ -557,7 +567,7 @@ $ sz-fuzzy-find --cost-matrix my_costs.txt --min-similarity 0.8 needle file.txt
 
 The keyboard matrix uses staggered-QWERTY Euclidean key distance; the phonetic matrix is seeded by voiced/unvoiced cognates (`b/p`, `d/t`, …) and Editex letter groups. Smith-Waterman fuzzy matching folds ASCII case (the 32-class budget leaves no room to distinguish case per letter).
 
-### Execution device (`--device`)
+#### Execution device (`--device`)
 
 ```bash
 $ sz-fuzzy-find --device cpu --threads 8 --max-distance 1 needle big.txt # CPU, 8 threads
@@ -570,3 +580,103 @@ Every core is used unless `--threads` says otherwise. The GPU path requires a CU
 # On systems with gcc > 14 + CUDA 12.x, point nvcc at a supported host compiler:
 $ CUDAHOSTCXX=g++-14 cargo install --git https://github.com/ashvardanian/StringZilla-CLI --features cuda
 ```
+
+## Workflows
+
+### Multi-Pass Agentic File Editing
+
+A program that reads a file, decides what to change, and writes it back some time later has no way to know the file is still what it read — a formatter on save, a second process, or a person in an editor invalidates the plan and the edit lands anyway.
+Line numbers have the same problem one level down: change line 10 and every number below it moves, so a plan made before the first edit is wrong by the second.
+
+Two names solve the two halves, and both come out of the same read.
+Everything below runs against one small file:
+
+```bash
+$ printf 'static int parse(state_t *s) {\n    // TODO: handle EOF\n    return 0;\n}\n' > parser.c
+```
+
+__One read names the file and every line it prints.__
+The file's name is a token for the whole content; a line's name is derived from its own bytes, so it survives edits elsewhere where a number would shift:
+
+```bash
+$ sz-find --heading --fields line-numbers,line-hashes,file-hash TODO parser.c
+parser.c  54cb6b8cbdf213ac
+2:5npdz5bs:    // TODO: handle EOF
+```
+
+Or, for a program reading the output, one record per file and one per line:
+
+```bash
+$ sz-find --fields line-hashes,file-hash --format json TODO parser.c
+{"type":"begin","data":{"path":{"text":"parser.c"},"file_hash":"54cb6b8cbdf213ac"}}
+{"type":"match","data":{"path":{"text":"parser.c"},"lines":{"text":"    // TODO: handle EOF"},"line_number":2,"absolute_offset":31,"line_hash":"5npdz5bs","submatches":[{"match":{"text":"TODO"},"start":7,"end":11}]}}
+{"type":"end","data":{"path":{"text":"parser.c"},"stats":{"matches":1,"lines_searched":4}}}
+```
+
+__The edit names both.__
+`--expect-hash` is the file token; the pattern is the line name; `--occurrences one` asserts the name picks out exactly one line:
+
+```bash
+$ sz-replace --in-place --expect-hash 54cb6b8cbdf213ac \
+             --match line-hash --occurrences one 5npdz5bs '    if (at_eof(s)) return 1;' \
+             --format json parser.c
+{"type":"summary","data":{"path":{"text":"parser.c"},"replacements":1,"dry_run":false,"hash_before":"54cb6b8cbdf213ac","hash_after":"af697883fe502ac7"}}
+```
+
+__The token it hands back is the one the next edit passes__, so a run of edits costs one read rather than one per edit:
+
+```bash
+$ sz-find --fields line-hashes at_eof parser.c
+fdffa87e:    if (at_eof(s)) return 1;
+
+$ sz-replace --in-place --expect-hash af697883fe502ac7 \
+             --match line-hash --after fdffa87e '    flush(s);' --format json parser.c
+{"type":"summary","data":{"path":{"text":"parser.c"},"replacements":1,"dry_run":false,"hash_before":"af697883fe502ac7","hash_after":"d50af765dc7423d5"}}
+```
+
+__Both names refuse rather than guess.__
+A spent file token means the file moved; a name that picks out nothing means the line did.
+Either way the file is untouched and the exit code says to look again:
+
+```bash
+$ sz-replace --in-place --expect-hash 54cb6b8cbdf213ac --match line-hash 5npdz5bs x parser.c
+sz-replace: parser.c: content is d50af765dc7423d5, not the expected 54cb6b8cbdf213ac; re-read it before editing
+$ echo $?
+3
+
+$ sz-replace --in-place --match line-hash 5npdz5bs x parser.c
+sz-replace: parser.c: `5npdz5bs` names no line here; re-read the file
+$ echo $?
+3
+```
+
+Exit code 3 is distinct from 1 (ran, found nothing) and 2 (could not run), because the recovery differs: look at the file again, rather than fix the arguments.
+
+The loop, for a program driving it:
+
+1. `sz-find --fields line-hashes,file-hash --format json <pattern> <file>` — read `file_hash` off the `begin` record and `line_hash` off each `match`.
+2. `sz-replace --in-place --expect-hash <file_hash> --match line-hash --occurrences one <line_hash> <new text> --format json <file>`.
+3. Take `hash_after` from the summary record and pass it as the next `--expect-hash`. Repeat from 2.
+4. On exit 3, go back to 1. Nothing was written.
+
+Both names refuse rather than guess, and they cover different things.
+The line name guards the line being edited and costs nothing, because a line that has changed no longer answers to its name.
+`--expect-hash` guards everything else in the file — a line inserted above yours, or a second copy of your line appearing and making the name ambiguous.
+
+A name identifies content rather than position, so identical lines share one, and `--occurrences` decides what happens to the set exactly as it does for a substring.
+Every candidate is found before a byte is written, so __a name too short to be unique can only ever cause a refused edit, never an edit to the wrong line__ — which is what makes the default eight characters safe.
+`--hash-width` goes up to 13 for the whole 64 bits, and because rendering truncates rather than folds, a short name is always a prefix of the long one.
+
+A name covers the line's terminator as well as its text.
+That is what makes it mean the same thing whether a file is read as LF or CRLF, and it is why every line operation falls out of one replacement argument:
+
+```bash
+$ sz-replace --match line-hash 5npdz5bs '    return 1;' parser.c   # rewrite
+$ sz-replace --match line-hash 5npdz5bs '' parser.c                # delete
+$ sz-replace --match line-hash 5npdz5bs $'\n' parser.c             # blank, keeping the line
+```
+
+The cost of covering the terminator is that adding a final newline renames the last line of a file.
+
+The hash is StringZilla's 64-bit AES hash under seed zero, identical across platforms.
+It answers "did this file change", not "did somebody change it" — it is fast, not cryptographic.

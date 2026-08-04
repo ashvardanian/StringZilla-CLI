@@ -533,7 +533,7 @@ pub fn stdout_writer() -> BufWriter<io::StdoutLock<'static>> {
 // region: Line Iteration
 
 /// Which newline set [`LineIter`] splits on.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Newlines {
     /// Byte-level: only LF (`\n`).
     Lf,
@@ -604,6 +604,103 @@ fn drop_trailing_empty<'a, I: Iterator<Item = &'a [u8]>>(
         return None;
     }
     Some(line)
+}
+
+/// A line, with the split a rewrite needs.
+///
+/// `whole` is exactly the bytes that name it — the line and its terminator together. That
+/// the terminator is *included* is what makes a name mean the same thing under either
+/// newline set: a span runs to the start of the next line, so a CRLF line spans `\r\n` in
+/// both, where a body-only view would see `text\r` under [`Newlines::Lf`] and `text` under
+/// [`Newlines::Unicode`].
+///
+/// [`NamedLine::body`] and [`NamedLine::terminator`] split `whole` where a rewrite replaces
+/// it, which is a different question: the terminator is copied, never reconstructed, so a
+/// CRLF file stays CRLF and a file with no final newline keeps having none.
+///
+/// The newline sets still disagree about where lines *begin* for VT, FF, NEL, LS and PS,
+/// which no naming scheme can reconcile.
+#[derive(Clone, Copy, Debug)]
+pub struct NamedLine<'a> {
+    /// Where the line starts in the input.
+    pub offset: usize,
+    /// The line and its terminator: the bytes [`NamedLine::name`] hashes.
+    pub whole: &'a [u8],
+    /// The line as [`LineIter`] yields it, which under [`Newlines::Lf`] keeps the carriage
+    /// return of a CRLF pair — what a search matches against and what `grep` prints.
+    pub line: &'a [u8],
+    /// How much of `whole` precedes the terminator.
+    body_len: usize,
+}
+
+impl<'a> NamedLine<'a> {
+    /// The line's text, without whatever ends it.
+    #[inline]
+    pub fn body(&self) -> &'a [u8] {
+        &self.whole[..self.body_len]
+    }
+
+    /// What ends the line: nothing at the end of a file that lacks a final newline.
+    #[inline]
+    pub fn terminator(&self) -> &'a [u8] {
+        &self.whole[self.body_len..]
+    }
+
+    /// Where the line ends, terminator included.
+    #[inline]
+    pub fn end(&self) -> usize {
+        self.offset + self.whole.len()
+    }
+
+    /// The hash naming this line, which [`format_hash`] renders into the token a caller
+    /// passes back. The cost of covering the terminator is that adding a final newline
+    /// renames a file's last line, which is the one place the two byte strings differ.
+    #[inline]
+    pub fn hash(&self) -> u64 {
+        content_hash(self.whole)
+    }
+}
+
+/// Iterate the lines of `data`, each carrying its terminator.
+pub fn named_lines(data: &[u8], newlines: Newlines) -> NamedLines<'_> {
+    let mut lines = LineIter::new(data, newlines);
+    let pending = lines.next();
+    NamedLines {
+        data,
+        lines,
+        pending,
+    }
+}
+
+pub struct NamedLines<'a> {
+    data: &'a [u8],
+    lines: LineIter<'a>,
+    pending: Option<&'a [u8]>,
+}
+
+impl<'a> Iterator for NamedLines<'a> {
+    type Item = NamedLine<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<NamedLine<'a>> {
+        let line = self.pending.take()?;
+        let offset = offset_within(self.data, line);
+        self.pending = self.lines.next();
+        let end = match self.pending {
+            Some(next) => offset_within(self.data, next),
+            None => self.data.len(),
+        };
+        // `Newlines::Lf` leaves the carriage return of a CRLF line on the line and the
+        // Unicode set takes it off, so the body is trimmed to agree with both. The name is
+        // unaffected either way, since it covers the terminator too.
+        let body_len = line.len() - usize::from(line.ends_with(b"\r"));
+        Some(NamedLine {
+            offset,
+            whole: &self.data[offset..end],
+            line,
+            body_len,
+        })
+    }
 }
 
 /// A byte range, in the coordinates of the buffer it was found in.
@@ -1012,12 +1109,18 @@ pub fn write_line_record(
     path: &str,
     line: &[u8],
     index: usize,
+    hash: Option<&str>,
 ) -> io::Result<()> {
     output.write_all(br#"{"type":"line","data":{"path":"#)?;
     json_text_field_to(output, path.as_bytes())?;
     output.write_all(br#","text":"#)?;
     json_text_field_to(output, line)?;
-    write!(output, r#","line_number":{}}}}}"#, index + 1)?;
+    write!(output, r#","line_number":{}"#, index + 1)?;
+    // Named the same as `sz-find`'s column, since it is the same value read back the same way.
+    if let Some(hash) = hash {
+        write!(output, r#","line_hash":"{hash}""#)?;
+    }
+    output.write_all(b"}}")?;
     output.write_all(b"\n")
 }
 
@@ -1082,6 +1185,188 @@ pub fn format_grouped_number(buffer: &mut [u8; 26], value: usize) -> &str {
 }
 
 // endregion: Machine-Readable Output
+
+// region: Content Hashing
+
+/// How many characters render a whole 64-bit hash in [`format_hash`]. Twelve carry five bits
+/// each and the leading one carries the remaining four, which covers a `u64` exactly.
+pub const HASH_CHARS: usize = 13;
+
+/// The shortest prefix a caller may name a line by. Four characters is twenty bits, which
+/// stays comfortable within one file; shorter is a typo rather than an abbreviation.
+pub const HASH_CHARS_MIN: usize = 4;
+
+/// Crockford's base32: the digits and the lowercase letters, less `i`, `l`, `o` and `u`,
+/// which are the four a reader confuses with `1`, `1`, `0` and `v`. Alphanumeric, so a hash
+/// never needs shell quoting and never opens with a `-` that reads as a flag.
+const HASH_ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// How many characters of a line hash print unless `--hash-width` says otherwise. Eight is
+/// forty bits, comfortable within one file, and two tokens of an LLM's context per line.
+pub const DEFAULT_HASH_WIDTH: usize = 8;
+
+/// Accept a hash width the renderer can actually produce, and that is long enough to be an
+/// abbreviation rather than a typo.
+pub fn parse_hash_width(value: &str) -> Result<usize, String> {
+    let width: usize = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number"))?;
+    if !(HASH_CHARS_MIN..=HASH_CHARS).contains(&width) {
+        return Err(format!(
+            "hash width must be between {HASH_CHARS_MIN} and {HASH_CHARS}"
+        ));
+    }
+    Ok(width)
+}
+
+/// Hash the bytes a run read or wrote, as `--expect-hash` compares against.
+///
+/// StringZilla's 64-bit AES hash under seed zero, whose header promises "the same output on
+/// all platforms in both single-shot and incremental modes" — which is what lets a token
+/// written on one machine mean the same thing on another, and what lets [`HashingWriter`]
+/// accumulate one over a stream rather than buffering it. It is not cryptographic: it
+/// answers "did this file change", not "did somebody change it".
+pub fn content_hash(data: &[u8]) -> u64 {
+    sz::hash(data)
+}
+
+/// Render the leading `width` characters of `hash`, most significant first.
+///
+/// Truncation rather than folding, so a short name is always a prefix of the long one and
+/// `sz-find --hash-width 4` agrees with the first four characters of `--hash-width 13`.
+pub fn format_hash(buffer: &mut [u8; HASH_CHARS], hash: u64, width: usize) -> &str {
+    let width = width.clamp(1, HASH_CHARS);
+    for (index, slot) in buffer.iter_mut().enumerate() {
+        let shift = 5 * (HASH_CHARS - 1 - index);
+        *slot = HASH_ALPHABET[((hash >> shift) & 0x1F) as usize];
+    }
+    // Only alphabet bytes were written.
+    core::str::from_utf8(&buffer[..width]).expect("the alphabet is ASCII")
+}
+
+/// The bits a line name constrains: a hash renders through [`format_hash`] beginning with
+/// this name exactly when `hash & mask == value`.
+///
+/// Because rendering truncates rather than folds, a name of `n` characters pins the leading
+/// `5n - 1` bits, so matching is one AND and one compare per line — no line is ever
+/// rendered to be compared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HashPrefix {
+    value: u64,
+    mask: u64,
+}
+
+impl HashPrefix {
+    #[inline]
+    pub fn matches(&self, hash: u64) -> bool {
+        hash & self.mask == self.value
+    }
+}
+
+/// Parse a line name, as `sz-find --fields line-hashes` prints one.
+pub fn parse_hash_prefix(name: &str) -> Result<HashPrefix, String> {
+    if !(HASH_CHARS_MIN..=HASH_CHARS).contains(&name.len()) {
+        // Sixteen hex digits is the whole-file token, which callers do reach for by mistake.
+        let hint = if name.len() == 16 {
+            ", which is the length of a whole-file hash"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "`{name}` is {} characters{hint}; a line name is {HASH_CHARS_MIN} to {HASH_CHARS}",
+            name.len()
+        ));
+    }
+
+    let mut value = 0u64;
+    for (index, byte) in name.bytes().enumerate() {
+        let lowered = byte.to_ascii_lowercase();
+        let Some(digit) = HASH_ALPHABET.iter().position(|entry| *entry == lowered) else {
+            return Err(format!(
+                "`{name}` is not a line name: `{}` is not in the alphabet, which drops \
+                 i, l, o and u to keep names legible",
+                byte as char
+            ));
+        };
+        // The leading character carries only the hash's top four bits, so half the alphabet
+        // can never appear there and a name that opens with one names nothing.
+        if index == 0 && digit > 0xF {
+            return Err(format!(
+                "no line name begins with `{}`: the first character carries four bits, \
+                 so it is always one of 0-9 or a-f",
+                byte as char
+            ));
+        }
+        value |= (digit as u64) << (5 * (HASH_CHARS - 1 - index));
+    }
+
+    let unpinned = 5 * (HASH_CHARS - name.len());
+    let mask = if unpinned >= u64::BITS as usize {
+        0
+    } else {
+        !0u64 << unpinned
+    };
+    Ok(HashPrefix {
+        value: value & mask,
+        mask,
+    })
+}
+
+/// Parse a whole-file token: exactly sixteen hex digits, in either case, as `{:016x}` writes
+/// them. A short or long token is refused rather than zero-extended, so a truncated paste
+/// fails loudly instead of matching some other file.
+pub fn parse_content_hash(value: &str) -> Result<u64, String> {
+    if value.len() != 16 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "`{value}` is not a content hash; expected 16 hex digits, as --summary prints"
+        ));
+    }
+    u64::from_str_radix(value, 16).map_err(|error| error.to_string())
+}
+
+/// A writer that hashes every byte on its way through, so a stream can be checksummed
+/// without a second pass over it or a buffer holding the whole result.
+pub struct HashingWriter<'a> {
+    inner: &'a mut dyn Write,
+    state: sz::Hasher,
+}
+
+impl<'a> HashingWriter<'a> {
+    pub fn new(inner: &'a mut dyn Write) -> Self {
+        HashingWriter {
+            inner,
+            state: sz::Hasher::new(0),
+        }
+    }
+
+    /// The hash of everything written so far, equal to [`content_hash`] of those bytes.
+    pub fn digest(&self) -> u64 {
+        self.state.digest()
+    }
+}
+
+impl Write for HashingWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(data)?;
+        self.state.update(&data[..written]);
+        Ok(written)
+    }
+
+    /// Overridden rather than inherited: every caller here writes whole slices, and the
+    /// default implementation would chunk the hash updates through partial-write bookkeeping
+    /// that never happens.
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.inner.write_all(data)?;
+        self.state.update(data);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+// endregion: Content Hashing
 
 // region: Argument Parsing
 
@@ -1199,6 +1484,12 @@ pub enum Status {
     Error = 2,    // Did not run to completion
 }
 
+/// What a refused precondition reports, distinct from [`Status::NoResult`] (ran, found
+/// nothing) and [`Status::Error`] (could not run). A caller reads it as "look again", not
+/// as "fix your arguments", and those are different recoveries. Not a [`Status`], because a
+/// run that declined produced nothing and so is only ever reached from an `Err`.
+pub const REFUSED_EXIT_CODE: u8 = 3;
+
 impl Status {
     /// Map a "found something" flag to the success/no-result pair.
     #[inline]
@@ -1220,6 +1511,30 @@ pub enum Failure {
     Io { path: String, source: io::Error },
     /// A usage error, already rendered by clap so it matches a parse failure exactly.
     Usage(clap::Error),
+    /// A precondition naming a file's contents that no longer holds: the file changed
+    /// between the read that produced the caller's hash and this run.
+    Stale {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// A name that had to pick out one thing and picked out several. Reported rather than
+    /// resolved, because choosing among candidates is what the caller came to decide.
+    Ambiguous {
+        path: String,
+        subject: String,
+        matches: usize,
+        /// How this caller suggests narrowing it. Supplied by the binary, since the flag
+        /// that widens the selection differs between them.
+        note: &'static str,
+    },
+    /// A name that picked out nothing. Distinct from [`Failure::Ambiguous`] because the
+    /// recoveries differ: one narrows the name, the other re-reads the file.
+    Unresolved {
+        path: String,
+        subject: String,
+        note: &'static str,
+    },
 }
 
 impl From<clap::Error> for Failure {
@@ -1241,6 +1556,31 @@ impl std::fmt::Display for Failure {
         match self {
             Failure::Io { path, source } => write!(formatter, "{path}: {source}"),
             Failure::Usage(error) => write!(formatter, "{error}"),
+            // Both hashes are printed because the recovery is to compare them against what
+            // the caller still holds, and neither alone says which read went out of date.
+            Failure::Stale {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{path}: content is {actual:016x}, not the expected {expected:016x}; \
+                 re-read it before editing"
+            ),
+            Failure::Ambiguous {
+                path,
+                subject,
+                matches,
+                note,
+            } => write!(
+                formatter,
+                "{path}: `{subject}` matches {matches} places, not one; {note}"
+            ),
+            Failure::Unresolved {
+                path,
+                subject,
+                note,
+            } => write!(formatter, "{path}: `{subject}` {note}"),
         }
     }
 }
@@ -1279,7 +1619,19 @@ pub fn report(tool: &str, outcome: Result<Status, Failure>) -> process::ExitCode
             let _ = error.print();
             process::ExitCode::from(error.exit_code() as u8)
         }
-        Err(failure) => {
+        // A refused precondition ran correctly and declined, so it reports neither "found
+        // nothing" nor "could not run".
+        Err(
+            failure @ (Failure::Stale { .. }
+            | Failure::Ambiguous { .. }
+            | Failure::Unresolved { .. }),
+        ) => {
+            eprintln!("{tool}: {failure}");
+            process::ExitCode::from(REFUSED_EXIT_CODE)
+        }
+        // Named rather than caught, so a new variant is a compile error instead of a
+        // silent exit 2.
+        Err(failure @ Failure::Io { .. }) => {
             eprintln!("{tool}: {failure}");
             process::ExitCode::from(Status::Error as u8)
         }
@@ -1409,6 +1761,22 @@ mod tests {
         assert_eq!(fs::metadata(&first).unwrap().ino(), before);
         assert_eq!(fs::read(&second).unwrap(), b"a\nb\n");
     }
+    #[test]
+    fn leaves_the_input_untouched_when_the_rewrite_fails() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("lines.txt");
+        fs::write(&path, b"original\n").unwrap();
+
+        let failed: Result<(), Failure> =
+            write_replacing("sz-test", path.to_str().unwrap(), |output| {
+                output.write_all(b"partial\n")?;
+                Err(io::Error::other("interrupted"))
+            });
+
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original\n");
+    }
+
     #[test]
     fn creates_an_output_file_through_a_temporary() {
         let directory = tempfile::TempDir::new().unwrap();
@@ -1576,29 +1944,327 @@ mod tests {
     }
 
     #[test]
-    fn leaves_the_input_untouched_when_the_rewrite_fails() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let path = directory.path().join("lines.txt");
-        fs::write(&path, b"original\n").unwrap();
+    fn reports_a_refused_precondition_as_its_own_code() {
+        // `report`'s catch-all would swallow a missing arm and quietly exit 2, which the
+        // compiler cannot object to, so the distinction is only ever as real as this test.
+        let code = |outcome| format!("{:?}", report("sz-test", outcome));
 
-        let failed: Result<(), Failure> =
-            write_replacing("sz-test", path.to_str().unwrap(), |output| {
-                output.write_all(b"partial\n")?;
-                Err(io::Error::other("interrupted"))
-            });
+        let stale = Failure::Stale {
+            path: "notes.md".into(),
+            expected: 0x91bc_0d2f_5a7e_3c11,
+            actual: 0x3f2a_1c88_de10_b4e7,
+        };
+        let ambiguous = Failure::Ambiguous {
+            path: "notes.md".into(),
+            subject: "k3f9m2qx".into(),
+            matches: 3,
+            note: "lengthen the name",
+        };
+        let unresolved = Failure::Unresolved {
+            path: "notes.md".into(),
+            subject: "k3f9m2qx".into(),
+            note: "re-read the file",
+        };
+        let expected = format!("{:?}", process::ExitCode::from(REFUSED_EXIT_CODE));
 
-        assert!(failed.is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"original\n");
+        assert_eq!(code(Err(stale)), expected);
+        assert_eq!(code(Err(ambiguous)), expected);
+        assert_eq!(code(Err(unresolved)), expected);
+        // And the codes it must stay distinct from.
+        assert_ne!(code(Ok(Status::NoResult)), expected);
+        assert_ne!(
+            code(Err(Failure::Io {
+                path: "notes.md".into(),
+                source: io::Error::other("broken"),
+            })),
+            expected
+        );
+    }
+
+    #[test]
+    fn names_both_hashes_when_a_precondition_is_refused() {
+        // The message is the agent's recovery instruction, so it has to carry what it held
+        // and what is there now, at the width `--expect-hash` accepts.
+        let message = Failure::Stale {
+            path: "notes.md".into(),
+            expected: 0x91bc_0d2f_5a7e_3c11,
+            actual: 0x3f2a_1c88_de10_b4e7,
+        }
+        .to_string();
+
+        assert!(message.contains("notes.md"), "{message}");
+        assert!(message.contains("91bc0d2f5a7e3c11"), "{message}");
+        assert!(message.contains("3f2a1c88de10b4e7"), "{message}");
+        assert!(parse_content_hash("3f2a1c88de10b4e7").is_ok());
+    }
+
+    #[test]
+    fn splits_every_line_where_its_name_was_taken() {
+        // The invariant the whole rewrite path rests on: `body` is what was hashed, and
+        // `body + tail` concatenated reproduces the input, so a rewrite copies terminators
+        // rather than reconstructing them.
+        for input in [
+            &b"alpha\nbeta\ngamma\n"[..],
+            &b"alpha\r\nbeta\r\n"[..],
+            &b"alpha\nbeta"[..],
+            &b"\n\n\n"[..],
+            &b""[..],
+            "α\nβ\u{2028}γ\n".as_bytes(),
+        ] {
+            for newlines in [Newlines::Lf, Newlines::Unicode] {
+                let mut rebuilt = Vec::new();
+                for line in named_lines(input, newlines) {
+                    assert_eq!(
+                        line.body().len() + line.terminator().len(),
+                        line.whole.len()
+                    );
+                    assert_eq!(line.hash(), content_hash(line.whole));
+                    rebuilt.extend_from_slice(line.whole);
+                }
+                assert_eq!(rebuilt, input, "{input:?} under {newlines:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn splits_a_crlf_line_the_same_under_both_newline_sets() {
+        // `Newlines::Lf` leaves the carriage return on the line and the Unicode set takes it
+        // off, so without the trim the two modes would disagree about which bytes are named
+        // — and a name issued by one tool would not resolve in another.
+        let input = b"alpha\r\nbeta\r\n";
+        let cut = |newlines| {
+            named_lines(input, newlines)
+                .map(|line| {
+                    (
+                        line.body().to_vec(),
+                        line.terminator().to_vec(),
+                        line.hash(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cut(Newlines::Lf), cut(Newlines::Unicode));
+        let first = &cut(Newlines::Lf)[0];
+        assert_eq!(
+            (first.0.as_slice(), first.1.as_slice()),
+            (&b"alpha"[..], &b"\r\n"[..])
+        );
+    }
+
+    #[test]
+    fn leaves_a_final_line_without_a_terminator_without_one() {
+        let lines: Vec<_> = named_lines(b"alpha\nbeta", Newlines::Lf).collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].terminator().is_empty());
+        assert_eq!(lines[1].end(), 10);
+        // The one cost of naming the terminator too: adding a final newline renames the
+        // last line, because those genuinely are different bytes.
+        let terminated: Vec<_> = named_lines(b"alpha\nbeta\n", Newlines::Lf).collect();
+        assert_ne!(lines[1].hash(), terminated[1].hash());
+    }
+
+    #[test]
+    fn matches_a_name_against_the_hash_it_renders_from() {
+        // The mask arithmetic has to agree with the renderer at every width, or a name
+        // printed by one tool resolves to nothing in another.
+        let mut buffer = [0u8; HASH_CHARS];
+        for seed in 0..64u64 {
+            let hash = content_hash(&seed.to_le_bytes());
+            for width in HASH_CHARS_MIN..=HASH_CHARS {
+                let name = format_hash(&mut buffer, hash, width).to_string();
+                let prefix = parse_hash_prefix(&name).expect("a rendered name parses");
+                assert!(prefix.matches(hash), "`{name}` did not match {hash:016x}");
+                // And it declines a hash that differs inside the bits it pins.
+                assert!(!prefix.matches(hash ^ (1 << 63)));
+            }
+        }
+    }
+
+    #[test]
+    fn reads_a_name_in_either_case() {
+        let lower = parse_hash_prefix("6vzvxbws").unwrap();
+        assert_eq!(parse_hash_prefix("6VZVXBWS").unwrap(), lower);
+    }
+
+    #[test]
+    fn refuses_a_name_that_could_never_have_been_printed() {
+        // Each of these is a different mistake, and the message has to say which.
+        for (name, expected) in [
+            ("abc", "4 to 13"),
+            ("abcdefghijklmn", "4 to 13"),
+            ("2544218206cee57b", "whole-file hash"),
+            ("6vzvxbwi", "not in the alphabet"),
+            ("g6vzvxbw", "first character"),
+        ] {
+            let error = parse_hash_prefix(name).expect_err("`{name}` must not parse");
+            assert!(
+                error.contains(expected),
+                "`{name}` reported `{error}`, which does not mention `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_a_hash_at_the_width_asked_for() {
+        let mut buffer = [0u8; HASH_CHARS];
+        assert_eq!(format_hash(&mut buffer, 0, HASH_CHARS), "0000000000000");
+        // Every bit set. The leading character carries the top four and the twelve after it
+        // five each, which is what makes thirteen cover a `u64` exactly.
+        assert_eq!(
+            format_hash(&mut buffer, u64::MAX, HASH_CHARS),
+            "fzzzzzzzzzzzz"
+        );
+        for width in 1..=HASH_CHARS {
+            assert_eq!(
+                format_hash(&mut buffer, 0x0123_4567_89ab_cdef, width).len(),
+                width
+            );
+        }
+    }
+
+    #[test]
+    fn renders_a_short_hash_as_a_prefix_of_the_long_one() {
+        // Truncation, not folding: `--hash-width 4` must agree with the first four
+        // characters of the whole rendering, or two tools reading one file disagree.
+        let mut buffer = [0u8; HASH_CHARS];
+        let whole = format_hash(&mut buffer, 0x0123_4567_89ab_cdef, HASH_CHARS).to_string();
+        for width in HASH_CHARS_MIN..=HASH_CHARS {
+            assert_eq!(
+                format_hash(&mut buffer, 0x0123_4567_89ab_cdef, width),
+                &whole[..width]
+            );
+        }
+    }
+
+    #[test]
+    fn never_renders_a_character_a_reader_confuses() {
+        let mut buffer = [0u8; HASH_CHARS];
+        for value in 0..64u64 {
+            let rendered = format_hash(
+                &mut buffer,
+                value.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                HASH_CHARS,
+            );
+            assert!(
+                !rendered.contains(['i', 'l', 'o', 'u']),
+                "{rendered} carries a character Crockford's alphabet drops"
+            );
+        }
+    }
+
+    #[test]
+    fn names_a_crlf_line_the_same_however_it_was_read() {
+        // The name covers the terminator, and a span runs to the start of the next line in
+        // either newline set, so both readings name the same bytes with no special case.
+        let named = |newlines| {
+            named_lines(b"alpha\r\nbeta\r\n", newlines)
+                .map(|line| line.hash())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(named(Newlines::Lf), named(Newlines::Unicode));
+    }
+
+    #[test]
+    fn names_the_same_content_the_same_wherever_it_sits() {
+        assert_eq!(
+            content_hash(b"    return 0;\n"),
+            content_hash(b"    return 0;\n")
+        );
+        assert_ne!(
+            content_hash(b"    return 0;\n"),
+            content_hash(b"    return 1;\n")
+        );
+        // An empty line is nameable rather than a special case.
+        let mut buffer = [0u8; HASH_CHARS];
+        assert_eq!(format_hash(&mut buffer, content_hash(b"\n"), 8).len(), 8);
+    }
+
+    #[test]
+    fn hashes_a_stream_as_one_slice() {
+        // The whole chaining design rests on this: the hash accumulated while writing must
+        // equal the hash of the file those writes produced.
+        let pieces: [&[u8]; 4] = [b"alpha\n", b"", b"beta\ngamma\n", b"delta"];
+        let mut sink = Vec::new();
+        let mut hashing = HashingWriter::new(&mut sink);
+        for piece in pieces {
+            hashing.write_all(piece).unwrap();
+        }
+        let digest = hashing.digest();
+
+        let joined: Vec<u8> = pieces.concat();
+        assert_eq!(digest, content_hash(&joined));
+        assert_eq!(sink, joined);
+    }
+
+    #[test]
+    fn hashes_an_empty_stream_as_an_empty_slice() {
+        let mut sink = Vec::new();
+        let hashing = HashingWriter::new(&mut sink);
+        assert_eq!(hashing.digest(), content_hash(b""));
+    }
+
+    #[test]
+    fn parses_a_content_hash_token_in_either_case() {
+        assert_eq!(
+            parse_content_hash("00000000deadbeef").unwrap(),
+            parse_content_hash("00000000DEADBEEF").unwrap()
+        );
+        let value = content_hash(b"round trip");
+        assert_eq!(parse_content_hash(&format!("{value:016x}")).unwrap(), value);
+    }
+
+    #[test]
+    fn refuses_a_content_hash_that_is_not_exactly_sixteen_digits() {
+        // Zero-extending a truncated paste would silently compare against another file.
+        for token in [
+            "",
+            "deadbeef",
+            "00000000deadbeef0",
+            "0x0000000deadbeef",
+            "gggggggggggggggg",
+        ] {
+            assert!(
+                parse_content_hash(token).is_err(),
+                "`{token}` must not parse as a content hash"
+            );
+        }
+    }
+
+    #[test]
+    fn pins_the_hash_of_known_bytes() {
+        // Deliberately brittle. Every hash this suite has ever printed is a promise about
+        // `sz::hash`, so a dependency bump that changes it must fail the build rather than
+        // silently reissue different names for the same lines.
+        let mut buffer = [0u8; HASH_CHARS];
+        assert_eq!(format!("{:016x}", content_hash(b"")), "066e609969a45246");
+        assert_eq!(
+            format!("{:016x}", content_hash(b"the quick brown fox\n")),
+            "dc66974a586d8b9a"
+        );
+        assert_eq!(
+            format_hash(&mut buffer, content_hash(b"    return 0;\n"), HASH_CHARS),
+            "efq8svzx6km8r"
+        );
     }
 
     #[test]
     fn writes_a_one_based_line_record() {
         let mut output = Vec::new();
-        write_line_record(&mut output, "f.txt", b"hello", 0).unwrap();
+        write_line_record(&mut output, "f.txt", b"hello", 0, None).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "{\"type\":\"line\",\"data\":{\"path\":{\"text\":\"f.txt\"},\"text\":{\"text\":\"hello\"},\"line_number\":1}}\n"
         );
+    }
+
+    #[test]
+    fn names_a_line_record_when_one_was_asked_for() {
+        // The same key `sz-find` prints, so a record from either tool reads the same way.
+        let mut output = Vec::new();
+        write_line_record(&mut output, "f.txt", b"hello", 0, Some("2xg6k171")).unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains(r#""line_number":1,"line_hash":"2xg6k171""#));
     }
 
     #[test]
