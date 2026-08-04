@@ -100,6 +100,8 @@ enum Field {
     LineNumbers,
     /// A hash of the line's content, which survives edits elsewhere in the file
     LineHashes,
+    /// A hash of the whole file, as `sz-replace --expect-hash` compares against
+    FileHash,
 }
 
 /// How records are rendered.
@@ -126,6 +128,11 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     if args.hash_width.is_some() && !args.fields.contains(&Field::LineHashes) {
         return Err(reject(
             "--hash-width sizes a line hash, so it needs --fields line-hashes",
+        ));
+    }
+    if args.quiet && args.fields.contains(&Field::FileHash) {
+        return Err(reject(
+            "--quiet prints nothing, so it has nowhere to report --fields file-hash",
         ));
     }
     if args.format == Format::Json {
@@ -157,31 +164,40 @@ enum ForwardSelector {
     Every(NonZeroUsize),
 }
 
+/// Read one 1-based row number into the 0-based index the walk uses.
+///
+/// Every message names the token it read, which is why the empty case is separate: `2-`
+/// splits into `2` and nothing, and "invalid row number: " names nothing at all.
+fn parse_row(token: &str) -> Result<usize, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("a row number is missing; write both ends of a range, as in `2-5`".into());
+    }
+    let row: usize = token
+        .parse()
+        .map_err(|_| format!("`{token}` is not a row number"))?;
+    if row == 0 {
+        return Err("row numbers start at 1".into());
+    }
+    Ok(row - 1)
+}
+
 /// Parse row specification into a RowSelector
 fn parse_rows(spec: &str) -> Result<RowSelector, String> {
+    if spec.trim().is_empty() {
+        return Err("no rows given; pass a row, a list, or a range".into());
+    }
     // Check if it's a simple range (no commas)
     if !spec.contains(',') && spec.contains('-') {
         let parts: Vec<&str> = spec.split('-').collect();
         if parts.len() == 2 {
-            let start: usize = parts[0]
-                .trim()
-                .parse()
-                .map_err(|_| format!("Invalid row number: {}", parts[0]))?;
-            let end: usize = parts[1]
-                .trim()
-                .parse()
-                .map_err(|_| format!("Invalid row number: {}", parts[1]))?;
-            if start == 0 || end == 0 {
-                return Err("Row numbers start at 1".to_string());
-            }
+            let (start, end) = (parse_row(parts[0])?, parse_row(parts[1])?);
             if start > end {
-                return Err(format!("Invalid range: {} > {}", start, end));
+                return Err(format!(
+                    "`{spec}` runs backwards; a range reads low to high"
+                ));
             }
-            // Convert to 0-based
-            return Ok(RowSelector::Forward(ForwardSelector::Range(
-                start - 1,
-                end - 1,
-            )));
+            return Ok(RowSelector::Forward(ForwardSelector::Range(start, end)));
         }
     }
 
@@ -194,35 +210,22 @@ fn parse_rows(spec: &str) -> Result<RowSelector, String> {
             // Range within list: "2-5"
             let parts: Vec<&str> = part.split('-').collect();
             if parts.len() != 2 {
-                return Err(format!("Invalid range: {}", part));
+                return Err(format!("`{part}` is not a range; a range has two ends"));
             }
-            let start: usize = parts[0]
-                .parse()
-                .map_err(|_| format!("Invalid row number: {}", parts[0]))?;
-            let end: usize = parts[1]
-                .parse()
-                .map_err(|_| format!("Invalid row number: {}", parts[1]))?;
-            if start == 0 || end == 0 {
-                return Err("Row numbers start at 1".to_string());
-            }
+            let (start, end) = (parse_row(parts[0])?, parse_row(parts[1])?);
             if start > end {
-                return Err(format!("Invalid range: {} > {}", start, end));
+                return Err(format!(
+                    "`{part}` runs backwards; a range reads low to high"
+                ));
             }
-            indices.extend((start..=end).map(|row| row - 1)); // Convert to 0-based
+            indices.extend(start..=end);
         } else {
-            // Single row: "5"
-            let row: usize = part
-                .parse()
-                .map_err(|_| format!("Invalid row number: {}", part))?;
-            if row == 0 {
-                return Err("Row numbers start at 1".to_string());
-            }
-            indices.push(row - 1); // Convert to 0-based
+            indices.push(parse_row(part)?);
         }
     }
 
     if indices.is_empty() {
-        return Err("No rows specified".to_string());
+        return Err("no rows given; pass a row, a list, or a range".into());
     }
 
     // Rows arrive in order, so the walk reads a sorted list with a cursor rather than
@@ -240,6 +243,8 @@ struct OutputConfig<'a> {
     terminator: Terminator,
     show_line_numbers: bool,
     show_line_hashes: bool,
+    /// Whether the run reports the whole file's hash, which costs it the whole input.
+    show_file_hash: bool,
     hash_width: usize,
     /// Input name carried into the JSON envelope.
     path: &'a str,
@@ -584,13 +589,23 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     };
 
     let name = args.input.as_deref().unwrap_or("-");
-    let input = get_input_streaming(args.input.as_deref()).at(name)?;
+    // A file's hash covers bytes the header line is written long before a stream reaches, so
+    // a text run that asked for one holds the input; JSON names the file again on the record
+    // that closes it, which a stream does reach.
+    let holds_input = args.fields.contains(&Field::FileHash) && args.format != Format::Json;
+    let input = if holds_input {
+        get_input(args.input.as_deref())
+    } else {
+        get_input_streaming(args.input.as_deref())
+    }
+    .at(name)?;
 
     let config = OutputConfig {
         json: args.format == Format::Json,
         terminator: Terminator::from_null(args.null),
         show_line_numbers: args.fields.contains(&Field::LineNumbers),
         show_line_hashes: args.fields.contains(&Field::LineHashes),
+        show_file_hash: args.fields.contains(&Field::FileHash),
         hash_width: args.hash_width.unwrap_or(DEFAULT_HASH_WIDTH),
         path: name,
     };
@@ -605,14 +620,55 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
 
     let newlines = Newlines::from_utf8(args.utf8);
     // Only a pipe streams, so both the reader and the writer of either arm are `-`.
-    let emitted = match input.into_window(DEFAULT_WINDOW_BYTES) {
+    let (emitted, file_hash) = match input.into_window(DEFAULT_WINDOW_BYTES) {
         InputWindow::Whole(source) => {
-            extract_data(source.as_bytes(), &selector, newlines, &config, writer).at("-")?
+            let data = source.as_bytes();
+            // Ahead of the rows, as `sz-find --heading` prints it, and outside the record
+            // stream so a reader never mistakes it for a row.
+            let hash = config.show_file_hash.then(|| content_hash(data));
+            if let Some(hash) = hash.filter(|_| !config.json) {
+                let mut buffer = [0u8; HASH_CHARS];
+                writeln!(
+                    writer,
+                    "{name}  {}",
+                    format_hash(&mut buffer, hash, HASH_CHARS)
+                )
+                .at("-")?;
+            }
+            let emitted = extract_data(data, &selector, newlines, &config, writer).at("-")?;
+            (emitted, hash)
         }
         InputWindow::Stream(mut refill) => {
-            extract_stream(&mut refill, &selector, newlines, &config, writer).at("-")?
+            // Before the first window is filled: a hash installed after that would cover
+            // everything but the bytes already read.
+            if config.show_file_hash {
+                refill.hash_stream();
+            }
+            let emitted =
+                extract_stream(&mut refill, &selector, newlines, &config, writer).at("-")?;
+            // A row selector stops as soon as it has what it asked for, and a digest of a
+            // prefix is indistinguishable from a digest of the file, so the rest of the pipe
+            // is read — through the same window, at no extra memory — before it is taken.
+            if config.show_file_hash {
+                while refill.advance(refill.filled().len()).at("-")? {}
+            }
+            (emitted, refill.digest())
         }
     };
+
+    // JSON carries the file's hash on the record that closes the file, which is the one
+    // place in a stream of per-row records a whole-file value belongs.
+    if let Some(hash) = file_hash.filter(|_| config.json && !args.quiet) {
+        let mut buffer = [0u8; HASH_CHARS];
+        write!(output, r#"{{"type":"end","data":{{"path":"#).at("-")?;
+        json_text_field_to(output, name.as_bytes()).at("-")?;
+        writeln!(
+            output,
+            r#","file_hash":"{}"}}}}"#,
+            format_hash(&mut buffer, hash, HASH_CHARS)
+        )
+        .at("-")?;
+    }
 
     output.flush().at("-")?;
     Ok(Status::from_found(emitted > 0))
@@ -634,8 +690,78 @@ mod tests {
             terminator: Terminator::Newline,
             show_line_numbers: false,
             show_line_hashes: false,
+            show_file_hash: false,
             hash_width: DEFAULT_HASH_WIDTH,
             path: "-",
+        }
+    }
+
+    #[test]
+    fn names_the_whole_file_the_same_streamed_as_mapped() {
+        // The token `sz-replace --expect-hash` wants, from the same read that named the
+        // lines. A row selector stops early, so a streamed run has to finish the pipe: a
+        // digest of a prefix is indistinguishable from a digest of the file.
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("rows.txt");
+        let corpus: String = (1..=400).map(|row| format!("line {row}\n")).collect();
+        std::fs::write(&path, &corpus).unwrap();
+
+        let args = Args::try_parse_from([
+            "sz-rows",
+            "--rows",
+            "2-3",
+            "--format",
+            "json",
+            "--fields",
+            "file-hash",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let mut mapped = Vec::new();
+        run(&args, &mut mapped).unwrap();
+
+        let mut buffer = [0u8; HASH_CHARS];
+        let expected = format_hash(&mut buffer, content_hash(corpus.as_bytes()), HASH_CHARS);
+        let text = String::from_utf8(mapped).unwrap();
+        assert!(
+            text.contains(&format!(r#""file_hash":"{expected}""#)),
+            "{text}"
+        );
+        // Two rows and the record that closes the file, and no more: a whole-file value has
+        // one place to be.
+        assert_eq!(text.lines().count(), 3, "{text}");
+    }
+
+    #[test]
+    fn refuses_a_file_hash_it_would_have_nowhere_to_report() {
+        assert!(Args::try_parse_from([
+            "sz-rows",
+            "--rows",
+            "1",
+            "--quiet",
+            "--fields",
+            "file-hash",
+            "f",
+        ])
+        .and_then(|args| validate(&args).map(|_| args))
+        .is_err());
+    }
+
+    #[test]
+    fn names_the_token_it_read_in_every_row_and_column_error() {
+        // A range with a missing end used to report `Invalid row number: `, naming nothing.
+        for (spec, expected) in [
+            ("2-", "a row number is missing"),
+            ("abc", "`abc` is not a row number"),
+            ("0", "row numbers start at 1"),
+            ("5-2", "runs backwards"),
+            ("1-2-3", "is not a range"),
+            ("", "no rows given"),
+        ] {
+            let Err(error) = parse_rows(spec) else {
+                panic!("`{spec}` must not parse");
+            };
+            assert!(error.contains(expected), "`{spec}` reported `{error}`");
         }
     }
 

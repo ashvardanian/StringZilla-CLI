@@ -75,7 +75,7 @@ struct Args {
     #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
-    /// Pack consecutive segments into records of at most N bytes, never splitting one
+    /// Pack consecutive segments into records of at most N bytes, never splitting one [default: one segment per record]
     #[arg(
         long,
         value_name = "N",
@@ -96,7 +96,7 @@ struct Args {
     #[arg(long, help_heading = "Traversal")]
     glob: Option<Vec<String>>,
 
-    /// Maximum directory depth (default: unlimited)
+    /// Maximum directory depth [default: unlimited]
     #[arg(long, help_heading = "Traversal")]
     max_depth: Option<usize>,
 

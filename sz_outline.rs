@@ -1130,9 +1130,15 @@ fn reject(message: impl std::fmt::Display) -> clap::Error {
 fn validate(args: &Args) -> Result<(), clap::Error> {
     let name = args.input.as_deref().unwrap_or("-");
     if args.language.or_else(|| detect_language(name)).is_none() {
+        // A path that is not there has no extension to have failed to recognise, and
+        // `--language` would not help. Say which of the two went wrong.
+        if let Some(input) = args.input.as_deref() {
+            if let Err(error) = std::fs::metadata(input) {
+                return Err(reject(format!("{input}: {error}")));
+            }
+        }
         return Err(reject(format!(
-            "cannot outline '{}', use --language (md, c, h)",
-            name
+            "cannot outline `{name}`: no language matches its name, so pass --language (md, c, h)"
         )));
     }
     Ok(())

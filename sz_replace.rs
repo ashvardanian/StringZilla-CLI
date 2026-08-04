@@ -111,11 +111,11 @@ struct Args {
     match_kind: Match,
 
     /// Insert the replacement after the matched line rather than over it
-    #[arg(long, conflicts_with = "before", help_heading = "Matching")]
+    #[arg(long, conflicts_with = "before", help_heading = "Placement")]
     after: bool,
 
     /// Insert the replacement before the matched line rather than over it
-    #[arg(long, help_heading = "Matching")]
+    #[arg(long, help_heading = "Placement")]
     before: bool,
 
     /// Split lines on the Unicode newline set rather than LF alone
@@ -123,7 +123,7 @@ struct Args {
     utf8: bool,
 
     /// How many matches to act on
-    #[arg(long, value_enum, default_value_t = Occurrences::All)]
+    #[arg(long, value_enum, default_value_t = Occurrences::All, help_heading = "Placement")]
     occurrences: Occurrences,
 
     /// Fold case when searching; matching is byte-literal, so there is no --utf8 to pair it with

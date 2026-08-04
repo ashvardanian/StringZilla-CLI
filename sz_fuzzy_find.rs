@@ -705,7 +705,7 @@ struct Args {
     #[arg(id = "pattern_flag", long = "pattern", value_name = "PATTERN")]
     extra: Vec<String>,
 
-    /// Maximum edit distance, in code points under --utf8
+    /// Maximum edit distance, in code points under --utf8 [default: 1]
     #[arg(long)]
     max_distance: Option<usize>,
 
@@ -729,11 +729,11 @@ struct Args {
     #[arg(long, value_enum)]
     device: Option<Device>,
 
-    /// CPU thread count (0 = all cores)
+    /// CPU thread count, where 0 is every core [default: 0]
     #[arg(long)]
     threads: Option<usize>,
 
-    /// GPU device index
+    /// GPU device index [default: 0]
     #[arg(long, requires = "device")]
     gpu_id: Option<usize>,
 
@@ -825,7 +825,12 @@ fn build_device(
         Device::Gpu => DeviceScope::gpu_device(gpu_id.unwrap_or(0)),
         Device::Cpu | Device::Auto => DeviceScope::cpu_cores(cores),
     };
-    result.map_err(|e| format!("{:?}", e))
+    // The library's error is a struct whose `Debug` leaks its variant names into a message
+    // a person reads, so only the sentence inside it is passed on.
+    result.map_err(|error| match device {
+        Device::Gpu => format!("--device gpu is unavailable: {}", error),
+        Device::Cpu | Device::Auto => format!("--threads {} is unavailable: {}", cores, error),
+    })
 }
 
 fn main() -> std::process::ExitCode {

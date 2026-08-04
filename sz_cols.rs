@@ -49,7 +49,7 @@ struct Args {
     #[arg(long)]
     output_delimiter: Option<String>,
 
-    /// Only output lines with at least N columns
+    /// Only output lines with at least N columns [default: no minimum]
     #[arg(long)]
     min_columns: Option<usize>,
 
@@ -110,7 +110,28 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
 }
 
 /// Parse a column specification into a list of 0-based column indices
+/// Read one 1-based column number into the 0-based index the split uses.
+///
+/// Every message names the token it read, which is why the empty case is separate: `2-`
+/// splits into `2` and nothing, and "invalid column number: " names nothing at all.
+fn parse_column(token: &str) -> Result<usize, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("a column number is missing; write both ends of a range, as in `2-5`".into());
+    }
+    let column: usize = token
+        .parse()
+        .map_err(|_| format!("`{token}` is not a column number"))?;
+    if column == 0 {
+        return Err("column numbers start at 1".into());
+    }
+    Ok(column - 1)
+}
+
 fn parse_columns(spec: &str) -> Result<Vec<usize>, String> {
+    if spec.trim().is_empty() {
+        return Err("no columns given; pass a column, a list, or a range".into());
+    }
     let mut columns = Vec::new();
 
     for part in spec.split(',') {
@@ -119,37 +140,22 @@ fn parse_columns(spec: &str) -> Result<Vec<usize>, String> {
             // Range: "2-5"
             let parts: Vec<&str> = part.split('-').collect();
             if parts.len() != 2 {
-                return Err(format!("Invalid range: {}", part));
+                return Err(format!("`{part}` is not a range; a range has two ends"));
             }
-            let start: usize = parts[0]
-                .parse()
-                .map_err(|_| format!("Invalid column number: {}", parts[0]))?;
-            let end: usize = parts[1]
-                .parse()
-                .map_err(|_| format!("Invalid column number: {}", parts[1]))?;
-            if start == 0 || end == 0 {
-                return Err("Column numbers start at 1".to_string());
-            }
+            let (start, end) = (parse_column(parts[0])?, parse_column(parts[1])?);
             if start > end {
-                return Err(format!("Invalid range: {} > {}", start, end));
+                return Err(format!(
+                    "`{part}` runs backwards; a range reads low to high"
+                ));
             }
-            for i in start..=end {
-                columns.push(i - 1); // Convert to 0-based
-            }
+            columns.extend(start..=end);
         } else {
-            // Single field: "2"
-            let num: usize = part
-                .parse()
-                .map_err(|_| format!("Invalid column number: {}", part))?;
-            if num == 0 {
-                return Err("Column numbers start at 1".to_string());
-            }
-            columns.push(num - 1); // Convert to 0-based
+            columns.push(parse_column(part)?);
         }
     }
 
     if columns.is_empty() {
-        return Err("No columns specified".to_string());
+        return Err("no columns given; pass a column, a list, or a range".into());
     }
 
     Ok(columns)
@@ -399,6 +405,21 @@ fn main() -> std::process::ExitCode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn names_the_token_it_read_in_every_column_error() {
+        // A range with a missing end used to report `Invalid column number: `, naming nothing.
+        for (spec, expected) in [
+            ("2-", "a column number is missing"),
+            ("abc", "`abc` is not a column number"),
+            ("0", "column numbers start at 1"),
+            ("5-2", "runs backwards"),
+            ("1-2-3", "is not a range"),
+            ("", "no columns given"),
+        ] {
+            let error = parse_columns(spec).expect_err("must not parse");
+            assert!(error.contains(expected), "`{spec}` reported `{error}`");
+        }
+    }
     #[test]
     fn counts_records_a_quiet_run_never_writes() {
         // `--quiet` extracts into a sink, so the count that becomes the exit status

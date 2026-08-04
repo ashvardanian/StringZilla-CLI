@@ -126,7 +126,7 @@ struct Args {
     #[arg(long, default_value = "0", help_heading = "Output Formats")]
     after_context: usize,
 
-    /// Lines of context before and after match
+    /// Lines of context before and after match, overriding both [default: 0]
     #[arg(long, conflicts_with_all = ["before_context", "after_context"], help_heading = "Output Formats")]
     context: Option<usize>,
 
@@ -142,7 +142,7 @@ struct Args {
     #[arg(long, help_heading = "Matching")]
     invert_match: bool,
 
-    /// Stop after NUM matches
+    /// Stop after NUM matches [default: no limit]
     #[arg(long, value_parser = parse_at_least_one, help_heading = "Matching")]
     max_matches: Option<NonZeroUsize>,
 
@@ -169,7 +169,7 @@ struct Args {
     #[arg(long, help_heading = "Output Formats")]
     heading: bool,
 
-    /// Trim printed lines to NUM units, on a character boundary
+    /// Trim printed lines to NUM units, on a character boundary [default: no limit]
     #[arg(long, value_parser = parse_at_least_one, help_heading = "Output Formats")]
     max_line_length: Option<NonZeroUsize>,
 
@@ -185,7 +185,7 @@ struct Args {
     #[arg(long, help_heading = "Traversal")]
     glob: Option<Vec<String>>,
 
-    /// Maximum directory depth
+    /// Maximum directory depth [default: unlimited]
     #[arg(long, help_heading = "Traversal")]
     max_depth: Option<usize>,
 
@@ -329,24 +329,32 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
 
     // `--color auto` is the default, so any other value is an explicit request.
     let colored = !matches!(args.color, ColorChoice::Auto);
+    // JSON emits `line_number` and `absolute_offset` on every record, so asking for those
+    // again is redundant — the two hashes are not, since neither is emitted unasked. Only
+    // some values conflict, so the message names the one that did rather than the flag: the
+    // documented agent recipe passes `--format json --fields line-hashes,file-hash`, which
+    // a message blaming `--fields` reads as forbidden.
+    if args.format == Format::Json {
+        if let Some(field) = args.fields.iter().find(|field| {
+            matches!(
+                field,
+                Field::LineNumbers | Field::ColumnNumbers | Field::ByteOffset
+            )
+        }) {
+            let value = field.to_possible_value().unwrap();
+            return Err(reject(format!(
+                "--format json already carries {0}, so --fields {0} is not allowed",
+                value.get_name()
+            )));
+        }
+    }
     let carried: Vec<(bool, &str)> = match args.format {
         // JSON escapes nothing, names its file in every record and reproduces whole lines.
-        // It also emits `line_number` and `absolute_offset` on every record, so naming those
-        // is inert — the two hashes are not, since neither is emitted unasked.
         Format::Json => vec![
             (args.null, "--null"),
             (args.heading, "--heading"),
             (colored, "--color"),
             (args.max_line_length.is_some(), "--max-line-length"),
-            (
-                args.fields.iter().any(|field| {
-                    matches!(
-                        field,
-                        Field::LineNumbers | Field::ColumnNumbers | Field::ByteOffset
-                    )
-                }),
-                "--fields",
-            ),
         ],
         // Vimgrep names its file, line and column in every record, and a fifth column would
         // be a different format wearing its name.
@@ -1542,9 +1550,6 @@ impl Emitter<'_, '_> {
     /// format asks for, resolving every position against `record.line`.
     fn write_line(&mut self, record: LineRecord, body: &[u8]) -> io::Result<()> {
         let (name, search, config) = (self.name, self.search, self.config);
-        let colors = config.colors;
-        // A context line is set off by `-` where a matching line uses `:`.
-        let separator = if record.is_match { ":" } else { "-" };
         let locates_matches = record.is_match && config.locates_matches;
 
         match config.output_format {
@@ -1578,54 +1583,7 @@ impl Emitter<'_, '_> {
             // `OutputConfig::new` clears `show_name` under `--heading`, where the name is a
             // header rather than a per-line prefix, so both formats print the same line.
             OutputFormat::Standard | OutputFormat::Heading => {
-                if config.show_name {
-                    write!(
-                        self.output,
-                        "{}{}{}{}",
-                        colors.name, name, colors.reset, separator
-                    )?;
-                }
-                if config.line_numbers {
-                    write!(
-                        self.output,
-                        "{}{}{}{}",
-                        colors.line_number, record.line_number, colors.reset, separator
-                    )?;
-                }
-                if config.column_numbers && locates_matches {
-                    let column = search
-                        .matcher
-                        .matches(record.line)
-                        .next()
-                        .map_or(1, |found| found.column(record.line, config.character_units));
-                    write!(
-                        self.output,
-                        "{}{}{}{}",
-                        colors.column, column, colors.reset, separator
-                    )?;
-                }
-                if config.byte_offset {
-                    write!(
-                        self.output,
-                        "{}{}{}{}",
-                        colors.byte_offset, record.byte_offset, colors.reset, separator
-                    )?;
-                }
-                // Last of the prefix, because it names the line rather than locating it, and
-                // because leaving the positional columns contiguous keeps `cut -d:` working.
-                if config.line_hashes {
-                    let mut buffer = [0u8; HASH_CHARS];
-                    write!(
-                        self.output,
-                        "{}{}{}{}",
-                        colors.hash,
-                        // The line as it was read, never `body`: that may carry highlight
-                        // codes or be trimmed, and neither is what the name refers to.
-                        format_hash(&mut buffer, content_hash(record.whole), config.hash_width),
-                        colors.reset,
-                        separator
-                    )?;
-                }
+                self.write_prefix(record)?;
                 self.write_content(record, body)?;
                 self.output.write_all(&[config.terminator])
             }
@@ -1712,6 +1670,65 @@ impl Emitter<'_, '_> {
         )
     }
 
+    /// Write the columns that come before a record's text: where it is, and what it is
+    /// named. Repeated for every record `--show matches` emits from one line, so a consumer
+    /// counting fields reads the same shape on every row.
+    fn write_prefix(&mut self, record: LineRecord) -> io::Result<()> {
+        let (name, search, config) = (self.name, self.search, self.config);
+        let colors = config.colors;
+        // A context line is set off by `-` where a matching line uses `:`.
+        let separator = if record.is_match { ":" } else { "-" };
+        if config.show_name {
+            write!(
+                self.output,
+                "{}{}{}{}",
+                colors.name, name, colors.reset, separator
+            )?;
+        }
+        if config.line_numbers {
+            write!(
+                self.output,
+                "{}{}{}{}",
+                colors.line_number, record.line_number, colors.reset, separator
+            )?;
+        }
+        if config.column_numbers && config.locates_matches && record.is_match {
+            let column = search
+                .matcher
+                .matches(record.line)
+                .next()
+                .map_or(1, |found| found.column(record.line, config.character_units));
+            write!(
+                self.output,
+                "{}{}{}{}",
+                colors.column, column, colors.reset, separator
+            )?;
+        }
+        if config.byte_offset {
+            write!(
+                self.output,
+                "{}{}{}{}",
+                colors.byte_offset, record.byte_offset, colors.reset, separator
+            )?;
+        }
+        // Last of the prefix, because it names the line rather than locating it, and
+        // because leaving the positional columns contiguous keeps `cut -d:` working.
+        if config.line_hashes {
+            let mut buffer = [0u8; HASH_CHARS];
+            write!(
+                self.output,
+                "{}{}{}{}",
+                colors.hash,
+                // The line as it was read, never `body`: that may carry highlight codes or
+                // be trimmed, and neither is what the name refers to.
+                format_hash(&mut buffer, content_hash(record.whole), config.hash_width),
+                colors.reset,
+                separator
+            )?;
+        }
+        Ok(())
+    }
+
     /// Write a line's content, reduced to the matches themselves under `--show matches`.
     fn write_content(&mut self, record: LineRecord, body: &[u8]) -> io::Result<()> {
         let (search, config) = (self.search, self.config);
@@ -1721,6 +1738,9 @@ impl Emitter<'_, '_> {
         for (index, found) in search.matcher.matches(record.line).enumerate() {
             if index > 0 {
                 self.output.write_all(&[config.terminator])?;
+                // Every match is its own record, so it carries the whole prefix rather than
+                // trailing the first one's.
+                self.write_prefix(record)?;
             }
             if !config.colors.match_highlight.is_empty() {
                 self.output

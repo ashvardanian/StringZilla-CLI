@@ -60,7 +60,7 @@ struct Args {
         value_enum,
         value_delimiter = ',',
         default_value = "lines,words,bytes",
-        help_heading = "Fields"
+        help_heading = "Output Formats"
     )]
     fields: Vec<Field>,
 
@@ -93,7 +93,7 @@ struct Args {
     #[arg(long, help_heading = "Traversal")]
     glob: Option<Vec<String>>,
 
-    /// Maximum directory depth (default: unlimited)
+    /// Maximum directory depth [default: unlimited]
     #[arg(long, help_heading = "Traversal")]
     max_depth: Option<usize>,
 
@@ -1064,6 +1064,16 @@ fn gather(
     report
 }
 
+/// Whether every selected measurement came out zero, which is what `--quiet` reports as
+/// "nothing was counted". A row exists for every readable input, so its presence alone only
+/// says the file opened.
+fn report_is_empty(report: &Report) -> bool {
+    report
+        .rows
+        .iter()
+        .all(|row| row.counts.values().iter().all(|value| *value == 0))
+}
+
 /// The status a finished run reports. Nothing readable did not complete; nothing
 /// counted completed and found nothing.
 fn outcome(report: &Report, failures: usize) -> Status {
@@ -1103,6 +1113,15 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         &mut failures,
     );
     let status = outcome(&counted, failures);
+
+    // Under `--quiet` the status is the whole output, and "anything was counted" means a
+    // non-zero tally rather than a readable file — a run over empty files completes and
+    // finds nothing, which is what exit 1 says.
+    let status = if args.quiet && status == Status::Success && report_is_empty(&counted) {
+        Status::NoResult
+    } else {
+        status
+    };
 
     if status == Status::Success && !args.quiet {
         let config = OutputConfig {

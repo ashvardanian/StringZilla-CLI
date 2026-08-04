@@ -249,6 +249,7 @@ $ sz-rows --tail 10 file.txt                  # the last ten (replaces: tail -n 
 $ sz-rows --rows 1,5,10 file.txt              # scattered lines in one pass (replaces: sed -n '1p;5p;10p')
 $ sz-rows --every 5 file.txt                  # every fifth (replaces: awk 'NR % 5 == 0')
 $ sz-rows --fields line-numbers --rows 5-10 file.txt # numbered output, as grep -n writes it
+$ sz-rows --fields line-hashes,file-hash --rows 5-10 file.txt # named output, to edit against
 ```
 
 Reaching a range deep in the same 5 GB, and sampling every thousandth line:
