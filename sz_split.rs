@@ -83,20 +83,24 @@ struct Args {
     /// Announce every written chunk on stdout
     #[arg(
         long,
-        value_name = "KIND",
+        value_name = "FORMAT",
         value_enum,
         default_value = "none",
         help_heading = "Output Formats"
     )]
-    manifest: Manifest,
+    format: Format,
+
+    /// NUL-terminate each announced path instead of newline, for `xargs -0`
+    #[arg(long, help_heading = "Output Formats")]
+    null: bool,
 }
 
 /// How a written chunk is announced.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum Manifest {
-    /// Nothing, so a run that asked for no manifest writes no stdout at all.
+enum Format {
+    /// Nothing, so a run that asked for no announcement writes no stdout at all.
     None,
-    /// The path alone, NUL-terminated, for `xargs -0`.
+    /// The path alone, one per record.
     Paths,
     /// A JSON Lines record carrying the tallies.
     Json,
@@ -311,8 +315,11 @@ struct SplitConfig<'a> {
     /// reproducing the input.
     header: &'a [u8],
     /// How each written chunk is announced.
-    manifest: Manifest,
-    /// Lines `header` carries, so the manifest can say how much of a chunk is not data.
+    format: Format,
+    /// What ends an announced path, as `--null` asks. JSON carries its own structure and
+    /// ignores it, exactly as it does in every other tool here.
+    terminator: Terminator,
+    /// Lines `header` carries, so an announcement can say how much of a chunk is not data.
     header_lines: usize,
 }
 
@@ -366,7 +373,7 @@ fn suffix_exhausted(chunk_number: usize, suffix_length: usize) -> Failure {
 }
 
 /// Flush the open chunk and record it in the manifest, readying `state` for the next one.
-/// A run without `--manifest` writes the record into [`io::sink`], so there is one path here.
+/// A run under `--format none` writes the record into [`io::sink`], so there is one path here.
 fn close_chunk(
     state: &mut SplitState,
     config: &SplitConfig,
@@ -379,7 +386,8 @@ fn close_chunk(
     // The manifest reports the file as it is on disk, header included.
     write_manifest_entry(
         manifest,
-        config.manifest,
+        config.format,
+        config.terminator,
         &chunk.name,
         chunk.lines + chunk.header_lines,
         chunk.bytes,
@@ -735,22 +743,23 @@ fn split_stream<R: Read>(
 
 // endregion: Streaming
 
-/// Write one manifest record naming a file that was written.
+/// Write one record naming a file that was written.
 fn write_manifest_entry(
     output: &mut dyn Write,
-    manifest: Manifest,
+    format: Format,
+    terminator: Terminator,
     name: &str,
     lines: usize,
     bytes: usize,
     header_lines: usize,
 ) -> io::Result<()> {
-    match manifest {
-        Manifest::None => return Ok(()),
-        Manifest::Paths => {
+    match format {
+        Format::None => return Ok(()),
+        Format::Paths => {
             output.write_all(name.as_bytes())?;
-            return output.write_all(&[0]);
+            return output.write_all(&[terminator.as_byte()]);
         }
-        Manifest::Json => {}
+        Format::Json => {}
     }
     output.write_all(br#"{"type":"file","data":{"path":"#)?;
     json_text_field_to(output, name.as_bytes())?;
@@ -833,8 +842,8 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let newlines = Newlines::from_utf8(args.utf8 || args.ignore_case);
     let emitted = {
         let mut discarded = io::sink();
-        let manifest: &mut dyn Write = match args.manifest {
-            Manifest::None => &mut discarded,
+        let manifest: &mut dyn Write = match args.format {
+            Format::None => &mut discarded,
             _ => &mut *output,
         };
         // The header is taken off the input before any boundary is chosen, so every mode
@@ -874,7 +883,8 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
             mode,
             newlines,
             suffix_length: args.suffix_length,
-            manifest: args.manifest,
+            format: args.format,
+            terminator: Terminator::from_null(args.null),
             header: &header,
             header_lines,
         };
@@ -1003,7 +1013,8 @@ mod tests {
                 "repeat-header",
                 "utf8",
                 "suffix-length",
-                "manifest",
+                "format",
+                "null",
                 "help",
                 "version",
             ],
@@ -1063,7 +1074,8 @@ mod tests {
             mode: SplitMode::Bytes(NonZeroUsize::new(8).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
             newlines: Newlines::Lf,
-            manifest: Manifest::None,
+            format: Format::None,
+            terminator: Terminator::Newline,
             header: b"",
             header_lines: 0,
         };
@@ -1085,7 +1097,8 @@ mod tests {
             mode: SplitMode::Bytes(NonZeroUsize::new(5).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
             newlines: Newlines::Lf,
-            manifest: Manifest::None,
+            format: Format::None,
+            terminator: Terminator::Newline,
             header: b"",
             header_lines: 0,
         };
@@ -1112,7 +1125,8 @@ mod tests {
                 mode: SplitMode::Lines(NonZeroUsize::MIN),
                 suffix_length: NonZeroUsize::new(2).unwrap(),
                 newlines: Newlines::Lf,
-                manifest: Manifest::None,
+                format: Format::None,
+                terminator: Terminator::Newline,
                 header: b"",
                 header_lines: 0,
             };
@@ -1142,7 +1156,8 @@ mod tests {
             mode: SplitMode::Lines(NonZeroUsize::new(2).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
             newlines: Newlines::Lf,
-            manifest: Manifest::None,
+            format: Format::None,
+            terminator: Terminator::Newline,
             header: b"id,name\n",
             header_lines: 1,
         };
@@ -1206,7 +1221,8 @@ mod tests {
             mode,
             newlines: Newlines::Unicode,
             suffix_length: NonZeroUsize::new(2).unwrap(),
-            manifest: Manifest::None,
+            format: Format::None,
+            terminator: Terminator::Newline,
             header: b"",
             header_lines: 0,
         }
@@ -1219,7 +1235,8 @@ mod tests {
             mode: SplitMode::Pattern(delimiter),
             suffix_length: NonZeroUsize::new(2).unwrap(),
             newlines: Newlines::Lf,
-            manifest: Manifest::None,
+            format: Format::None,
+            terminator: Terminator::Newline,
             header: b"",
             header_lines: 0,
         }
@@ -1354,7 +1371,8 @@ mod tests {
             mode: SplitMode::Lines(NonZeroUsize::new(lines_per_file).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
             newlines,
-            manifest: Manifest::None,
+            format: Format::None,
+            terminator: Terminator::Newline,
             header: b"",
             header_lines: 0,
         }
@@ -1448,7 +1466,8 @@ mod tests {
             mode: SplitMode::Lines(NonZeroUsize::new(1).unwrap()),
             suffix_length: NonZeroUsize::new(1).unwrap(),
             newlines: Newlines::Lf,
-            manifest: Manifest::None,
+            format: Format::None,
+            terminator: Terminator::Newline,
             header: b"",
             header_lines: 0,
         };

@@ -17,7 +17,7 @@
 //! sz-segment-utf8 --by graphemes --null emoji.txt
 //!
 //! # Byte offsets back into the source, for retrieval pipelines
-//! sz-segment-utf8 --by sentences --byte-offsets book.txt
+//! sz-segment-utf8 --by sentences --fields byte-span book.txt
 //!
 //! # Pack sentences into 2 KB chunks for embedding
 //! sz-segment-utf8 --by sentences --chunk-bytes 2000 --format json book.txt
@@ -136,7 +136,7 @@ enum By {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Field {
     /// `start<TAB>end<TAB>`, as byte offsets into the input
-    ByteOffsets,
+    ByteSpan,
 }
 
 /// Which record kind the run emits.
@@ -172,9 +172,9 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
         if args.null {
             return Err(reject("--format json cannot be combined with --null"));
         }
-        if args.fields.contains(&Field::ByteOffsets) {
+        if args.fields.contains(&Field::ByteSpan) {
             return Err(reject(
-                "--format json already carries offsets, so --fields byte-offsets is not allowed",
+                "--format json already carries offsets, so --fields byte-span is not allowed",
             ));
         }
     }
@@ -355,7 +355,7 @@ impl OutputConfig {
         };
         let render = if args.format == Some(Format::Json) {
             Render::Json
-        } else if args.fields.contains(&Field::ByteOffsets) {
+        } else if args.fields.contains(&Field::ByteSpan) {
             Render::Offsets
         } else {
             Render::Plain
@@ -531,7 +531,7 @@ fn write_chunks(
 
 /// Segment a pipe one window at a time, cutting each window where [`By::cut_after`] says
 /// the automaton restarts. `base` tracks where the window starts in the input, so
-/// `--byte-offsets` and `--format json` report the absolute positions the mapped path does.
+/// `--fields byte-span` and `--format json` report the absolute positions the mapped path does.
 fn segment_stream(
     refill: &mut Refill<impl io::Read>,
     segmentation: Segmentation,
@@ -1083,7 +1083,7 @@ mod tests {
         let counting = ["sz-segment-utf8", "--by", "words", "--show", "count"];
         assert!(validate(&parsed(&[&counting[..], &["--null"]].concat())).is_ok());
         assert!(validate(&parsed(
-            &[&counting[..], &["--fields", "byte-offsets"]].concat()
+            &[&counting[..], &["--fields", "byte-span"]].concat()
         ))
         .is_err());
     }

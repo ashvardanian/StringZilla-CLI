@@ -699,8 +699,9 @@ fn write_summary_json(output: &mut dyn Write, summary: &Summary) -> io::Result<(
 
 /// Write the one-line text summary.
 ///
-/// It goes through `output` rather than `println!` so it lands after the transformed bytes
-/// that are still sitting in the same buffer, rather than jumping ahead of them.
+/// The caller hands it stderr. The transformed bytes are the run's output, whether they go
+/// to a file, to stdout, or through a pipe, and a sentence about the run is not part of them
+/// — `sz-replace --summary a b f > out.txt` must leave `out.txt` a file of text.
 fn write_summary_text(output: &mut dyn Write, summary: &Summary) -> io::Result<()> {
     let verb = if summary.dry_run {
         "Would replace"
@@ -724,10 +725,14 @@ fn main() -> std::process::ExitCode {
     let args = Args::parse();
     // Every byte this run prints goes here, so the records stay in one order.
     let mut output = stdout_writer();
-    report("sz-replace", run(&args, &mut output))
+    report("sz-replace", run(&args, &mut output, &mut io::stderr()))
 }
 
-fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+/// The run's output and the notes about it are two different streams, and the caller passes
+/// both: `output` carries what the run produced, `notes` carries what it has to say about
+/// the run. Only the second may be prose, and only the second goes to stderr, so redirecting
+/// stdout gives a file of data rather than data with a sentence appended.
+fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
     let name = args.input.as_deref().unwrap_or("-");
@@ -847,7 +852,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     if args.format == Format::Json {
         write_summary_json(output, &summary).at("-")?;
     } else if args.summary || args.dry_run {
-        write_summary_text(output, &summary).at("-")?;
+        write_summary_text(notes, &summary).at("-")?;
     }
 
     output.flush().at("-")?;
@@ -920,17 +925,18 @@ mod tests {
         (buf, count)
     }
 
-    /// Test helper: drive a whole run, returning its outcome and everything it printed.
+    /// Test helper: drive a whole run, returning its outcome, what it produced, and what it
+    /// had to say about the run — the two streams kept apart, as a caller's shell keeps them.
     ///
     /// Paths are passed absolute rather than by changing directory, since the working
     /// directory is process-wide and these tests run in parallel.
-    fn run_with(flags: &[&str]) -> (Result<Status, Failure>, Vec<u8>) {
+    fn run_with(flags: &[&str]) -> (Result<Status, Failure>, Vec<u8>, Vec<u8>) {
         let mut argv = vec!["sz-replace"];
         argv.extend_from_slice(flags);
         let args = Args::try_parse_from(argv).expect("flags must parse");
-        let mut output = Vec::new();
-        let outcome = run(&args, &mut output);
-        (outcome, output)
+        let (mut output, mut notes) = (Vec::new(), Vec::new());
+        let outcome = run(&args, &mut output, &mut notes);
+        (outcome, output, notes)
     }
 
     /// Test helper: the token `--expect-hash` accepts for a file's current contents.
@@ -1399,7 +1405,7 @@ mod tests {
         let mut argv = vec!["--match", "line-hash"];
         argv.extend_from_slice(flags);
         argv.extend_from_slice(&[name, replacement, &file]);
-        let (outcome, printed) = run_with(&argv);
+        let (outcome, printed, _notes) = run_with(&argv);
         outcome.expect("the edit applies");
         printed
     }
@@ -1488,9 +1494,10 @@ mod tests {
         let path = directory.path().join("notes.txt");
         fs::write(&path, b"alpha\nbeta\n").unwrap();
 
-        let (outcome, printed) = run_with(&["beta", "BETA", path.to_str().unwrap(), "--summary"]);
+        let (outcome, _printed, notes) =
+            run_with(&["beta", "BETA", path.to_str().unwrap(), "--summary"]);
         outcome.unwrap();
-        let text = String::from_utf8(printed).unwrap();
+        let text = String::from_utf8(notes).unwrap();
         let mut buffer = [0u8; HASH_CHARS];
         let after = format_hash(&mut buffer, content_hash(b"alpha\nBETA\n"), HASH_CHARS);
         assert!(text.contains(after), "{text}");
@@ -1783,7 +1790,7 @@ aaa
         fs::write(&path, b"dup\nother\ndup\n").unwrap();
         let file = path.to_str().unwrap();
 
-        let (outcome, printed) = run_with(&[
+        let (outcome, printed, _notes) = run_with(&[
             "--match",
             "line-hash",
             "--occurrences",
@@ -1799,7 +1806,7 @@ aaa
         assert_eq!(matches, 2);
         assert!(printed.is_empty());
 
-        let (outcome, _) = run_with(&[
+        let (outcome, _, _notes) = run_with(&[
             "--match",
             "line-hash",
             "--occurrences",
@@ -1823,7 +1830,7 @@ aaa
         let file = path.to_str().unwrap();
         let four = &name_of(b"beta\n")[..HASH_CHARS_MIN];
 
-        let (outcome, _) = run_with(&[
+        let (outcome, _, _notes) = run_with(&[
             "--match",
             "line-hash",
             "--occurrences",
@@ -1850,7 +1857,7 @@ aaa
 
         // Two insertions above it. Its line number is now 5; its name has not moved.
         for text in ["one", "two"] {
-            let (outcome, _) = run_with(&[
+            let (outcome, _, _notes) = run_with(&[
                 "--in-place",
                 "--match",
                 "line-hash",
@@ -1861,7 +1868,7 @@ aaa
             ]);
             outcome.unwrap();
         }
-        let (outcome, _) = run_with(&[
+        let (outcome, _, _notes) = run_with(&[
             "--in-place",
             "--match",
             "line-hash",
@@ -1897,7 +1904,7 @@ aaa
             ])
         };
         edit("done").0.unwrap();
-        let (outcome, _) = edit("again");
+        let (outcome, _, _notes) = edit("again");
 
         assert!(matches!(outcome, Err(Failure::Unresolved { .. })));
         assert_eq!(fs::read(&path).unwrap(), b"alpha\ndone\n");
@@ -1913,7 +1920,7 @@ aaa
         let file = path.to_str().unwrap();
 
         let first = token_of(&path);
-        let (outcome, printed) = run_with(&[
+        let (outcome, printed, _notes) = run_with(&[
             "beta",
             "BETA",
             file,
@@ -1934,7 +1941,7 @@ aaa
         assert_eq!(second, token_of(&path), "the reported hash is the file's");
 
         // The chained token still holds, so the second edit lands without a re-read.
-        let (outcome, _) = run_with(&[
+        let (outcome, _, _notes) = run_with(&[
             "gamma",
             "GAMMA",
             file,
@@ -1946,7 +1953,7 @@ aaa
         assert_eq!(fs::read(&path).unwrap(), b"alpha\nBETA\nGAMMA\n");
 
         // Replaying the first token now names a file that has moved on twice.
-        let (outcome, _) = run_with(&[
+        let (outcome, _, _notes) = run_with(&[
             "alpha",
             "ALPHA",
             file,
@@ -1982,7 +1989,7 @@ aaa
             vec!["alpha", "A", file, "--dry-run", "--expect-hash", stale],
             vec!["alpha", "A", file, "--expect-hash", stale],
         ] {
-            let (outcome, printed) = run_with(&flags);
+            let (outcome, printed, _notes) = run_with(&flags);
             assert!(
                 matches!(outcome, Err(Failure::Stale { .. })),
                 "expected {flags:?} to be refused"
@@ -2008,7 +2015,8 @@ aaa
         fs::write(&path, b"beta\ngamma\nbeta\n").unwrap();
         let file = path.to_str().unwrap();
 
-        let (outcome, _) = run_with(&["beta", "B", file, "--in-place", "--occurrences", "one"]);
+        let (outcome, _, _notes) =
+            run_with(&["beta", "B", file, "--in-place", "--occurrences", "one"]);
         let Err(Failure::Ambiguous { matches, .. }) = outcome else {
             panic!("two matches under --occurrences one must be refused");
         };
@@ -2016,7 +2024,8 @@ aaa
         assert_eq!(fs::read(&path).unwrap(), b"beta\ngamma\nbeta\n");
 
         // One match is what the mode asserts, so it goes through.
-        let (outcome, _) = run_with(&["gamma", "G", file, "--in-place", "--occurrences", "one"]);
+        let (outcome, _, _notes) =
+            run_with(&["gamma", "G", file, "--in-place", "--occurrences", "one"]);
         assert_eq!(outcome.unwrap(), Status::Success);
         assert_eq!(fs::read(&path).unwrap(), b"beta\nG\nbeta\n");
     }
@@ -2097,7 +2106,7 @@ aaa
         let file = path.to_str().unwrap();
         let before = token_of(&path);
 
-        let (outcome, printed) =
+        let (outcome, printed, _notes) =
             run_with(&["beta", "BETA", file, "--in-place", "--format", "json"]);
         outcome.unwrap();
 
@@ -2120,7 +2129,8 @@ aaa
         fs::write(&path, b"alpha\nbeta\n").unwrap();
         let file = path.to_str().unwrap();
 
-        let (outcome, printed) = run_with(&["beta", "BETA", file, "--dry-run", "--format", "json"]);
+        let (outcome, printed, _notes) =
+            run_with(&["beta", "BETA", file, "--dry-run", "--format", "json"]);
         outcome.unwrap();
 
         // Untouched, but the record still names what the edit would have produced.
@@ -2135,24 +2145,23 @@ aaa
     }
 
     #[test]
-    fn prints_the_summary_after_the_bytes_it_summarizes() {
-        // Both go through the one writer, so the summary lands where it was emitted rather
-        // than jumping the buffer the transformed bytes are still sitting in.
+    fn keeps_the_summary_out_of_the_bytes_it_summarizes() {
+        // `sz-replace --summary a b f > out.txt` has to leave `out.txt` a file of text. The
+        // sentence describes the run, so it goes to the stream a shell keeps separate.
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("notes.md");
         fs::write(&path, b"alpha\nbeta\n").unwrap();
 
-        let (outcome, printed) = run_with(&["beta", "BETA", path.to_str().unwrap(), "--summary"]);
+        let (outcome, printed, notes) =
+            run_with(&["beta", "BETA", path.to_str().unwrap(), "--summary"]);
         outcome.unwrap();
 
-        let text = String::from_utf8(printed).unwrap();
-        let (body, summary) = text.split_once("Replaced").expect("the summary is printed");
-        assert_eq!(body, "alpha\nBETA\n");
+        assert_eq!(String::from_utf8(printed).unwrap(), "alpha\nBETA\n");
         let mut buffer = [0u8; HASH_CHARS];
         let after = format_hash(&mut buffer, content_hash(b"alpha\nBETA\n"), HASH_CHARS);
         assert_eq!(
-            summary.trim(),
-            format!("1 occurrence(s); content is {after}")
+            String::from_utf8(notes).unwrap().trim(),
+            format!("Replaced 1 occurrence(s); content is {after}")
         );
     }
 
@@ -2164,7 +2173,7 @@ aaa
         let path = directory.path().join("notes.md");
         fs::write(&path, b"alpha\nbeta\n").unwrap();
 
-        let (outcome, printed) = run_with(&["beta", "BETA", path.to_str().unwrap()]);
+        let (outcome, printed, _notes) = run_with(&["beta", "BETA", path.to_str().unwrap()]);
         outcome.unwrap();
         assert_eq!(printed, b"alpha\nBETA\n");
     }

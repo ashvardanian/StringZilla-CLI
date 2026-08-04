@@ -274,7 +274,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Format::Text, help_heading = "Output Formats")]
     format: Format,
 
-    /// Print one line about the whole run on stdout
+    /// Print one line about the whole run on stderr
     #[arg(long, conflicts_with = "dry_run", help_heading = "Output Formats")]
     summary: bool,
 
@@ -315,10 +315,14 @@ fn main() -> std::process::ExitCode {
     let args = Args::parse();
     // Every byte this run prints goes here, so the records stay in one order.
     let mut output = stdout_writer();
-    report("sz-sort", run(&args, &mut output))
+    report("sz-sort", run(&args, &mut output, &mut io::stderr()))
 }
 
-fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+/// The run's output and the notes about it are two different streams, and the caller passes
+/// both: `output` carries what the run produced, `notes` carries what it has to say about
+/// the run. Only the second may be prose, and only the second goes to stderr, so redirecting
+/// stdout gives a file of data rather than data with a sentence appended.
+fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
     let name = args.input.as_deref().unwrap_or("-");
@@ -382,7 +386,10 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
             write_summary_json(output, name, lines.len(), emitted).at("-")?;
         }
     } else if args.summary || args.dry_run {
-        println!("{} lines read, {} written", lines.len(), emitted);
+        // Prose about the run, so it goes to `notes`: `sz-sort --summary f > sorted.txt`
+        // must not append a sentence to the lines it just wrote. `--format json` puts the
+        // same numbers on the record stream, where a program can read them.
+        writeln!(notes, "{} lines read, {} written", lines.len(), emitted).at("-")?;
     }
     output.flush().at("-")?;
     Ok(Status::from_found(emitted > 0))

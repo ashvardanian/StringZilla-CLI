@@ -157,7 +157,7 @@ struct Args {
     )]
     quiet: bool,
 
-    /// Report totals for the whole run
+    /// Report totals for the whole run, on stderr unless `--format json` makes them a record
     #[arg(long, help_heading = "Output Formats")]
     summary: bool,
 
@@ -215,7 +215,7 @@ enum Field {
     /// The 1-based column of the first match on the line
     ColumnNumbers,
     /// The line's byte offset from the start of the input
-    ByteOffsets,
+    ByteOffset,
     /// A hash of the line's content, which survives edits elsewhere in the file
     LineHashes,
     /// A hash of the whole file, as `sz-replace --expect-hash` compares against
@@ -342,7 +342,7 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
                 args.fields.iter().any(|field| {
                     matches!(
                         field,
-                        Field::LineNumbers | Field::ColumnNumbers | Field::ByteOffsets
+                        Field::LineNumbers | Field::ColumnNumbers | Field::ByteOffset
                     )
                 }),
                 "--fields",
@@ -454,7 +454,7 @@ struct OutputConfig {
     show_name: bool,
     line_numbers: bool,
     column_numbers: bool,
-    byte_offsets: bool,
+    byte_offset: bool,
     line_hashes: bool,
     file_hash: bool,
     /// How many characters of a line hash are printed.
@@ -480,7 +480,7 @@ impl OutputConfig {
     /// `validate` refuses outright rather than printing column one for every line.
     #[inline]
     fn annotates_lines(&self) -> bool {
-        self.line_numbers || self.byte_offsets || self.line_hashes
+        self.line_numbers || self.byte_offset || self.line_hashes
     }
 
     /// Collapse the output flags into the form every emitter reads. `is_terminal` answers
@@ -515,7 +515,7 @@ impl OutputConfig {
             // Vimgrep implies line numbers and columns.
             line_numbers: carries(Field::LineNumbers) || output_format == OutputFormat::Vimgrep,
             column_numbers: carries(Field::ColumnNumbers) || output_format == OutputFormat::Vimgrep,
-            byte_offsets: carries(Field::ByteOffsets),
+            byte_offset: carries(Field::ByteOffset),
             line_hashes: carries(Field::LineHashes),
             file_hash: carries(Field::FileHash),
             hash_width: args.hash_width.unwrap_or(DEFAULT_HASH_WIDTH),
@@ -918,7 +918,7 @@ struct FindState {
     match_count: usize,
     lines_searched: usize,
     /// Offset of the current window's first byte within the whole input, which keeps
-    /// `--byte-offsets` and the JSON and vimgrep formats absolute across a streamed run.
+    /// `--fields byte-offset` and the JSON and vimgrep formats absolute across a streamed run.
     window_base: usize,
     printed_heading: bool,
     /// The whole file's hash, when `--fields file-hash` asked for one. Set where the file
@@ -1604,7 +1604,7 @@ impl Emitter<'_, '_> {
                         colors.column, column, colors.reset, separator
                     )?;
                 }
-                if config.byte_offsets {
+                if config.byte_offset {
                     write!(
                         self.output,
                         "{}{}{}{}",
@@ -2083,10 +2083,12 @@ fn search_tree(
     Ok(())
 }
 
-/// Report the run's totals, on stdout beside the records they describe. Under
-/// `--format json` they are one more record, so the stream still parses line by line.
+/// Report the run's totals. Under `--format json` they are one more record on the stream
+/// they describe, so it still parses line by line. In text they are prose, and prose goes to
+/// stderr — a paragraph in the middle of `sz-find … > matches.txt` is not a match.
 fn print_summary(
     output: &mut dyn Write,
+    notes: &mut dyn Write,
     format: Format,
     summary: &Summary,
     elapsed: std::time::Duration,
@@ -2104,22 +2106,22 @@ fn print_summary(
             elapsed.as_secs_f64()
         );
     }
-    writeln!(output)?;
-    writeln!(output, "Summary:")?;
-    writeln!(output, "  Files searched: {}", summary.files_searched)?;
-    writeln!(output, "  Files matched:  {}", summary.files_matched)?;
-    writeln!(output, "  Lines searched: {}", summary.lines_searched)?;
-    writeln!(output, "  Matches found:  {}", summary.matches_found)?;
+    writeln!(notes)?;
+    writeln!(notes, "Summary:")?;
+    writeln!(notes, "  Files searched: {}", summary.files_searched)?;
+    writeln!(notes, "  Files matched:  {}", summary.files_matched)?;
+    writeln!(notes, "  Lines searched: {}", summary.lines_searched)?;
+    writeln!(notes, "  Matches found:  {}", summary.matches_found)?;
     writeln!(
-        output,
+        notes,
         "  Bytes searched: {} ({:.2} MB)",
         bytes,
         bytes as f64 / 1_000_000.0
     )?;
-    writeln!(output, "  Time elapsed:   {:.3}s", elapsed.as_secs_f64())?;
+    writeln!(notes, "  Time elapsed:   {:.3}s", elapsed.as_secs_f64())?;
     if elapsed.as_secs_f64() > 0.0 {
         writeln!(
-            output,
+            notes,
             "  Throughput:     {:.2} MB/s",
             (bytes as f64 / 1_000_000.0) / elapsed.as_secs_f64()
         )?;
@@ -2133,11 +2135,15 @@ fn main() -> std::process::ExitCode {
     let args = Args::parse();
     // Every byte this run prints goes here, so the records stay in one order.
     let mut output = stdout_writer();
-    report("sz-find", run(&args, &mut output))
+    report("sz-find", run(&args, &mut output, &mut io::stderr()))
 }
 
 /// Search every input in turn and answer with the status the run earned.
-fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+/// The run's output and the notes about it are two different streams, and the caller passes
+/// both: `output` carries what the run produced, `notes` carries what it has to say about
+/// the run. Only the second may be prose, and only the second goes to stderr, so redirecting
+/// stdout gives a file of data rather than data with a sentence appended.
+fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
     let started = std::time::Instant::now();
     let show = args.show.unwrap_or_default();
@@ -2231,7 +2237,14 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     }
 
     if args.summary {
-        print_summary(output, args.format, &outcome.summary, started.elapsed()).at(STDIN_NAME)?;
+        print_summary(
+            output,
+            notes,
+            args.format,
+            &outcome.summary,
+            started.elapsed(),
+        )
+        .at(STDIN_NAME)?;
     }
     output.flush().at(STDIN_NAME)?;
 
@@ -2271,7 +2284,7 @@ mod tests {
             show_name: false,
             line_numbers: false,
             column_numbers: false,
-            byte_offsets: false,
+            byte_offset: false,
             line_hashes: false,
             file_hash: false,
             hash_width: DEFAULT_HASH_WIDTH,
@@ -2468,7 +2481,7 @@ mod tests {
             vec!["--format", "json", "--max-line-length", "10"],
             // JSON emits the position of every record unasked, so naming it is inert.
             vec!["--format", "json", "--fields", "line-numbers"],
-            vec!["--format", "json", "--fields", "byte-offsets"],
+            vec!["--format", "json", "--fields", "byte-offset"],
             vec!["--format", "vimgrep", "--heading"],
             vec!["--format", "vimgrep", "--fields", "line-numbers"],
             vec!["--format", "vimgrep", "--fields", "line-hashes"],
@@ -2530,10 +2543,14 @@ mod tests {
         .unwrap();
         assert!(validate(&args).is_ok());
 
-        let mut printed = Vec::new();
-        assert!(matches!(run(&args, &mut printed), Ok(Status::Success)));
-        let printed = String::from_utf8(printed).unwrap();
-        assert!(printed.contains("Matches found:  2"), "{}", printed);
+        let (mut printed, mut notes) = (Vec::new(), Vec::new());
+        assert!(matches!(
+            run(&args, &mut printed, &mut notes),
+            Ok(Status::Success)
+        ));
+        assert!(printed.is_empty(), "--quiet prints no line");
+        let notes = String::from_utf8(notes).unwrap();
+        assert!(notes.contains("Matches found:  2"), "{notes}");
     }
 
     #[test]
@@ -2548,6 +2565,7 @@ mod tests {
         let mut printed = Vec::new();
         print_summary(
             &mut printed,
+            &mut io::sink(),
             Format::Json,
             &summary,
             std::time::Duration::from_millis(1500),
@@ -2672,10 +2690,16 @@ mod tests {
             present.to_str().unwrap(),
         ])
         .unwrap();
-        assert!(matches!(run(&args, &mut output), Ok(Status::Success)));
+        assert!(matches!(
+            run(&args, &mut output, &mut io::sink()),
+            Ok(Status::Success)
+        ));
 
         let args = Args::try_parse_from(["sz-find", "error", missing.to_str().unwrap()]).unwrap();
-        assert!(matches!(run(&args, &mut io::sink()), Ok(Status::Error)));
+        assert!(matches!(
+            run(&args, &mut io::sink(), &mut io::sink()),
+            Ok(Status::Error)
+        ));
     }
 
     #[test]
@@ -3234,7 +3258,7 @@ mod tests {
     fn keeps_line_numbers_and_offsets_absolute_across_windows() {
         let mut config = make_config();
         config.line_numbers = true;
-        config.byte_offsets = true;
+        config.byte_offset = true;
         config.column_numbers = true;
         config.line_hashes = true;
         let path = SearchPath::Print(config);

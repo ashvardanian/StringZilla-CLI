@@ -76,7 +76,7 @@ $ sz-find --multiline $'hello\nworld' file.txt                 # match across li
 $ sz-find --utf8 "pattern" file.txt                            # break lines on the Unicode newline set
 ```
 
-`--show` picks which records a run emits; `--fields` picks which columns each of them carries, comma-separated: `line-numbers`, `column-numbers`, `byte-offsets`, `line-hashes`, `file-hash`.
+`--show` picks which records a run emits; `--fields` picks which columns each of them carries, comma-separated: `line-numbers`, `column-numbers`, `byte-offset`, `line-hashes`, `file-hash`.
 
 Beyond the flags above, `sz-find` also covers most of the `grep`/`ripgrep` surface: whole-word matching (`--match word`), inverted matches (`--invert-match`), only-matching output (`--show matches`), recursive directory walking with `.gitignore` awareness, type/glob filters (`--type`, `--glob`), and `--format json`/`--format vimgrep` output.
 
@@ -277,7 +277,7 @@ Coreutils has nothing, ICU ships `genbrk` and `uconv` but neither segments text,
 ```bash
 $ sz-segment-utf8 --by sentences book.txt                               # one UAX-29 sentence per line
 $ sz-segment-utf8 --by graphemes --show count emoji.txt                 # count user-perceived characters
-$ sz-segment-utf8 --by sentences --fields byte-offsets doc.txt          # offsets, for citing back to source
+$ sz-segment-utf8 --by sentences --fields byte-span doc.txt             # start and end, for citing back to source
 $ sz-segment-utf8 --by sentences --chunk-bytes 2000 --format json c.txt # 2 KB records for an embedder
 ```
 
@@ -405,7 +405,7 @@ $ sz-split --chunk-bytes 100MB    large.csv part.               # 100 MB shards,
 $ sz-split --chunk-count 16       large.csv part.               # one chunk per core, cut at line ends
 $ sz-split --chunk-pattern '>'    seqs.fa   rec.                # a new chunk at each line starting with >
 $ sz-split --repeat-header --chunk-bytes 100MB large.csv        # every shard keeps the CSV header
-$ sz-split --chunk-lines 100000 --manifest json large.csv part. # a manifest of what was written
+$ sz-split --chunk-lines 100000 --format json large.csv part.   # a record per chunk written
 ```
 
 A line is never split, whatever the budget: one longer than `--chunk-bytes` becomes an over-budget chunk of its own.

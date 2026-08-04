@@ -229,7 +229,7 @@ fn is_posix_space(byte: u8) -> bool {
 // region: Counts and Fields
 
 /// Every measurement's header, in column order.
-const HEADERS: &[&str] = &["lines", "words", "bytes", "chars", "maxline"];
+const HEADERS: &[&str] = &["lines", "words", "bytes", "chars", "max_line_length"];
 
 /// How many measurements [`Counts`] carries, and so the most columns a table has.
 /// [`Counts::values`] and [`Fields::selectors`] are sized by it, so a sixth
@@ -1281,7 +1281,7 @@ mod tests {
                     if fields.max_line_length {
                         assert_eq!(
                             subset.max_line_length, full.max_line_length,
-                            "maxline, {}",
+                            "max_line_length, {}",
                             context
                         );
                     }
@@ -1432,7 +1432,7 @@ mod tests {
         let args = Args::parse_from(["sz-count", "--fields", "lines,max-line-length", "file.txt"]);
         let fields = Fields::from_selection(&args.fields);
         assert_eq!(fields.selectors(), [true, false, false, false, true]);
-        assert!(Args::try_parse_from(["sz-count", "--fields", "maxline"]).is_err());
+        assert!(Args::try_parse_from(["sz-count", "--fields", "max_line_length"]).is_err());
     }
 
     #[test]
@@ -1576,7 +1576,10 @@ mod tests {
             max_line_length: true,
         };
         let selected: Vec<_> = counts.columns(fields).collect();
-        assert_eq!(selected, vec![("lines", 1), ("bytes", 3), ("maxline", 5)]);
+        assert_eq!(
+            selected,
+            vec![("lines", 1), ("bytes", 3), ("max_line_length", 5)]
+        );
     }
 
     #[test]

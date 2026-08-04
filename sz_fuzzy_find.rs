@@ -758,7 +758,7 @@ struct Args {
     #[arg(long, value_enum)]
     show: Option<Show>,
 
-    /// Print one line about the whole run, on stdout
+    /// Print one line about the whole run, on stderr
     #[arg(long)]
     summary: bool,
 
@@ -831,7 +831,7 @@ fn build_device(
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
     let mut output = stdout_writer();
-    report("sz-fuzzy-find", run(&args, &mut output))
+    report("sz-fuzzy-find", run(&args, &mut output, &mut io::stderr()))
 }
 
 /// An engine fails to build on allocation or a device fault, never on a bad argument.
@@ -842,7 +842,11 @@ fn engine_failure(engine: &str, error: impl std::fmt::Debug) -> Failure {
     }
 }
 
-fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+/// The run's output and the notes about it are two different streams, and the caller passes
+/// both: `output` carries what the run produced, `notes` carries what it has to say about
+/// the run. Only the second may be prose, and only the second goes to stderr, so redirecting
+/// stdout gives a file of data rather than data with a sentence appended.
+fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
     let cost = args.cost.unwrap_or(Cost::Edit);
@@ -912,8 +916,16 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let opened = inputs
         .iter()
         .map(|name| (name.as_str(), get_input(Some(name))));
-    let outcome =
-        search_inputs(writer, opened, &queries, &engines, &cfg, &output_config).at("-")?;
+    let outcome = search_inputs(
+        writer,
+        notes,
+        opened,
+        &queries,
+        &engines,
+        &cfg,
+        &output_config,
+    )
+    .at("-")?;
 
     output.flush().at("-")?;
     if outcome.readable == 0 {
@@ -957,6 +969,7 @@ fn resolve_positionals(
 /// Search every opened input, warning about the ones that could not be opened and continuing.
 fn search_inputs<'a>(
     output: &mut dyn Write,
+    notes: &mut dyn Write,
     inputs: impl IntoIterator<Item = (&'a str, io::Result<InputSource>)>,
     queries: &[Query],
     engines: &Engines,
@@ -995,14 +1008,16 @@ fn search_inputs<'a>(
     }
 
     if out_cfg.summary {
-        write_summary(output, out_cfg, &outcome, seen)?;
+        write_summary(output, notes, out_cfg, &outcome, seen)?;
     }
     Ok(outcome)
 }
 
-/// The one summary record closing the run, in whichever format it selected.
+/// The one summary closing the run: a record under `--json`, where it belongs to the stream
+/// it closes, and otherwise a sentence on stderr, where it cannot be mistaken for a match.
 fn write_summary(
     output: &mut dyn Write,
+    notes: &mut dyn Write,
     cfg: &OutputConfig,
     outcome: &Outcome,
     inputs: usize,
@@ -1015,7 +1030,7 @@ fn write_summary(
         );
     }
     writeln!(
-        output,
+        notes,
         "matched {} lines in {} of {} inputs, skipping {} malformed lines",
         outcome.total, outcome.readable, inputs, outcome.malformed
     )
@@ -1205,8 +1220,8 @@ mod tests {
             summary: true,
             terminator: Terminator::Newline,
         };
-        let mut written = Vec::new();
-        write_summary(&mut written, &cfg, &outcome, 1).unwrap();
+        let (mut written, mut notes) = (Vec::new(), Vec::new());
+        write_summary(&mut written, &mut notes, &cfg, &outcome, 1).unwrap();
         let record = String::from_utf8(written).unwrap();
         assert!(
             record.starts_with(r#"{"type":"summary","data":{"#),
@@ -1214,11 +1229,14 @@ mod tests {
             record
         );
         assert!(record.contains(r#""matched_lines":9"#), "{}", record);
+        assert!(notes.is_empty(), "a record belongs to the stream it closes");
 
+        // In text it is prose about the run, so it leaves the record stream alone.
         cfg.json = false;
-        let mut written = Vec::new();
-        write_summary(&mut written, &cfg, &outcome, 1).unwrap();
-        assert!(String::from_utf8(written)
+        let (mut written, mut notes) = (Vec::new(), Vec::new());
+        write_summary(&mut written, &mut notes, &cfg, &outcome, 1).unwrap();
+        assert!(written.is_empty(), "prose is not a match");
+        assert!(String::from_utf8(notes)
             .unwrap()
             .starts_with("matched 9 lines"));
     }
@@ -1249,8 +1267,16 @@ mod tests {
         let queries = vec![Query::new("color".to_string(), false)];
 
         let mut written = Vec::new();
-        let outcome =
-            search_inputs(&mut written, inputs, &queries, &engines, &cfg, &out_cfg).unwrap();
+        let outcome = search_inputs(
+            &mut written,
+            &mut io::sink(),
+            inputs,
+            &queries,
+            &engines,
+            &cfg,
+            &out_cfg,
+        )
+        .unwrap();
         assert_eq!(outcome.readable, 1);
         assert_eq!(outcome.total, 1);
         assert_eq!(written, b"colour\n");
