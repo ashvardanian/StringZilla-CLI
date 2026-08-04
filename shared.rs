@@ -787,6 +787,10 @@ pub struct Refill<R> {
     buffer: Box<[u8]>,
     valid: usize,
     reached_eof: bool,
+    /// Hashes the stream as it arrives, when a caller asked for a whole-input hash. Boxed
+    /// because `sz::Hasher` is cache-line aligned and would otherwise make a `Refill` far
+    /// larger than the other shape an input can take.
+    hasher: Option<Box<sz::Hasher>>,
 }
 
 impl<R: Read> Refill<R> {
@@ -798,7 +802,28 @@ impl<R: Read> Refill<R> {
             buffer: vec![0u8; capacity.max(1)].into_boxed_slice(),
             valid: 0,
             reached_eof: false,
+            hasher: None,
         }
+    }
+
+    /// Hash the stream as it is read, so a whole-input hash costs no second pass and no
+    /// buffer holding the input.
+    ///
+    /// Accumulated in [`Refill::fill`], which is the only place a byte enters the window and
+    /// so the only place that sees each one exactly once. Hashing where windows are *handed
+    /// out* would double-count every byte a cut retained, re-count the whole window each time
+    /// it grew, and miss whatever a caller consumed outside the driver.
+    pub fn hash_stream(&mut self) {
+        self.hasher
+            .get_or_insert_with(|| Box::new(sz::Hasher::new(0)));
+    }
+
+    /// The hash of everything read so far, equal to [`content_hash`] of those bytes.
+    ///
+    /// A run that stops early has read less than the input holds, so this describes what was
+    /// read rather than what the writer still has to give.
+    pub fn digest(&self) -> Option<u64> {
+        self.hasher.as_ref().map(|state| state.digest())
     }
 
     /// The bytes currently in the window.
@@ -904,7 +929,12 @@ impl<R: Read> Refill<R> {
         while !self.reached_eof && self.valid < self.buffer.len() {
             match self.reader.read(&mut self.buffer[self.valid..]) {
                 Ok(0) => self.reached_eof = true,
-                Ok(read) => self.valid += read,
+                Ok(read) => {
+                    if let Some(state) = self.hasher.as_mut() {
+                        state.update(&self.buffer[self.valid..self.valid + read]);
+                    }
+                    self.valid += read;
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
@@ -2177,6 +2207,51 @@ mod tests {
         // An empty line is nameable rather than a special case.
         let mut buffer = [0u8; HASH_CHARS];
         assert_eq!(format_hash(&mut buffer, content_hash(b"\n"), 8).len(), 8);
+    }
+
+    #[test]
+    fn hashes_a_windowed_read_as_one_slice() {
+        // The property the whole streamed-hash design rests on: a hash accumulated while
+        // windowing has to equal the hash of the bytes those windows came from, at every
+        // capacity — including the ones where a cut retains a carry and where a record
+        // wider than the window forces it to grow.
+        let input = b"alpha\nbeta\n\ngamma delta epsilon zeta\nend";
+        for capacity in [1, 2, 7, 13, 64, 4096] {
+            let mut refill = Refill::new(&input[..], capacity);
+            refill.hash_stream();
+            refill
+                .for_each_window(CutAfter::LineFeed, |_| Ok(()))
+                .unwrap();
+            assert_eq!(
+                refill.digest(),
+                Some(content_hash(input)),
+                "capacity {capacity}"
+            );
+        }
+    }
+
+    #[test]
+    fn hashes_only_what_a_stopped_read_took() {
+        // An early stop leaves the rest of the input unread, so the digest describes what was
+        // read. A caller that needs the whole input has to keep reading, not ask twice.
+        let input = b"alpha\nbeta\ngamma\n";
+        let mut refill = Refill::new(&input[..], 6);
+        refill.hash_stream();
+        refill
+            .try_for_each_window(CutAfter::LineFeed, |_| Ok(ControlFlow::Break(())))
+            .unwrap();
+        let stopped = refill.digest().unwrap();
+        assert_ne!(stopped, content_hash(input));
+        assert_eq!(stopped, content_hash(b"alpha\n"));
+    }
+
+    #[test]
+    fn hashes_nothing_when_it_was_not_asked_to() {
+        let mut refill = Refill::new(&b"alpha\n"[..], 8);
+        refill
+            .for_each_window(CutAfter::LineFeed, |_| Ok(()))
+            .unwrap();
+        assert_eq!(refill.digest(), None);
     }
 
     #[test]

@@ -974,12 +974,18 @@ fn search_data(
         return search_multiline(data, name, search, path, output, max_reached);
     }
     let mut state = FindState::new(path.context());
-    if path.config().is_some_and(|config| config.file_hash) {
-        state.file_hash = Some(content_hash(data));
-    }
+    let file_hash = path
+        .config()
+        .filter(|config| config.file_hash)
+        .map(|_| content_hash(data));
+    // Only the heading prints it inline; JSON carries it on the closing record.
+    state.file_hash = file_hash.filter(|_| {
+        path.config()
+            .is_some_and(|config| config.output_format == OutputFormat::Heading)
+    });
     // One window spans the whole input, so there is nothing left to stop for.
     let _ = search_window(data, name, search, path, &mut state, output, max_reached)?;
-    print_json_end(output, name, path, &state)?;
+    print_json_end(output, name, path, &state, file_hash)?;
     Ok(state.result(data.len()))
 }
 
@@ -1240,7 +1246,9 @@ fn search_multiline(
         search,
         config,
         // Taken here rather than from the state below, which this path builds afterwards.
-        file_hash: config.file_hash.then(|| content_hash(data)),
+        // Only the heading prints it inline; JSON carries it on the closing record.
+        file_hash: (config.file_hash && config.output_format == OutputFormat::Heading)
+            .then(|| content_hash(data)),
     });
 
     // Each region carries its own surrounding lines, so this path keeps no look-behind
@@ -1346,7 +1354,15 @@ fn search_multiline(
         }
     }
 
-    print_json_end(output, name, path, &state)?;
+    print_json_end(
+        output,
+        name,
+        path,
+        &state,
+        path.config()
+            .filter(|config| config.file_hash)
+            .map(|_| content_hash(data)),
+    )?;
 
     // `--max-matches` caps this file, and reaching the cap ends the walk over the rest —
     // but only with input still unread, which is where the line paths stop as well.
@@ -1367,8 +1383,12 @@ fn search_multiline(
 /// the window, so those two keep every byte. `--after-context` alone only reaches forward.
 fn can_stream(search: &Search, path: &SearchPath) -> bool {
     !search.multiline
-        // A file's hash covers bytes the heading is written long before a stream reaches.
-        && !path.config().is_some_and(|config| config.file_hash)
+        // A heading is written on the first match, long before a stream reaches the bytes a
+        // file's hash covers. JSON names the file again when it closes it, which a stream
+        // does reach, so only the heading has to hold the input.
+        && !path.config().is_some_and(|config| {
+            config.file_hash && config.output_format == OutputFormat::Heading
+        })
         && match path {
             SearchPath::Tally { .. } | SearchPath::Print(_) => true,
             SearchPath::PrintContext(_, context) => context.before == 0,
@@ -1392,14 +1412,20 @@ fn search_stream<R: Read>(
     debug_assert!(can_stream(search, path), "this path reads earlier lines");
 
     let mut state = FindState::new(path.context());
+    // Installed by the caller, before the window it hands over has read anything.
+    let hashing = refill.digest().is_some();
     refill.try_for_each_window(search.newlines.into(), |window| {
         let flow = search_window(window, name, search, path, &mut state, output, max_reached)?;
         // Counted before the flow is honoured, so a stop still reports the window it read.
         state.window_base += window.len();
-        Ok(flow)
+        Ok(if hashing {
+            ControlFlow::Continue(())
+        } else {
+            flow
+        })
     })?;
 
-    print_json_end(output, name, path, &state)?;
+    print_json_end(output, name, path, &state, refill.digest())?;
     // An early stop leaves the rest of the pipe unread, so the total describes what
     // was searched rather than what the writer still holds.
     Ok(state.result(state.window_base))
@@ -1771,6 +1797,7 @@ fn print_json_end(
     name: &str,
     path: &SearchPath,
     state: &FindState,
+    file_hash: Option<u64>,
 ) -> io::Result<()> {
     let Some(config) = path.config() else {
         return Ok(());
@@ -1780,6 +1807,12 @@ fn print_json_end(
     }
     output.write_all(br#"{"type":"end","data":{"path":"#)?;
     json_text_field_to(output, name.as_bytes())?;
+    // On the closing record rather than the opening one, because a file's hash covers bytes
+    // the opening record is written long before a stream reaches. Naming it here is what
+    // lets a piped search report one without holding the pipe in memory.
+    if let Some(hash) = file_hash {
+        write!(output, r#","file_hash":"{hash:016x}""#)?;
+    }
     write!(
         output,
         r#","stats":{{"matches":{},"lines_searched":{}}}}}}}"#,
@@ -1941,6 +1974,11 @@ fn search_stdin(
             )?
         }
         InputWindow::Stream(mut refill) => {
+            // Before the sniff below, which fills the first window: a hash installed after
+            // that would miss everything it read.
+            if path.config().is_some_and(|config| config.file_hash) {
+                refill.hash_stream();
+            }
             // The first window is filled up front so that `--binary` reads the same on a
             // pipe as it does on a file; `try_for_each_window` refills without consuming.
             refill.advance(0)?;
@@ -2261,6 +2299,11 @@ mod tests {
         path: &SearchPath,
     ) -> (Vec<u8>, usize, usize) {
         let mut refill = Refill::new(data, capacity);
+        // As `search_stdin` does, and before anything is read: a hash installed later would
+        // miss the window that installing it came after.
+        if path.config().is_some_and(|config| config.file_hash) {
+            refill.hash_stream();
+        }
         let mut output = Vec::new();
         let mut max_reached = false;
         let result = search_stream(
@@ -3519,19 +3562,6 @@ mod tests {
     }
 
     #[test]
-    fn never_streams_a_run_that_names_the_whole_file() {
-        // The heading is written on the first match, long before a stream reaches the bytes
-        // the file's hash covers, so the pipe is held instead.
-        let mut config = make_config();
-        config.output_format = OutputFormat::Json;
-        config.file_hash = true;
-        assert!(!can_stream(
-            &make_search(b"error"),
-            &SearchPath::Print(config)
-        ));
-    }
-
-    #[test]
     fn names_the_whole_file_once_beside_its_name() {
         let search = make_search(b"error");
         let corpus = b"alpha error one\nbeta error two\n";
@@ -3557,6 +3587,66 @@ mod tests {
         assert_eq!(text.matches(&expected).count(), 1, "{text}");
         // The token it prints is the one `sz-replace --expect-hash` accepts.
         assert!(parse_content_hash(&expected).is_ok());
+    }
+
+    #[test]
+    fn streams_a_file_hash_that_a_closing_record_can_carry() {
+        // JSON names the file again when it closes it, which a stream reaches; a heading
+        // names it on the first match, which a stream has not read past yet.
+        let search = make_search(b"error");
+
+        let mut json = make_config();
+        json.output_format = OutputFormat::Json;
+        json.file_hash = true;
+        assert!(can_stream(&search, &SearchPath::Print(json)));
+
+        let mut heading = make_config();
+        heading.output_format = OutputFormat::Heading;
+        heading.file_hash = true;
+        assert!(!can_stream(&search, &SearchPath::Print(heading)));
+    }
+
+    #[test]
+    fn names_the_whole_file_the_same_streamed_as_mapped() {
+        // The hash a piped run reports has to be the hash of the file, not of the windows it
+        // happened to be handed.
+        let mut config = make_config();
+        config.output_format = OutputFormat::Json;
+        config.file_hash = true;
+        let path = SearchPath::Print(config);
+        let search = make_search(b"error");
+        let expected = format!(r#""file_hash":"{:016x}""#, content_hash(SEAM_CORPUS));
+
+        let (whole, ..) = search_whole(SEAM_CORPUS, &search, &path);
+        assert!(String::from_utf8(whole).unwrap().contains(&expected));
+
+        for capacity in [1, 7, 13, 64] {
+            let (streamed, ..) = search_streamed(SEAM_CORPUS, capacity, &search, &path);
+            let text = String::from_utf8(streamed).unwrap();
+            assert!(text.contains(&expected), "capacity {capacity}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn names_the_whole_file_even_when_the_search_stops_early() {
+        // `--max-matches` leaves the rest of a pipe unread, and a hash of the prefix would
+        // look exactly like a hash of the file. A run that asked for one reads to the end.
+        let mut config = make_config();
+        config.output_format = OutputFormat::Json;
+        config.file_hash = true;
+        let mut search = make_search(b"error");
+        search.max_matches = Some(1);
+
+        let (streamed, ..) = search_streamed(SEAM_CORPUS, 7, &search, &SearchPath::Print(config));
+        let text = String::from_utf8(streamed).unwrap();
+        assert!(
+            text.contains(&format!(
+                r#""file_hash":"{:016x}""#,
+                content_hash(SEAM_CORPUS)
+            )),
+            "{text}"
+        );
+        assert_eq!(text.matches(r#""type":"match""#).count(), 1);
     }
 
     #[test]

@@ -25,10 +25,10 @@
 //! cat file.txt | sz-replace foo bar
 //! ```
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringzilla::sz::{find, utf8_uncased_search};
+use stringzilla::sz::{find, utf8_uncased_fold, utf8_uncased_search};
 
 use shared::*;
 
@@ -293,14 +293,129 @@ enum Edit<'a> {
     Lines(Vec<Splice>),
 }
 
+/// Where the bytes to transform come from. Owned, so the borrow of the mapping lasts
+/// exactly as long as the run that is reading it.
+enum Source {
+    /// The whole input at once: a mapped file, or a pipe a run had to hold.
+    Whole(InputSource),
+    /// A pipe, read one window at a time.
+    Windows(Refill<io::StdinLock<'static>>),
+}
+
+impl Source {
+    /// The whole input, for the decisions that cannot be made without it.
+    fn whole(&self) -> Option<&[u8]> {
+        match self {
+            Source::Whole(held) => Some(held.as_bytes()),
+            Source::Windows(_) => None,
+        }
+    }
+}
+
 /// Everything the replacement needs that does not depend on where it is written, so the
 /// destinations cannot disagree about what they are producing or whether it is hashed.
 struct Substitution<'a> {
-    data: &'a [u8],
+    source: Source,
     edit: Edit<'a>,
     /// Whether the produced bytes are hashed on their way out. A run that reports no hash
     /// pays for none, which is what keeps the plain pipe as fast as it was.
     hashed: bool,
+}
+
+/// The most bytes one match can occupy, which is how far a window has to see past what it
+/// emits.
+///
+/// Folding makes this larger than the pattern — `ss` matches `ẞ`, three bytes — but not
+/// unboundedly so. A matching span folds to exactly what the pattern folds to, every
+/// character occupies at most four UTF-8 bytes, and every character folds to at least one:
+/// so no match can run past four times the folded length.
+fn longest_match(pattern: &[u8], ignore_case: bool) -> usize {
+    if !ignore_case {
+        return pattern.len();
+    }
+    // Folding expands by at most three, which is the bound `sz-dedup` sizes its own scratch by.
+    let mut scratch = vec![0u8; pattern.len().saturating_mul(3).max(64)];
+    utf8_uncased_fold(pattern, &mut scratch[..]).saturating_mul(4)
+}
+
+/// Replace within one window, emitting only what is settled and reporting how far that got.
+///
+/// `carry` is how many trailing bytes could still be the opening of a match the next window
+/// completes; at end of input nothing is pending and it is zero. A match that *starts* in
+/// the carry is left for the next window, and one that starts before it and runs past it is
+/// whole here and emitted.
+///
+/// Returns `(replacements, consumed)`. A `consumed` of zero means the window is too narrow
+/// to settle anything, which is the caller's cue to widen it.
+fn replace_window(
+    window: &[u8],
+    pattern: &[u8],
+    replacement: &[u8],
+    ignore_case: bool,
+    limit: usize,
+    carry: usize,
+    out: &mut dyn Write,
+) -> io::Result<(usize, usize)> {
+    let settled = window.len().saturating_sub(carry);
+    let (mut base, mut count) = (0, 0);
+    while count < limit {
+        let Some((offset, matched)) = next_match(&window[base..], pattern, ignore_case) else {
+            break;
+        };
+        let start = base + offset;
+        if start >= settled {
+            break;
+        }
+        out.write_all(&window[base..start])?;
+        out.write_all(replacement)?;
+        count += 1;
+        base = start + matched;
+    }
+    // A match reaching past the settled point is still whole, so it carries the boundary
+    // with it rather than being scanned a second time.
+    let consumed = base.max(settled);
+    out.write_all(&window[base..consumed])?;
+    Ok((count, consumed))
+}
+
+/// Replace through a window at a time, returning the replacement count and the bytes read.
+///
+/// Driven by hand rather than through [`Refill::for_each_window`], because a scanner whose
+/// match may straddle a seam has to *see* further than it *emits* — one byte less than the
+/// longest match stays pending at the end of every window — and a cut can only say where to
+/// stop.
+fn replace_stream<R: Read>(
+    refill: &mut Refill<R>,
+    pattern: &[u8],
+    replacement: &[u8],
+    ignore_case: bool,
+    limit: usize,
+    destination: &mut dyn Write,
+) -> io::Result<(usize, usize)> {
+    let pending = longest_match(pattern, ignore_case).saturating_sub(1);
+    let (mut count, mut bytes, mut consumed) = (0, 0, 0);
+    while refill.advance(consumed)? {
+        // Nothing is pending once the input has ended: the last window is whole.
+        let carry = if refill.at_eof() { 0 } else { pending };
+        let (made, took) = replace_window(
+            refill.filled(),
+            pattern,
+            replacement,
+            ignore_case,
+            limit.saturating_sub(count),
+            carry,
+            destination,
+        )?;
+        count += made;
+        bytes += took;
+        consumed = took;
+        // A window no wider than what is pending settles nothing, so it doubles instead of
+        // handing the same bytes back forever.
+        if consumed == 0 {
+            refill.grow()?;
+        }
+    }
+    Ok((count, bytes))
 }
 
 /// What a finished run produced: how many replacements it made, how many bytes it read, and
@@ -333,10 +448,11 @@ impl Substitution<'_> {
     }
 
     fn emit(&mut self, destination: &mut dyn Write) -> io::Result<(usize, usize)> {
-        let data = self.data;
-        {
-            {
-                match &self.edit {
+        let edit = &self.edit;
+        match &mut self.source {
+            Source::Whole(held) => {
+                let data = held.as_bytes();
+                match edit {
                     Edit::Substring {
                         pattern,
                         replacement,
@@ -365,6 +481,27 @@ impl Substitution<'_> {
                         Ok((splices.len(), data.len()))
                     }
                 }
+            }
+            Source::Windows(refill) => {
+                // A name is resolved against every candidate before anything is written, so
+                // a run that addresses lines never reaches here without the whole input.
+                let Edit::Substring {
+                    pattern,
+                    replacement,
+                    ignore_case,
+                    limit,
+                } = edit
+                else {
+                    unreachable!("line addressing holds the whole input")
+                };
+                replace_stream(
+                    refill,
+                    pattern,
+                    replacement,
+                    *ignore_case,
+                    *limit,
+                    destination,
+                )
             }
         }
     }
@@ -572,15 +709,43 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     // whole of it before it may write, *and* its destination cannot take the write back.
     // Every other combination has a way out: a mapped file is already whole, and a temporary
     // can be discarded once the answer arrives at the end.
-    let input = get_input(args.input.as_deref()).at(name)?;
-    let data = input.as_bytes();
+    let needs_whole_input = args.occurrences == Occurrences::One
+        || args.match_kind == Match::LineHash
+        // A refusal tells the caller to read the file again, which a pipe cannot do, so the
+        // one destination that could act on it is the one that already holds the input.
+        || args.expect_hash.is_some();
+    let sink_retracts =
+        args.in_place || counting_only || args.output.as_deref().is_some_and(|path| path != "-");
+
+    let input = if needs_whole_input && !sink_retracts {
+        get_input(args.input.as_deref())
+    } else {
+        get_input_streaming(args.input.as_deref())
+    }
+    .at(name)?;
+
     let pattern = args.pattern.as_bytes();
     let replacement = args.replacement.as_bytes();
 
+    let source = match input.into_window(DEFAULT_WINDOW_BYTES) {
+        InputWindow::Whole(held) => Source::Whole(held),
+        // Hashed as it arrives, before anything reads it, so a streamed run can still report
+        // what it read without holding it.
+        InputWindow::Stream(mut refill) => {
+            if reports_hashes {
+                refill.hash_stream();
+            }
+            Source::Windows(refill)
+        }
+    };
+
     // Settled before any destination is opened, so a refused edit has nothing to retract;
     // and the fast path pays for a hash only when one will be reported.
-    let hash_before = (args.expect_hash.is_some() || reports_hashes).then(|| content_hash(data));
-    if let Some((expected, actual)) = args.expect_hash.zip(hash_before) {
+    let mapped_hash = source
+        .whole()
+        .filter(|_| args.expect_hash.is_some() || reports_hashes)
+        .map(content_hash);
+    if let Some((expected, actual)) = args.expect_hash.zip(mapped_hash) {
         if actual != expected {
             return Err(Failure::Stale {
                 path: name.to_string(),
@@ -590,18 +755,31 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         }
     }
 
-    let edit = match args.match_kind {
-        Match::LineHash => Edit::Lines(resolve_lines(args, data, name)?),
-        Match::Substring => Edit::Substring {
+    let edit = match source.whole() {
+        Some(data) if args.match_kind == Match::LineHash => {
+            Edit::Lines(resolve_lines(args, data, name)?)
+        }
+        Some(data) => Edit::Substring {
             pattern,
             replacement,
             ignore_case: args.ignore_case,
             limit: substring_limit(args, data, name)?,
         },
+        // Streaming is reached only when nothing about the whole input is needed, so there
+        // is nothing to count before the limit is known.
+        None => Edit::Substring {
+            pattern,
+            replacement,
+            ignore_case: args.ignore_case,
+            limit: match args.occurrences {
+                Occurrences::All => usize::MAX,
+                _ => 1,
+            },
+        },
     };
 
     let mut substitution = Substitution {
-        data,
+        source,
         edit,
         hashed: reports_hashes,
     };
@@ -624,6 +802,11 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         substitution.write_to(output).at("-")?
     };
 
+    // A mapped run hashed its input up front; a streamed one accumulated it while reading.
+    let hash_before = mapped_hash.or_else(|| match &substitution.source {
+        Source::Windows(refill) => refill.digest(),
+        Source::Whole(_) => None,
+    });
     let summary = Summary {
         path: name,
         replacements: produced.replacements,
@@ -1185,6 +1368,222 @@ mod tests {
         let (outcome, printed) = run_with(&argv);
         outcome.expect("the edit applies");
         printed
+    }
+
+    /// Test helper: replace through a window of `capacity` bytes, as a pipe would.
+    fn replace_windowed(
+        data: &[u8],
+        pattern: &[u8],
+        replacement: &[u8],
+        limit: usize,
+        capacity: usize,
+    ) -> (Vec<u8>, usize) {
+        replace_windowed_folding(data, pattern, replacement, false, limit, capacity)
+    }
+
+    /// The same, with folding, which widens what a window has to see past what it emits.
+    fn replace_windowed_folding(
+        data: &[u8],
+        pattern: &[u8],
+        replacement: &[u8],
+        ignore_case: bool,
+        limit: usize,
+        capacity: usize,
+    ) -> (Vec<u8>, usize) {
+        let mut refill = Refill::new(data, capacity);
+        let mut written = Vec::new();
+        let (count, bytes) = replace_stream(
+            &mut refill,
+            pattern,
+            replacement,
+            ignore_case,
+            limit,
+            &mut written,
+        )
+        .unwrap();
+        assert_eq!(bytes, data.len(), "the stream read every byte");
+        (written, count)
+    }
+
+    #[test]
+    fn reads_a_pipe_whole_only_when_it_must() {
+        // The model, stated as a table: a run holds an unbounded input only when it must
+        // know something about the whole of it before writing *and* cannot take the write
+        // back. Read here off the same predicates `run` computes.
+        let holds = |flags: &[&str]| {
+            let mut argv = vec!["sz-replace", "old", "new"];
+            argv.extend_from_slice(flags);
+            let args = Args::try_parse_from(argv).expect("flags must parse");
+            let reports = args.summary || args.dry_run || args.format == Format::Json;
+            let needs = args.occurrences == Occurrences::One
+                || args.match_kind == Match::LineHash
+                || args.expect_hash.is_some();
+            let retracts = args.in_place
+                || args.dry_run
+                || args.quiet
+                || args.output.as_deref().is_some_and(|path| path != "-");
+            let _ = reports;
+            needs && !retracts
+        };
+
+        // Nothing about the whole input is needed.
+        assert!(!holds(&[]));
+        // A hash of what was read is accumulated as it arrives, so reporting one is free.
+        assert!(!holds(&["--summary"]));
+        // These cannot be answered without the whole input, and stdout cannot be retracted.
+        assert!(holds(&["--occurrences", "one"]));
+        assert!(holds(&["--expect-hash", "0123456789abcdef"]));
+        // Folding does not hold the input: how far a match can run follows from what the
+        // pattern folds to.
+        assert!(!holds(&["--ignore-case"]));
+        // The same questions become answerable once the destination can be discarded.
+        assert!(!holds(&["--occurrences", "one", "--output", "o.txt"]));
+        assert!(!holds(&["--occurrences", "one", "--dry-run"]));
+    }
+
+    #[test]
+    fn reports_the_same_hash_streamed_as_mapped() {
+        // A streamed run accumulates the hash of its input while reading it, so the token it
+        // reports is the token the mapped run would have reported.
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("notes.txt");
+        fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+        let (outcome, printed) = run_with(&["beta", "BETA", path.to_str().unwrap(), "--summary"]);
+        outcome.unwrap();
+        let text = String::from_utf8(printed).unwrap();
+        assert!(
+            text.contains(&format!("{:016x}", content_hash(b"alpha\nBETA\n"))),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn streams_a_match_that_straddles_a_window_seam() {
+        // The property the carry exists for. At capacity 2 a three-byte pattern cannot fit
+        // in one window at all, so every match crosses a seam.
+        for capacity in 1..=12 {
+            let (written, count) =
+                replace_windowed(b"xxabcxxabc", b"abc", b"<>", usize::MAX, capacity);
+            assert_eq!(written, b"xx<>xx<>", "capacity {capacity}");
+            assert_eq!(count, 2, "capacity {capacity}");
+        }
+    }
+
+    #[test]
+    fn streams_the_same_bytes_the_whole_buffer_writes() {
+        // Exhaustive over short inputs and patterns rather than sampled: a seam bug shows up
+        // only when a match happens to sit on one, and which offsets those are depends on
+        // the window size.
+        let corpus: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"aaaa",
+            b"abab",
+            b"ababab",
+            b"xxabcxxabcxx",
+            b"aaa
+aaa
+",
+            b"the quick brown fox",
+            b"abcabcabcabc",
+        ];
+        for data in corpus {
+            for pattern in [&b"a"[..], b"ab", b"abc", b"aaa", b"zzz"] {
+                let (expected, wanted) = replace_all(data, pattern, b"<>", false);
+                for capacity in 1..=16 {
+                    let (written, count) =
+                        replace_windowed(data, pattern, b"<>", usize::MAX, capacity);
+                    assert_eq!(
+                        written, expected,
+                        "{data:?} / {pattern:?} at capacity {capacity}"
+                    );
+                    assert_eq!(count, wanted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounds_a_folded_match_by_what_the_pattern_folds_to() {
+        // A match spans at most four times the folded pattern: every character is at most
+        // four UTF-8 bytes and folds to at least one. Checked against the widest real
+        // expansions rather than only against the arithmetic.
+        assert_eq!(longest_match(b"abc", false), 3);
+        for (pattern, haystack) in [
+            (&b"ss"[..], "ẞ".as_bytes()),
+            (&b"fi"[..], "ﬁ".as_bytes()),
+            (&b"ffi"[..], "ﬃ".as_bytes()),
+            (&b"i"[..], "İ".as_bytes()),
+            (&b"k"[..], "\u{212a}".as_bytes()),
+        ] {
+            assert!(
+                haystack.len() <= longest_match(pattern, true),
+                "{:?} matched {} bytes, past the bound of {}",
+                String::from_utf8_lossy(pattern),
+                haystack.len(),
+                longest_match(pattern, true)
+            );
+        }
+    }
+
+    #[test]
+    fn streams_a_folded_match_that_straddles_a_window_seam() {
+        // The case that used to hold the whole input: a match wider than its pattern, cut in
+        // half by a window boundary.
+        let data = "xxẞxxﬃx".as_bytes();
+        let (expected, wanted) = replace_all(data, b"ss", b"<>", true);
+        for capacity in 1..=20 {
+            let (written, count) =
+                replace_windowed_folding(data, b"ss", b"<>", true, usize::MAX, capacity);
+            assert_eq!(written, expected, "capacity {capacity}");
+            assert_eq!(count, wanted, "capacity {capacity}");
+        }
+    }
+
+    #[test]
+    fn streams_folded_matches_the_same_as_the_whole_buffer() {
+        let corpus: &[&str] = &[
+            "",
+            "ẞ",
+            "xẞx",
+            "ssẞss",
+            "ẞẞẞ",
+            "aﬃb",
+            "İİ",
+            "straße Straße STRASSE",
+        ];
+        for data in corpus {
+            for pattern in [&b"ss"[..], b"i", b"fi", b"strasse"] {
+                let (expected, wanted) = replace_all(data.as_bytes(), pattern, b"<>", true);
+                for capacity in 1..=24 {
+                    let (written, count) = replace_windowed_folding(
+                        data.as_bytes(),
+                        pattern,
+                        b"<>",
+                        true,
+                        usize::MAX,
+                        capacity,
+                    );
+                    assert_eq!(
+                        written,
+                        expected,
+                        "{data:?} / {:?} at capacity {capacity}",
+                        String::from_utf8_lossy(pattern)
+                    );
+                    assert_eq!(count, wanted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stops_a_streamed_run_at_the_limit_it_was_given() {
+        for capacity in 1..=8 {
+            let (written, count) = replace_windowed(b"aXaXaX", b"a", b"<>", 1, capacity);
+            assert_eq!(written, b"<>XaXaX", "capacity {capacity}");
+            assert_eq!(count, 1);
+        }
     }
 
     #[test]

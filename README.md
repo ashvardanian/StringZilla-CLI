@@ -608,9 +608,9 @@ Or, for a program reading the output, one record per file and one per line:
 
 ```bash
 $ sz-find --fields line-hashes,file-hash --format json TODO parser.c
-{"type":"begin","data":{"path":{"text":"parser.c"},"file_hash":"54cb6b8cbdf213ac"}}
+{"type":"begin","data":{"path":{"text":"parser.c"}}}
 {"type":"match","data":{"path":{"text":"parser.c"},"lines":{"text":"    // TODO: handle EOF"},"line_number":2,"absolute_offset":31,"line_hash":"5npdz5bs","submatches":[{"match":{"text":"TODO"},"start":7,"end":11}]}}
-{"type":"end","data":{"path":{"text":"parser.c"},"stats":{"matches":1,"lines_searched":4}}}
+{"type":"end","data":{"path":{"text":"parser.c"},"file_hash":"54cb6b8cbdf213ac","stats":{"matches":1,"lines_searched":4}}}
 ```
 
 __The edit names both.__
@@ -654,7 +654,7 @@ Exit code 3 is distinct from 1 (ran, found nothing) and 2 (could not run), becau
 
 The loop, for a program driving it:
 
-1. `sz-find --fields line-hashes,file-hash --format json <pattern> <file>` — read `file_hash` off the `begin` record and `line_hash` off each `match`.
+1. `sz-find --fields line-hashes,file-hash --format json <pattern> <file>` — read `line_hash` off each `match`, and `file_hash` off the `end` record, which is written once the whole file has been read.
 2. `sz-replace --in-place --expect-hash <file_hash> --match line-hash --occurrences one <line_hash> <new text> --format json <file>`.
 3. Take `hash_after` from the summary record and pass it as the next `--expect-hash`. Repeat from 2.
 4. On exit 3, go back to 1. Nothing was written.
