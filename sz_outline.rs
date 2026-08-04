@@ -1128,8 +1128,8 @@ fn reject(message: impl std::fmt::Display) -> clap::Error {
 
 /// Every constraint that depends on an argument's *value*, which clap cannot declare.
 fn validate(args: &Args) -> Result<(), clap::Error> {
-    let name = args.input.as_deref().unwrap_or("-");
-    if args.language.or_else(|| detect_language(name)).is_none() {
+    let path = args.input.as_deref().unwrap_or("-");
+    if args.language.or_else(|| detect_language(path)).is_none() {
         // A path that is not there has no extension to have failed to recognise, and
         // `--language` would not help. Say which of the two went wrong.
         if let Some(input) = args.input.as_deref() {
@@ -1138,7 +1138,7 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
             }
         }
         return Err(reject(format!(
-            "cannot outline `{name}`: no language matches its name, so pass --language (md, c, h)"
+            "cannot outline `{path}`: no language matches its name, so pass --language (md, c, h)"
         )));
     }
     Ok(())
@@ -1153,14 +1153,14 @@ fn main() -> std::process::ExitCode {
 fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
-    let name = args.input.as_deref().unwrap_or("-");
+    let path = args.input.as_deref().unwrap_or("-");
     let language = args
         .language
-        .or_else(|| detect_language(name))
+        .or_else(|| detect_language(path))
         .expect("validated");
 
     // The mmap is borrowed, not copied.
-    let input = get_input(Some(name)).at(name)?;
+    let input = get_input(Some(path)).at(path)?;
     let newlines = Newlines::from_utf8(args.utf8);
     let elements = match language {
         Language::Md => parse_markdown(input.as_bytes(), newlines),

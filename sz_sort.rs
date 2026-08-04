@@ -148,7 +148,7 @@ struct OutputConfig<'a> {
     /// Drop lines equal to the one before them, which sorting made adjacent.
     unique: bool,
     terminator: Terminator,
-    /// Input name carried into the JSON envelope.
+    /// The input's path, carried into the JSON envelope.
     path: &'a str,
 }
 
@@ -325,8 +325,8 @@ fn main() -> std::process::ExitCode {
 fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
-    let name = args.input.as_deref().unwrap_or("-");
-    let input = get_input(args.input.as_deref()).at(name)?;
+    let path = args.input.as_deref().unwrap_or("-");
+    let input = get_input(args.input.as_deref()).at(path)?;
     let data = input.as_bytes();
 
     let order = SortOrder {
@@ -337,14 +337,14 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     let newlines = Newlines::from_utf8(args.utf8 || args.ignore_case);
     let lines = collect_lines(data, newlines)
         .map_err(|error| io::Error::other(format!("indexing lines: {:?}", error)))
-        .at(name)?;
+        .at(path)?;
 
     if args.check {
         return Ok(match check_sorted(&lines, order) {
             None => Status::Success,
             Some(line_number) => {
                 if !args.quiet {
-                    eprintln!("sz-sort: {}:{}: disorder", name, line_number);
+                    eprintln!("sz-sort: {}:{}: disorder", path, line_number);
                 }
                 Status::NoResult
             }
@@ -353,16 +353,16 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
 
     let permutation = sorted_order(&lines, order)
         .map_err(|status| io::Error::other(format!("sorting: {:?}", status)))
-        .at(name)?;
+        .at(path)?;
     let config = OutputConfig {
         format: args.format,
         unique: args.unique,
         terminator: Terminator::from_null(args.null),
-        path: name,
+        path,
     };
 
     let emitted = if args.dry_run || args.quiet {
-        write_sorted(&lines, &permutation, order, &config, &mut io::sink()).at(name)?
+        write_sorted(&lines, &permutation, order, &config, &mut io::sink()).at(path)?
     } else if args.in_place {
         let path = args.input.as_deref().expect("validated");
         write_replacing("sz-sort", path, |output| {
@@ -383,7 +383,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     if args.format == Format::Json {
         // The record stream went to a sink, so its closing summary still owes stdout.
         if args.dry_run {
-            write_summary_json(output, name, lines.len(), emitted).at("-")?;
+            write_summary_json(output, path, lines.len(), emitted).at("-")?;
         }
     } else if args.summary || args.dry_run {
         // Prose about the run, so it goes to `notes`: `sz-sort --summary f > sorted.txt`

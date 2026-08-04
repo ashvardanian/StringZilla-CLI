@@ -230,7 +230,7 @@ struct OutputConfig<'a> {
     terminator: Terminator,
     /// Separates fields within one record; unused under `--format json`, which nests them.
     output_delimiter: &'a [u8],
-    /// Input name carried into the JSON envelope.
+    /// The input's path, carried into the JSON envelope.
     path: &'a str,
 }
 
@@ -340,8 +340,8 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let column_indices = parse_columns(&args.columns)
         .map_err(|message| Args::command().error(ErrorKind::ValueValidation, message))?;
 
-    let name = args.input.as_deref().unwrap_or("-");
-    let input = get_input_streaming(args.input.as_deref()).at(name)?;
+    let path = args.input.as_deref().unwrap_or("-");
+    let input = get_input_streaming(args.input.as_deref()).at(path)?;
 
     let delimiter = args.delimiter.as_bytes();
     let output_delimiter = args
@@ -356,7 +356,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         json: args.format == Format::Json,
         terminator: Terminator::from_null(args.null),
         output_delimiter,
-        path: name,
+        path,
     };
 
     // A quiet run still extracts, so the record count that answers it stays honest.

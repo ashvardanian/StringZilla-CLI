@@ -566,12 +566,12 @@ fn segment_input(
     } else {
         get_input(path)?
     };
-    let name = path.unwrap_or("-");
+    let shown = path.unwrap_or("-");
 
     // Escape the path once per file, never per segment.
     let mut path_json = Vec::new();
     if config.render == Render::Json {
-        json_text_field_to(&mut path_json, name.as_bytes())?;
+        json_text_field_to(&mut path_json, shown.as_bytes())?;
     }
 
     let records = match input.into_window(DEFAULT_WINDOW_BYTES) {

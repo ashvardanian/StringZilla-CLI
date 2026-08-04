@@ -288,7 +288,7 @@ enum Rendering {
 #[derive(Clone, Copy)]
 struct OutputConfig<'a> {
     rendering: Rendering,
-    /// Input name carried into the JSON envelope.
+    /// The input's path, carried into the JSON envelope.
     path: &'a str,
 }
 
@@ -451,18 +451,17 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
 
     // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
     let utf8_mode = args.utf8 || args.ignore_case;
-    let name = args.input.as_deref().unwrap_or("-");
+    let path = args.input.as_deref().unwrap_or("-");
 
-    let input = get_input(args.input.as_deref()).at(name)?;
+    let input = get_input(args.input.as_deref()).at(path)?;
     let data = input.as_bytes();
 
     // In-place is opt-in: the default writes to stdout like every other binary,
     // so `sz-dedup file | head` cannot destroy the input.
     let counts = if args.in_place {
-        let path = args.input.as_deref().expect("validated");
         let config = OutputConfig {
             rendering: Rendering::Verbatim,
-            path: name,
+            path,
         };
         write_replacing("sz-dedup", path, |output| {
             dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
@@ -470,22 +469,22 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     } else if args.dry_run || args.quiet {
         let config = OutputConfig {
             rendering: Rendering::Terminated(Terminator::from_null(args.null)),
-            path: name,
+            path,
         };
-        dedup_to_writer(data, &mut io::sink(), args.ignore_case, utf8_mode, &config).at(name)?
+        dedup_to_writer(data, &mut io::sink(), args.ignore_case, utf8_mode, &config).at(path)?
     } else {
         let config = OutputConfig {
             rendering: match args.format {
                 Format::Json => Rendering::Json,
                 Format::Text => Rendering::Terminated(Terminator::from_null(args.null)),
             },
-            path: name,
+            path,
         };
         // Through a temporary like `--in-place`, so an interrupted run leaves the previous
         // file rather than a half-written one, and naming the input as the output does not
         // truncate the mapping this run is still reading from.
         match args.output.as_deref().filter(|path| *path != "-") {
-            Some(path) => write_creating("sz-dedup", path, |output| {
+            Some(destination) => write_creating("sz-dedup", destination, |output| {
                 dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
             })?,
             None => dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config).at("-")?,
@@ -495,7 +494,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     if args.format == Format::Json {
         // A run with no record stream still owes its one summary record.
         if args.in_place || args.dry_run {
-            write_summary_json(output, name, counts).at("-")?;
+            write_summary_json(output, path, counts).at("-")?;
         }
     } else if args.summary || args.dry_run {
         // Prose about the run, so it goes to `notes`: `sz-dedup --summary f > unique.txt`

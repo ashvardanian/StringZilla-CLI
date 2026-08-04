@@ -7,9 +7,9 @@ This utility is written in Rust, leveraging StringZilla for both pipe and file-b
 Install it straight from the GitHub repository:
 
 ```bash
-cargo install --git https://github.com/ashvardanian/StringZilla-CLI --tag v0.1.0 # pinned release
-cargo install --git https://github.com/ashvardanian/StringZilla-CLI              # or the tip of main
-cargo install --path . --force                                                   # or a local clone
+cargo install --git https://github.com/ashvardanian/StringZilla-CLI --tag v0.1.0 --locked # pinned release
+cargo install --git https://github.com/ashvardanian/StringZilla-CLI --locked              # or the tip of main
+cargo install --path . --force --locked                                                   # or a local clone
 ```
 
 It provides the following subcommands:
@@ -110,7 +110,7 @@ The difference matters for legal documents, German/Swiss news, Turkish text, or 
 
 The `wc` utility on Linux counts lines, words, and bytes.
 A word is a maximal run of non-whitespace, exactly as in `wc -w`; `sz-count` uses the same rule, so it is a drop-in replacement rather than a different measurement.
-Output is a labelled, aligned table; pass `--fields chars` to also count Unicode code points, or `--format human` for human-readable suffixes.
+Output is a labelled, aligned table; `--fields` chooses the columns outright rather than adding to them, so counting code points alongside the defaults is `--fields lines,words,bytes,chars`. Pass `--format human` for human-readable suffixes.
 
 The comparison worth making is in a __UTF-8 locale__, because that is the only configuration computing the same thing.
 BSD `wc` never counts code points at all, and GNU `wc` pays for them:
@@ -468,31 +468,34 @@ __Default__ — names only:
 ```bash
 $ sz-outline README.md
 # StringZilla 🦖 Command-Line Interface
-## Installation
-## `sz-find`: Unicode Aware Substring Search
-## `sz-count`: Word Count
-## `sz-split`: Split File into Smaller Ones
+## Tools
+### `sz-find`: Unicode Aware Substring Search
+### `sz-count`: Word Count
+### `sz-replace`: Substring Replacement
+...
 ```
 
 __`--detail positions`__ — line numbers and byte offsets:
 
 ```bash
 $ sz-outline --detail positions README.md
-# StringZilla 🦖 Command-Line Interface       [L1, @0]
-## Installation                              [L26, @1689]
-## `sz-find`: Unicode Aware Substring Search [L33, @1907]
-## `sz-count`: Word Count                    [L98, @5474]
+# StringZilla 🦖 Command-Line Interface           [L1, @0]
+## Tools                                         [L62, @4151]
+### `sz-find`: Unicode Aware Substring Search    [L64, @4161]
+### `sz-count`: Word Count                       [L109, @7488]
+...
 ```
 
 __`--detail blocks`__ — child blocks too, with their sizes:
 
 ```bash
 $ sz-outline --detail blocks README.md
-# StringZilla 🦖 Command-Line Interface       [L1, @0, 41B]
-  - image: StringZilla CLI banner            [L3, 125B]
-  - paragraph                                [L5-7, 436B]
-  - code (bash)                              [L9-11, 79B]
-  - paragraph                                [L13, 39B]
+# StringZilla 🦖 Command-Line Interface           [L1, @0, 41B]
+  - image: StringZilla CLI banner                [L3, 125B]
+  - paragraph                                    [L5-7, 436B]
+  - code (bash)                                  [L9-13, 338B]
+  - paragraph                                    [L15, 39B]
+...
 ```
 
 For C source files, `sz-outline` extracts includes and function signatures:
@@ -651,7 +654,8 @@ $ echo $?
 3
 ```
 
-Exit code 3 is distinct from 1 (ran, found nothing) and 2 (could not run), because the recovery differs: look at the file again, rather than fix the arguments.
+Exit code 3 is distinct from 1 (ran, found nothing) and 2 (could not run), because the recovery is to look at the file again rather than to fix the arguments.
+Which look depends on the message: a spent file token or a name that resolves nowhere means re-reading, while a name that resolves in several places means asking `sz-find` for a longer one with `--hash-width`.
 
 The loop, for a program driving it:
 
@@ -673,7 +677,7 @@ A file token is simply a name at the full 13 characters; anything shorter is a l
 Each character pins five bits, so eight characters is forty.
 
 A name covers the line's terminator as well as its text.
-That is what makes it mean the same thing whether a file is read as LF or CRLF, and it is why every line operation falls out of one replacement argument:
+That is what makes a CRLF line name the same under `--utf8` as under the default LF reading, and it is why every line operation falls out of one replacement argument:
 
 ```bash
 $ sz-replace --match line-hash bbcvyaqk '    return 1;' parser.c   # rewrite
@@ -682,6 +686,7 @@ $ sz-replace --match line-hash bbcvyaqk $'\n' parser.c             # blank, keep
 ```
 
 The cost of covering the terminator is that adding a final newline renames the last line of a file.
+The two newline sets still disagree about where a line *begins* at VT, FF, NEL, LS and PS, which no naming scheme can reconcile: pass `--utf8` to both the read and the edit, or to neither, or a name issued under one will refuse under the other.
 
 The hash is StringZilla's 64-bit AES hash under seed zero, identical across platforms.
 It answers "did this file change", not "did somebody change it" — it is fast, not cryptographic.

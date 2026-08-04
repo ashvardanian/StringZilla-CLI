@@ -920,7 +920,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     };
     let opened = inputs
         .iter()
-        .map(|name| (name.as_str(), get_input(Some(name))));
+        .map(|path| (path.as_str(), get_input(Some(path))));
     let outcome = search_inputs(
         writer,
         notes,
@@ -983,12 +983,12 @@ fn search_inputs<'a>(
 ) -> io::Result<Outcome> {
     let mut outcome = Outcome::default();
     let mut seen = 0;
-    for (name, input) in inputs {
+    for (path, input) in inputs {
         seen += 1;
         let input = match input {
             Ok(input) => input,
             Err(error) => {
-                eprintln!("sz-fuzzy-find: {}: {}", name, error);
+                eprintln!("sz-fuzzy-find: {}: {}", path, error);
                 continue;
             }
         };
@@ -1003,11 +1003,11 @@ fn search_inputs<'a>(
             }
             count += 1;
             if !out_cfg.count {
-                write_match(output, out_cfg, name, index + 1, line)?;
+                write_match(output, out_cfg, path, index + 1, line)?;
             }
         }
         if out_cfg.count {
-            write_count(output, out_cfg, name, count)?;
+            write_count(output, out_cfg, path, count)?;
         }
         outcome.total += count;
     }
@@ -1045,17 +1045,17 @@ fn write_summary(
 fn write_count(
     output: &mut dyn Write,
     cfg: &OutputConfig,
-    name: &str,
+    path: &str,
     count: usize,
 ) -> io::Result<()> {
     if cfg.json {
         output.write_all(br#"{"type":"count","data":{"path":"#)?;
-        json_text_field_to(output, name.as_bytes())?;
+        json_text_field_to(output, path.as_bytes())?;
         write!(output, r#","count":{}}}}}"#, count)?;
         return output.write_all(b"\n");
     }
     if cfg.prefix {
-        write!(output, "{}:", name)?;
+        write!(output, "{}:", path)?;
     }
     write!(output, "{}", count)?;
     output.write_all(&[cfg.terminator.as_byte()])
@@ -1064,21 +1064,21 @@ fn write_count(
 fn write_match(
     output: &mut dyn Write,
     cfg: &OutputConfig,
-    name: &str,
+    path: &str,
     line_no: usize,
     line: &[u8],
 ) -> io::Result<()> {
     if cfg.json {
         // Ripgrep's schema, minus `submatches`: fuzzy matching has no exact span.
         output.write_all(br#"{"type":"match","data":{"path":"#)?;
-        json_text_field_to(output, name.as_bytes())?;
+        json_text_field_to(output, path.as_bytes())?;
         output.write_all(br#","lines":"#)?;
         json_text_field_to(output, line)?;
         write!(output, r#","line_number":{},"submatches":[]}}}}"#, line_no)?;
         return output.write_all(b"\n");
     }
     if cfg.prefix {
-        write!(output, "{}:", name)?;
+        write!(output, "{}:", path)?;
     }
     if cfg.line_numbers {
         write!(output, "{}:", line_no)?;

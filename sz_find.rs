@@ -232,9 +232,9 @@ enum Show {
     Matches,
     /// One count per input
     Count,
-    /// The name of every input that matched
+    /// The path of every input that matched
     Files,
-    /// The name of every input that did not match
+    /// The path of every input that did not match
     FilesWithout,
 }
 
@@ -406,7 +406,7 @@ impl std::str::FromStr for ColorChoice {
 /// ANSI color codes
 #[derive(Clone, Copy)]
 struct Colors {
-    name: &'static str,
+    path: &'static str,
     line_number: &'static str,
     column: &'static str,
     byte_offset: &'static str,
@@ -419,7 +419,7 @@ struct Colors {
 impl Colors {
     fn enabled() -> Self {
         Self {
-            name: "\x1b[1;35m",            // Bold Magenta
+            path: "\x1b[1;35m",            // Bold Magenta
             line_number: "\x1b[32m",       // Green
             column: "\x1b[32m",            // Green (same as line number)
             byte_offset: "\x1b[36m",       // Cyan
@@ -432,7 +432,7 @@ impl Colors {
 
     fn disabled() -> Self {
         Self {
-            name: "",
+            path: "",
             line_number: "",
             column: "",
             byte_offset: "",
@@ -454,12 +454,12 @@ enum OutputFormat {
 }
 
 /// Everything the line emitters read, resolved once from the flags.
-/// Only the printing paths hold one; [`SearchPath::Tally`] has no emitter.
+/// Only the printing paths hold one; [`Reporting::Tally`] has no emitter.
 #[derive(Clone, Copy)]
 struct OutputConfig {
     output_format: OutputFormat,
     colors: Colors,
-    show_name: bool,
+    show_path: bool,
     line_numbers: bool,
     column_numbers: bool,
     byte_offset: bool,
@@ -519,7 +519,7 @@ impl OutputConfig {
         Self {
             output_format,
             colors,
-            show_name: multiple_inputs && output_format != OutputFormat::Heading,
+            show_path: multiple_inputs && output_format != OutputFormat::Heading,
             // Vimgrep implies line numbers and columns.
             line_numbers: carries(Field::LineNumbers) || output_format == OutputFormat::Vimgrep,
             column_numbers: carries(Field::ColumnNumbers) || output_format == OutputFormat::Vimgrep,
@@ -758,7 +758,7 @@ impl Matcher<'_> {
     }
 }
 
-/// What every search path reads: the needle, the line split, and the selection rules.
+/// What every search reporting reads: the needle, the line split, and the selection rules.
 struct Search<'a> {
     matcher: Matcher<'a>,
     newlines: Newlines,
@@ -787,7 +787,7 @@ struct Context {
 }
 
 impl Context {
-    /// No surrounding lines, which is what every path but `PrintContext` carries.
+    /// No surrounding lines, which is what every reporting but `PrintContext` carries.
     #[inline]
     fn none() -> Self {
         Context {
@@ -803,7 +803,7 @@ impl Context {
 /// `--invert-match` and `--match word` all change what an emitter writes, not what
 /// the loop holds.
 #[derive(Clone, Copy)]
-enum SearchPath {
+enum Reporting {
     /// Two counters. Serves `--quiet` and the three record kinds that name no line.
     Tally { stop_at_first: bool },
     /// Counters plus a heading bit. Serves every format without context lines.
@@ -812,8 +812,8 @@ enum SearchPath {
     PrintContext(OutputConfig, Context),
 }
 
-impl SearchPath {
-    /// Pick the path: existence only, plain printing, or printing with context.
+impl Reporting {
+    /// Pick the reporting: existence only, plain printing, or printing with context.
     fn choose(
         args: &Args,
         show: Show,
@@ -823,7 +823,7 @@ impl SearchPath {
     ) -> Self {
         // `--show count` must see every line. Existence answers need only one hit — except
         // under `--summary`, whose totals would otherwise describe a prefix of the file.
-        let tally = |stop_at_first: bool| SearchPath::Tally {
+        let tally = |stop_at_first: bool| Reporting::Tally {
             stop_at_first: stop_at_first && !args.summary,
         };
         if args.quiet {
@@ -835,29 +835,29 @@ impl SearchPath {
             Show::Lines | Show::Matches => {
                 let config = OutputConfig::new(args, show, multiple_inputs, is_terminal);
                 if context.before == 0 && context.after == 0 {
-                    SearchPath::Print(config)
+                    Reporting::Print(config)
                 } else {
-                    SearchPath::PrintContext(config, context)
+                    Reporting::PrintContext(config, context)
                 }
             }
         }
     }
 
-    /// The emitter this path prints through, absent for the tally.
+    /// The emitter this reporting prints through, absent for the tally.
     #[inline]
     fn config(&self) -> Option<&OutputConfig> {
         match self {
-            SearchPath::Tally { .. } => None,
-            SearchPath::Print(config) | SearchPath::PrintContext(config, _) => Some(config),
+            Reporting::Tally { .. } => None,
+            Reporting::Print(config) | Reporting::PrintContext(config, _) => Some(config),
         }
     }
 
-    /// The surrounding lines this path prints, none for the two that print none.
+    /// The surrounding lines this reporting prints, none for the two that print none.
     #[inline]
     fn context(&self) -> Context {
         match self {
-            SearchPath::PrintContext(_, context) => *context,
-            SearchPath::Tally { .. } | SearchPath::Print(_) => Context::none(),
+            Reporting::PrintContext(_, context) => *context,
+            Reporting::Tally { .. } | Reporting::Print(_) => Context::none(),
         }
     }
 }
@@ -887,7 +887,7 @@ struct ContextLine {
 struct ContextState {
     lines: Context,
     /// Window offsets rather than copies, and `lines.before` entries is the exact ceiling.
-    /// Empty under `--after-context` alone, which is what lets that path stream.
+    /// Empty under `--after-context` alone, which is what lets that reporting stream.
     behind: VecDeque<ContextLine>,
     pending_after: usize,
     last_printed_line: Option<usize>,
@@ -920,7 +920,7 @@ impl ContextState {
     }
 }
 
-/// What a search path remembers between lines, and between windows once the input
+/// What a search reporting remembers between lines, and between windows once the input
 /// streams: the counters, the once-per-file heading bit and the context ring.
 struct FindState {
     match_count: usize,
@@ -951,7 +951,7 @@ impl FindState {
         }
     }
 
-    /// Whether `--max-matches` is already satisfied, where every path stops reporting.
+    /// Whether `--max-matches` is already satisfied, where every reporting stops reporting.
     #[inline]
     fn exhausted(&self, search: &Search) -> bool {
         search
@@ -972,55 +972,64 @@ impl FindState {
 /// Search one whole slice, which is the shape a mapped or buffered input already has.
 fn search_data(
     data: &[u8],
-    name: &str,
+    path: &str,
     search: &Search,
-    path: &SearchPath,
+    reporting: &Reporting,
     output: &mut dyn Write,
     max_reached: &mut bool,
 ) -> io::Result<FileResult> {
     if search.multiline {
-        return search_multiline(data, name, search, path, output, max_reached);
+        return search_multiline(data, path, search, reporting, output, max_reached);
     }
-    let mut state = FindState::new(path.context());
-    let file_hash = path
+    let mut state = FindState::new(reporting.context());
+    let file_hash = reporting
         .config()
         .filter(|config| config.file_hash)
         .map(|_| content_hash(data));
     // Only the heading prints it inline; JSON carries it on the closing record.
     state.file_hash = file_hash.filter(|_| {
-        path.config()
+        reporting
+            .config()
             .is_some_and(|config| config.output_format == OutputFormat::Heading)
     });
     // One window spans the whole input, so there is nothing left to stop for.
-    let _ = search_window(data, name, search, path, &mut state, output, max_reached)?;
-    print_json_end(output, name, path, &state, file_hash)?;
+    let _ = search_window(
+        data,
+        path,
+        search,
+        reporting,
+        &mut state,
+        output,
+        max_reached,
+    )?;
+    print_json_end(output, path, reporting, &state, file_hash)?;
     Ok(state.result(data.len()))
 }
 
-/// Run one window through the chosen path, folding its lines into `state`.
-/// Breaks once the path has reported everything it will, which ends a streamed read.
+/// Run one window through the chosen reporting, folding its lines into `state`.
+/// Breaks once the reporting has reported everything it will, which ends a streamed read.
 fn search_window(
     window: &[u8],
-    name: &str,
+    path: &str,
     search: &Search,
-    path: &SearchPath,
+    reporting: &Reporting,
     state: &mut FindState,
     output: &mut dyn Write,
     max_reached: &mut bool,
 ) -> io::Result<ControlFlow<()>> {
-    match path {
-        SearchPath::Tally { stop_at_first } => Ok(tally_window(
+    match reporting {
+        Reporting::Tally { stop_at_first } => Ok(tally_window(
             window,
             search,
             *stop_at_first,
             state,
             max_reached,
         )),
-        SearchPath::Print(config) => {
-            print_window(window, name, search, config, state, output, max_reached)
+        Reporting::Print(config) => {
+            print_window(window, path, search, config, state, output, max_reached)
         }
-        SearchPath::PrintContext(config, _) => {
-            print_context_window(window, name, search, config, state, output, max_reached)
+        Reporting::PrintContext(config, _) => {
+            print_context_window(window, path, search, config, state, output, max_reached)
         }
     }
 }
@@ -1057,7 +1066,7 @@ fn tally_window(
 /// Print matching lines, carrying counters and the once-per-file heading bit.
 fn print_window(
     window: &[u8],
-    name: &str,
+    path: &str,
     search: &Search,
     config: &OutputConfig,
     state: &mut FindState,
@@ -1066,13 +1075,13 @@ fn print_window(
 ) -> io::Result<ControlFlow<()>> {
     let mut emitter = Emitter {
         output,
-        name,
+        path,
         search,
         config,
         file_hash: state.file_hash,
     };
     for named in named_lines(window, search.newlines) {
-        let line = named.line;
+        let line = named.as_cut;
         // Counted before the limit is tested, so `--summary` includes the line that trips the cap.
         state.lines_searched += 1;
         if state.exhausted(search) {
@@ -1086,7 +1095,7 @@ fn print_window(
         state.match_count += 1;
 
         let record = LineRecord {
-            line,
+            as_cut: line,
             whole: named.whole,
             line_number: state.lines_searched,
             byte_offset: state.window_base + named.offset,
@@ -1102,7 +1111,7 @@ fn print_window(
 /// of window offsets, the pending after-context count, and separators.
 fn print_context_window(
     window: &[u8],
-    name: &str,
+    path: &str,
     search: &Search,
     config: &OutputConfig,
     state: &mut FindState,
@@ -1111,13 +1120,13 @@ fn print_context_window(
 ) -> io::Result<ControlFlow<()>> {
     let mut emitter = Emitter {
         output,
-        name,
+        path,
         search,
         config,
         file_hash: state.file_hash,
     };
     for named in named_lines(window, search.newlines) {
-        let line = named.line;
+        let line = named.as_cut;
         // Counted before the limit is tested, so `--summary` includes the line that trips the cap.
         state.lines_searched += 1;
         if state.exhausted(search) {
@@ -1153,7 +1162,7 @@ fn print_context_window(
             for buffered in state.context.behind.iter() {
                 if state.context.is_unprinted(buffered.line_number) {
                     emitter.line(LineRecord {
-                        line: &window[buffered.span.start..buffered.span.end],
+                        as_cut: &window[buffered.span.start..buffered.span.end],
                         whole: &window[buffered.span.start..buffered.whole_end],
                         line_number: buffered.line_number,
                         byte_offset: state.window_base + buffered.span.start,
@@ -1165,7 +1174,7 @@ fn print_context_window(
 
             emitter.match_line(
                 LineRecord {
-                    line,
+                    as_cut: line,
                     whole: named.whole,
                     line_number,
                     byte_offset,
@@ -1177,7 +1186,7 @@ fn print_context_window(
             state.context.pending_after = state.context.lines.after;
         } else if state.context.pending_after > 0 {
             emitter.line(LineRecord {
-                line,
+                as_cut: line,
                 whole: named.whole,
                 line_number,
                 byte_offset,
@@ -1230,38 +1239,38 @@ impl LineCursor {
 /// Search using multi-line matching (whole buffer search)
 fn search_multiline(
     data: &[u8],
-    name: &str,
+    path: &str,
     search: &Search,
-    path: &SearchPath,
+    reporting: &Reporting,
     output: &mut dyn Write,
     max_reached: &mut bool,
 ) -> io::Result<FileResult> {
     // The emitter, the tally's early stop and the context width hold for the whole file.
     let stop_at_first = matches!(
-        path,
-        SearchPath::Tally {
+        reporting,
+        Reporting::Tally {
             stop_at_first: true
         }
     );
-    let context = path.context();
+    let context = reporting.context();
     // Groups are divided only where surrounding lines are printed, as in line mode.
     let separates_groups = context.before > 0 || context.after > 0;
-    let file_hash = path
+    let file_hash = reporting
         .config()
         .filter(|config| config.file_hash)
         .map(|_| content_hash(data));
     // Reborrowed rather than moved, so the sink is still reachable for the closing
     // JSON record once every region is printed.
-    let mut emitter = path.config().map(|config| Emitter {
+    let mut emitter = reporting.config().map(|config| Emitter {
         output: &mut *output,
-        name,
+        path,
         search,
         config,
         // Only the heading prints it inline; JSON carries it on the closing record.
         file_hash: file_hash.filter(|_| config.output_format == OutputFormat::Heading),
     });
 
-    // Each region carries its own surrounding lines, so this path keeps no look-behind
+    // Each region carries its own surrounding lines, so this reporting keeps no look-behind
     // ring, and the whole file is one window that counts its lines up front.
     let mut state = FindState::new(Context::none());
     state.lines_searched = data.sz_matches(b"\n").count() + 1;
@@ -1350,7 +1359,7 @@ fn search_multiline(
                 let line_number = line_numbers.line_at(data, actual_start);
                 for (index, named) in named_lines(region, Newlines::Lf).enumerate() {
                     emitter.line(LineRecord {
-                        line: named.line,
+                        as_cut: named.as_cut,
                         whole: named.whole,
                         line_number: line_number + index,
                         byte_offset: actual_start + named.offset,
@@ -1364,7 +1373,7 @@ fn search_multiline(
         }
     }
 
-    print_json_end(output, name, path, &state, file_hash)?;
+    print_json_end(output, path, reporting, &state, file_hash)?;
 
     // `--max-matches` caps this file, and reaching the cap ends the walk over the rest —
     // but only with input still unread, which is where the line paths stop as well.
@@ -1383,21 +1392,21 @@ fn search_multiline(
 ///
 /// `--multiline` searches the whole input backward and `--before-context` reaches back past
 /// the window, so those two keep every byte. `--after-context` alone only reaches forward.
-fn can_stream(search: &Search, path: &SearchPath) -> bool {
+fn can_stream(search: &Search, reporting: &Reporting) -> bool {
     !search.multiline
         // A heading is written on the first match, long before a stream reaches the bytes a
         // file's hash covers. JSON names the file again when it closes it, which a stream
         // does reach, so only the heading has to hold the input.
-        && !path.config().is_some_and(|config| {
+        && !reporting.config().is_some_and(|config| {
             config.file_hash && config.output_format == OutputFormat::Heading
         })
-        && match path {
-            SearchPath::Tally { .. } | SearchPath::Print(_) => true,
-            SearchPath::PrintContext(_, context) => context.before == 0,
+        && match reporting {
+            Reporting::Tally { .. } | Reporting::Print(_) => true,
+            Reporting::PrintContext(_, context) => context.before == 0,
         }
 }
 
-/// Drive the chosen path over a reader, handing it whole-line prefixes of one reused
+/// Drive the chosen reporting over a reader, handing it whole-line prefixes of one reused
 /// window so that a pipe costs bounded memory rather than the input's size.
 ///
 /// A match cannot cross a newline here — the paths search within each line — so cutting
@@ -1405,15 +1414,18 @@ fn can_stream(search: &Search, path: &SearchPath) -> bool {
 /// match does cross, and it never reaches this driver.
 fn search_stream<R: Read>(
     refill: &mut Refill<R>,
-    name: &str,
+    path: &str,
     search: &Search,
-    path: &SearchPath,
+    reporting: &Reporting,
     output: &mut dyn Write,
     max_reached: &mut bool,
 ) -> io::Result<FileResult> {
-    debug_assert!(can_stream(search, path), "this path reads earlier lines");
+    debug_assert!(
+        can_stream(search, reporting),
+        "this reporting reads earlier lines"
+    );
 
-    let mut state = FindState::new(path.context());
+    let mut state = FindState::new(reporting.context());
     // Installed by the caller, before the window it hands over has read anything.
     let hashing = refill.digest().is_some();
     let mut stopped = false;
@@ -1422,8 +1434,16 @@ fn search_stream<R: Read>(
         // needs, since a digest of a prefix looks exactly like a digest of the file — but it
         // stops *searching*, or the totals would count one line per remaining window.
         if !stopped {
-            stopped = search_window(window, name, search, path, &mut state, output, max_reached)?
-                .is_break();
+            stopped = search_window(
+                window,
+                path,
+                search,
+                reporting,
+                &mut state,
+                output,
+                max_reached,
+            )?
+            .is_break();
         }
         // Counted before the flow is honoured, so a stop still reports the window it read.
         state.window_base += window.len();
@@ -1434,7 +1454,7 @@ fn search_stream<R: Read>(
         })
     })?;
 
-    print_json_end(output, name, path, &state, refill.digest())?;
+    print_json_end(output, path, reporting, &state, refill.digest())?;
     // An early stop leaves the rest of the pipe unread, so the total describes what
     // was searched rather than what the writer still holds.
     Ok(state.result(state.window_base))
@@ -1447,9 +1467,10 @@ fn search_stream<R: Read>(
 /// One line as an emitter sees it: its bytes, where it sits, and how it was selected.
 #[derive(Clone, Copy)]
 struct LineRecord<'a> {
-    line: &'a [u8],
-    /// The line and its terminator, which is what names it. Distinct from `line`, which is
-    /// what the record prints and matches against.
+    /// The line as the newline set cut it, which is what the record prints and matches
+    /// against. Same slice, same word as [`NamedLine::as_cut`].
+    as_cut: &'a [u8],
+    /// The line and its terminator, which is what names it.
     whole: &'a [u8],
     line_number: usize,
     byte_offset: usize,
@@ -1461,10 +1482,12 @@ struct LineRecord<'a> {
 /// from, the pattern its matches are resolved against, and the resolved output flags.
 struct Emitter<'a, 'p> {
     output: &'a mut dyn Write,
-    name: &'a str,
+    path: &'a str,
     search: &'a Search<'p>,
     config: &'a OutputConfig,
-    /// The whole file's hash, printed once beside its name rather than on every record.
+    /// The whole file's hash, printed once beside the reporting in a heading rather than on
+    /// every record. Populated only for `OutputFormat::Heading`: JSON puts it on the record
+    /// that closes the file, which is written past this emitter.
     file_hash: Option<u64>,
 }
 
@@ -1474,15 +1497,15 @@ impl Emitter<'_, '_> {
         if *printed {
             return Ok(());
         }
-        let (name, config, file_hash) = (self.name, self.config, self.file_hash);
+        let (path, config, file_hash) = (self.path, self.config, self.file_hash);
         match config.output_format {
             OutputFormat::Heading => {
                 write!(
                     self.output,
                     "{}{}{}",
-                    config.colors.name, name, config.colors.reset
+                    config.colors.path, path, config.colors.reset
                 )?;
-                // Beside the name, which is the only place a whole-file value belongs in a
+                // Beside the path, which is the only place a whole-file value belongs in a
                 // stream of per-line records.
                 if let Some(hash) = file_hash {
                     // Two spaces rather than `:`, which would read as a `file:line` prefix,
@@ -1505,7 +1528,7 @@ impl Emitter<'_, '_> {
             OutputFormat::Json => {
                 self.output
                     .write_all(br#"{"type":"begin","data":{"path":"#)?;
-                json_text_field_to(self.output, name.as_bytes())?;
+                json_text_field_to(self.output, path.as_bytes())?;
                 self.output.write_all(b"}}\n")?;
                 *printed = true;
             }
@@ -1533,23 +1556,23 @@ impl Emitter<'_, '_> {
         let (search, config) = (self.search, self.config);
         let highlighted = config
             .highlight
-            .then(|| highlight_line(record.line, search, config, highlight_buffer))
+            .then(|| highlight_line(record.as_cut, search, config, highlight_buffer))
             .flatten();
         // The colored bytes travel beside the record rather than inside it: the column
         // resolves against the line as it was found, and an escape code spliced in ahead
         // of a match would shift that column by its own length.
-        self.write_line(record, highlighted.unwrap_or(record.line))
+        self.write_line(record, highlighted.unwrap_or(record.as_cut))
     }
 
     /// Print one line with the prefixes its format asks for.
     fn line(&mut self, record: LineRecord) -> io::Result<()> {
-        self.write_line(record, record.line)
+        self.write_line(record, record.as_cut)
     }
 
     /// Print `body` — the line itself, or its highlighted form — behind the prefixes the
-    /// format asks for, resolving every position against `record.line`.
+    /// format asks for, resolving every position against `record.as_cut`.
     fn write_line(&mut self, record: LineRecord, body: &[u8]) -> io::Result<()> {
-        let (name, search, config) = (self.name, self.search, self.config);
+        let (path, search, config) = (self.path, self.search, self.config);
         let locates_matches = record.is_match && config.locates_matches;
 
         match config.output_format {
@@ -1557,16 +1580,16 @@ impl Emitter<'_, '_> {
             OutputFormat::Vimgrep => {
                 // Vimgrep puts every match on its own `file:line:column:text` line.
                 if locates_matches {
-                    for found in search.matcher.matches(record.line) {
+                    for found in search.matcher.matches(record.as_cut) {
                         write!(
                             self.output,
                             "{}:{}:{}:",
-                            name,
+                            path,
                             record.line_number,
-                            found.column(record.line, config.character_units)
+                            found.column(record.as_cut, config.character_units)
                         )?;
                         if config.only_matches {
-                            self.output.write_all(found.text(record.line))?;
+                            self.output.write_all(found.text(record.as_cut))?;
                         } else {
                             self.write_trimmed(body)?;
                         }
@@ -1574,13 +1597,13 @@ impl Emitter<'_, '_> {
                     }
                 } else if record.is_match {
                     // An inverted match holds no position, so the line prints at column one.
-                    write!(self.output, "{}:{}:1:", name, record.line_number)?;
+                    write!(self.output, "{}:{}:1:", path, record.line_number)?;
                     self.write_trimmed(body)?;
                     self.output.write_all(&[config.terminator])?;
                 }
                 Ok(())
             }
-            // `OutputConfig::new` clears `show_name` under `--heading`, where the name is a
+            // `OutputConfig::new` clears `show_path` under `--heading`, where the path is a
             // header rather than a per-line prefix, so both formats print the same line.
             OutputFormat::Standard | OutputFormat::Heading => {
                 self.write_prefix(record)?;
@@ -1593,13 +1616,13 @@ impl Emitter<'_, '_> {
     /// Print one line in JSON Lines format (ripgrep-compatible), writing straight to the
     /// sink so that no record is staged in a `String` first.
     fn json_line(&mut self, record: LineRecord) -> io::Result<()> {
-        let (name, search, config) = (self.name, self.search, self.config);
+        let (path, search, config) = (self.path, self.search, self.config);
         if !record.is_match {
             self.output
                 .write_all(br#"{"type":"context","data":{"path":"#)?;
-            json_text_field_to(self.output, name.as_bytes())?;
+            json_text_field_to(self.output, path.as_bytes())?;
             self.output.write_all(br#","lines":"#)?;
-            json_text_field_to(self.output, record.line)?;
+            json_text_field_to(self.output, record.as_cut)?;
             write!(
                 self.output,
                 r#","line_number":{},"absolute_offset":{}"#,
@@ -1611,9 +1634,9 @@ impl Emitter<'_, '_> {
             // An inverted match holds no position, so it carries no submatches.
             self.output
                 .write_all(br#"{"type":"match","data":{"path":"#)?;
-            json_text_field_to(self.output, name.as_bytes())?;
+            json_text_field_to(self.output, path.as_bytes())?;
             self.output.write_all(br#","lines":"#)?;
-            json_text_field_to(self.output, record.line)?;
+            json_text_field_to(self.output, record.as_cut)?;
             write!(
                 self.output,
                 r#","line_number":{},"absolute_offset":{}"#,
@@ -1625,9 +1648,9 @@ impl Emitter<'_, '_> {
         } else {
             self.output
                 .write_all(br#"{"type":"match","data":{"path":"#)?;
-            json_text_field_to(self.output, name.as_bytes())?;
+            json_text_field_to(self.output, path.as_bytes())?;
             self.output.write_all(br#","lines":"#)?;
-            json_text_field_to(self.output, record.line)?;
+            json_text_field_to(self.output, record.as_cut)?;
             write!(
                 self.output,
                 r#","line_number":{},"absolute_offset":{}"#,
@@ -1636,12 +1659,12 @@ impl Emitter<'_, '_> {
             self.json_line_hash(record.whole)?;
             self.output.write_all(br#","submatches":["#)?;
 
-            for (index, found) in search.matcher.matches(record.line).enumerate() {
+            for (index, found) in search.matcher.matches(record.as_cut).enumerate() {
                 if index > 0 {
                     self.output.write_all(b",")?;
                 }
                 self.output.write_all(br#"{"match":"#)?;
-                json_text_field_to(self.output, found.text(record.line))?;
+                json_text_field_to(self.output, found.text(record.as_cut))?;
                 write!(
                     self.output,
                     r#","start":{},"end":{}}}"#,
@@ -1674,15 +1697,15 @@ impl Emitter<'_, '_> {
     /// named. Repeated for every record `--show matches` emits from one line, so a consumer
     /// counting fields reads the same shape on every row.
     fn write_prefix(&mut self, record: LineRecord) -> io::Result<()> {
-        let (name, search, config) = (self.name, self.search, self.config);
+        let (path, search, config) = (self.path, self.search, self.config);
         let colors = config.colors;
         // A context line is set off by `-` where a matching line uses `:`.
         let separator = if record.is_match { ":" } else { "-" };
-        if config.show_name {
+        if config.show_path {
             write!(
                 self.output,
                 "{}{}{}{}",
-                colors.name, name, colors.reset, separator
+                colors.path, path, colors.reset, separator
             )?;
         }
         if config.line_numbers {
@@ -1695,9 +1718,11 @@ impl Emitter<'_, '_> {
         if config.column_numbers && config.locates_matches && record.is_match {
             let column = search
                 .matcher
-                .matches(record.line)
+                .matches(record.as_cut)
                 .next()
-                .map_or(1, |found| found.column(record.line, config.character_units));
+                .map_or(1, |found| {
+                    found.column(record.as_cut, config.character_units)
+                });
             write!(
                 self.output,
                 "{}{}{}{}",
@@ -1735,7 +1760,7 @@ impl Emitter<'_, '_> {
         if !(config.only_matches && record.is_match && config.locates_matches) {
             return self.write_trimmed(body);
         }
-        for (index, found) in search.matcher.matches(record.line).enumerate() {
+        for (index, found) in search.matcher.matches(record.as_cut).enumerate() {
             if index > 0 {
                 self.output.write_all(&[config.terminator])?;
                 // Every match is its own record, so it carries the whole prefix rather than
@@ -1746,7 +1771,7 @@ impl Emitter<'_, '_> {
                 self.output
                     .write_all(config.colors.match_highlight.as_bytes())?;
             }
-            self.output.write_all(found.text(record.line))?;
+            self.output.write_all(found.text(record.as_cut))?;
             if !config.colors.reset.is_empty() {
                 self.output.write_all(config.colors.reset.as_bytes())?;
             }
@@ -1771,12 +1796,12 @@ impl Emitter<'_, '_> {
     /// Write a whole multi-line region verbatim, which is what `--multiline` prints when
     /// no per-line prefix is asked for.
     fn region(&mut self, region: &[u8]) -> io::Result<()> {
-        let (name, config) = (self.name, self.config);
-        if config.show_name {
+        let (path, config) = (self.path, self.config);
+        if config.show_path {
             write!(
                 self.output,
                 "{}{}{}:",
-                config.colors.name, name, config.colors.reset
+                config.colors.path, path, config.colors.reset
             )?;
         }
         self.output.write_all(region)?;
@@ -1818,19 +1843,19 @@ fn highlight_line<'b>(
 /// Close the JSON Lines record for a file that opened one, once every window is done.
 fn print_json_end(
     output: &mut dyn Write,
-    name: &str,
-    path: &SearchPath,
+    path: &str,
+    reporting: &Reporting,
     state: &FindState,
     file_hash: Option<u64>,
 ) -> io::Result<()> {
-    let Some(config) = path.config() else {
+    let Some(config) = reporting.config() else {
         return Ok(());
     };
     if config.output_format != OutputFormat::Json || !state.printed_heading {
         return Ok(());
     }
     output.write_all(br#"{"type":"end","data":{"path":"#)?;
-    json_text_field_to(output, name.as_bytes())?;
+    json_text_field_to(output, path.as_bytes())?;
     // On the closing record rather than the opening one, because a file's hash covers bytes
     // the opening record is written long before a stream reaches. Naming it here is what
     // lets a piped search report one without holding the pipe in memory.
@@ -1860,7 +1885,7 @@ fn is_binary(data: &[u8]) -> bool {
     find(&data[..check_len], b"\0").is_some()
 }
 
-/// The name stdin reports itself under, in records and in diagnostics.
+/// The path stdin reports itself under, in records and in diagnostics.
 const STDIN_NAME: &str = "-";
 
 /// The run's totals and the questions the exit code asks of them.
@@ -1877,11 +1902,11 @@ struct Outcome {
 /// What every input of this run is searched and reported with.
 struct Session<'a> {
     search: Search<'a>,
-    path: SearchPath,
+    reporting: Reporting,
     show: Show,
     format: Format,
     terminator: u8,
-    /// Whether a per-file record carries its file name, as a walk's records must.
+    /// Whether a per-file record carries its path, as a walk's records must.
     named: bool,
     binary: bool,
 }
@@ -1897,7 +1922,7 @@ impl Session<'_> {
     fn report(
         &self,
         output: &mut dyn Write,
-        name: &str,
+        path: &str,
         result: &FileResult,
         outcome: &mut Outcome,
     ) -> io::Result<()> {
@@ -1914,21 +1939,21 @@ impl Session<'_> {
             Show::Count => {
                 outcome.emitted |= matched;
                 // Only files with matches are reported over a walk, as `grep -c` and
-                // `rg -c` do: listing every `path:0` buries the answer.
+                // `rg -c` do: listing every `reporting:0` buries the answer.
                 if matched || !self.named {
-                    self.write_count(output, name, result.match_count)?;
+                    self.write_count(output, path, result.match_count)?;
                 }
             }
             Show::Files => {
                 outcome.emitted |= matched;
                 if matched {
-                    self.write_path(output, name)?;
+                    self.write_path(output, path)?;
                 }
             }
             Show::FilesWithout => {
                 if !matched {
                     outcome.emitted = true;
-                    self.write_path(output, name)?;
+                    self.write_path(output, path)?;
                 }
             }
         }
@@ -1936,41 +1961,41 @@ impl Session<'_> {
     }
 
     /// Emit one input's matching-line count.
-    fn write_count(&self, output: &mut dyn Write, name: &str, count: usize) -> io::Result<()> {
+    fn write_count(&self, output: &mut dyn Write, path: &str, count: usize) -> io::Result<()> {
         if self.format == Format::Json {
             output.write_all(br#"{"type":"count","data":{"path":"#)?;
-            json_text_field_to(output, name.as_bytes())?;
+            json_text_field_to(output, path.as_bytes())?;
             return writeln!(output, r#","count":{}}}}}"#, count);
         }
         if self.named {
-            write!(output, "{}:{}", name, count)?;
+            write!(output, "{}:{}", path, count)?;
         } else {
             write!(output, "{}", count)?;
         }
         output.write_all(&[self.terminator])
     }
 
-    /// Emit one input's name.
-    fn write_path(&self, output: &mut dyn Write, name: &str) -> io::Result<()> {
+    /// Emit one input's path.
+    fn write_path(&self, output: &mut dyn Write, path: &str) -> io::Result<()> {
         if self.format == Format::Json {
             output.write_all(br#"{"type":"file","data":{"path":"#)?;
-            json_text_field_to(output, name.as_bytes())?;
+            json_text_field_to(output, path.as_bytes())?;
             return output.write_all(b"}}\n");
         }
-        output.write_all(name.as_bytes())?;
+        output.write_all(path.as_bytes())?;
         output.write_all(&[self.terminator])
     }
 }
 
 /// Search stdin: a redirect maps, and a true pipe streams through one reused window
-/// unless the path reads lines the window has already dropped.
+/// unless the reporting reads lines the window has already dropped.
 fn search_stdin(
     session: &Session,
     output: &mut dyn Write,
     outcome: &mut Outcome,
 ) -> io::Result<()> {
-    let (search, path) = (&session.search, &session.path);
-    let streams = can_stream(search, path);
+    let (search, reporting) = (&session.search, &session.reporting);
+    let streams = can_stream(search, reporting);
     let source = if streams {
         get_input_streaming(None)
     } else {
@@ -1997,7 +2022,7 @@ fn search_stdin(
                 data,
                 STDIN_NAME,
                 search,
-                path,
+                reporting,
                 output,
                 &mut outcome.max_reached,
             )?
@@ -2005,7 +2030,7 @@ fn search_stdin(
         InputWindow::Stream(mut refill) => {
             // Before the sniff below, which fills the first window: a hash installed after
             // that would miss everything it read.
-            if path.config().is_some_and(|config| config.file_hash) {
+            if reporting.config().is_some_and(|config| config.file_hash) {
                 refill.hash_stream();
             }
             // The first window is filled up front so that `--binary` reads the same on a
@@ -2018,7 +2043,7 @@ fn search_stdin(
                 &mut refill,
                 STDIN_NAME,
                 search,
-                path,
+                reporting,
                 output,
                 &mut outcome.max_reached,
             )?
@@ -2038,7 +2063,7 @@ fn search_tree(
     output: &mut dyn Write,
     outcome: &mut Outcome,
 ) -> io::Result<()> {
-    // Checked here rather than left to the walker, whose error names the path twice.
+    // Checked here rather than left to the walker, whose error names the reporting twice.
     if let Err(error) = std::fs::metadata(input) {
         eprintln!("sz-find: {}: {}", input, error);
         outcome.failed_any = true;
@@ -2089,16 +2114,16 @@ fn search_tree(
             continue;
         }
 
-        let name = entry.path().to_string_lossy();
+        let path = entry.path().to_string_lossy();
         let result = search_data(
             data,
-            &name,
+            &path,
             &session.search,
-            &session.path,
+            &session.reporting,
             output,
             &mut outcome.max_reached,
         )?;
-        session.report(output, &name, &result, outcome)?;
+        session.report(output, &path, &result, outcome)?;
     }
     Ok(())
 }
@@ -2203,7 +2228,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
             max_matches: args.max_matches.map(NonZeroUsize::get),
         },
         // One dispatch decision for the whole run: what the per-line loop remembers.
-        path: SearchPath::choose(args, show, context, named, io::stdout().is_terminal()),
+        reporting: Reporting::choose(args, show, context, named, io::stdout().is_terminal()),
         show,
         format: args.format,
         terminator: Terminator::from_null(args.null).as_byte(),
@@ -2301,7 +2326,7 @@ mod tests {
         OutputConfig {
             output_format: OutputFormat::Standard,
             colors: Colors::disabled(),
-            show_name: false,
+            show_path: false,
             line_numbers: false,
             column_numbers: false,
             byte_offset: false,
@@ -2318,14 +2343,18 @@ mod tests {
     }
 
     /// Search a whole slice, returning what it printed and what it counted.
-    fn search_whole(data: &[u8], search: &Search, path: &SearchPath) -> (Vec<u8>, usize, usize) {
+    fn search_whole(
+        data: &[u8],
+        search: &Search,
+        reporting: &Reporting,
+    ) -> (Vec<u8>, usize, usize) {
         let mut output = Vec::new();
         let mut max_reached = false;
         let result = search_data(
             data,
             "test.txt",
             search,
-            path,
+            reporting,
             &mut output,
             &mut max_reached,
         )
@@ -2338,12 +2367,12 @@ mod tests {
         data: &[u8],
         capacity: usize,
         search: &Search,
-        path: &SearchPath,
+        reporting: &Reporting,
     ) -> (Vec<u8>, usize, usize) {
         let mut refill = Refill::new(data, capacity);
         // As `search_stdin` does, and before anything is read: a hash installed later would
         // miss the window that installing it came after.
-        if path.config().is_some_and(|config| config.file_hash) {
+        if reporting.config().is_some_and(|config| config.file_hash) {
             refill.hash_stream();
         }
         let mut output = Vec::new();
@@ -2352,7 +2381,7 @@ mod tests {
             &mut refill,
             "test.txt",
             search,
-            path,
+            reporting,
             &mut output,
             &mut max_reached,
         )
@@ -2361,7 +2390,7 @@ mod tests {
     }
 
     /// A reader that fails once a budget of bytes has been handed out, so a test can prove
-    /// a path stopped reading rather than merely stopped printing.
+    /// a reporting stopped reading rather than merely stopped printing.
     struct BudgetedReader<'a> {
         data: &'a [u8],
         position: usize,
@@ -2601,21 +2630,21 @@ mod tests {
     #[test]
     fn tallies_silently_under_quiet() {
         let args = Args::try_parse_from(["sz-find", "--quiet", "error", "log.txt"]).unwrap();
-        let path = SearchPath::choose(&args, Show::Lines, Context::none(), false, false);
+        let reporting = Reporting::choose(&args, Show::Lines, Context::none(), false, false);
         assert!(matches!(
-            path,
-            SearchPath::Tally {
+            reporting,
+            Reporting::Tally {
                 stop_at_first: true
             }
         ));
-        assert!(path.config().is_none());
+        assert!(reporting.config().is_none());
     }
 
     /// A session reporting `show` records in `format`, over a single unnamed input.
     fn make_session(show: Show, format: Format, null: bool) -> Session<'static> {
         Session {
             search: make_search(b"error"),
-            path: SearchPath::Tally {
+            reporting: Reporting::Tally {
                 stop_at_first: false,
             },
             show,
@@ -2680,7 +2709,7 @@ mod tests {
         let (printed, ..) = search_whole(
             b"error one\nplain\nerror two\n",
             &make_search(b"error"),
-            &SearchPath::Print(config),
+            &Reporting::Print(config),
         );
         assert_eq!(printed, b"error one\0error two\0");
     }
@@ -2688,10 +2717,10 @@ mod tests {
     #[test]
     fn honours_stdin_in_any_position() {
         // Each input is dispatched on its own, so `-` names stdin wherever it appears
-        // rather than becoming a literal path once a second input follows it.
+        // rather than becoming a literal reporting once a second input follows it.
         let args = Args::try_parse_from(["sz-find", "error", "log.txt", "-"]).unwrap();
         assert_eq!(args.inputs, ["log.txt", "-"]);
-        // Records name stdin with the same token that selects it.
+        // Records give stdin the same token that selects it.
         assert_eq!(STDIN_NAME, "-");
     }
 
@@ -2795,7 +2824,7 @@ mod tests {
     fn reports_matching_line() {
         let data = b"line1\nerror here\nline3\n";
         let search = make_search(b"error");
-        let path = SearchPath::Print(make_config());
+        let reporting = Reporting::Print(make_config());
         let mut max_reached = false;
         let mut output = Vec::new();
 
@@ -2803,7 +2832,7 @@ mod tests {
             data,
             "test.txt",
             &search,
-            &path,
+            &reporting,
             &mut output,
             &mut max_reached,
         )
@@ -2822,7 +2851,7 @@ mod tests {
             before: 1,
             after: 1,
         };
-        let path = SearchPath::PrintContext(make_config(), context);
+        let reporting = Reporting::PrintContext(make_config(), context);
         let mut max_reached = false;
         let mut output = Vec::new();
 
@@ -2830,7 +2859,7 @@ mod tests {
             data,
             "test.txt",
             &search,
-            &path,
+            &reporting,
             &mut output,
             &mut max_reached,
         )
@@ -2847,7 +2876,7 @@ mod tests {
         let data = b"error1\nerror2\nerror3\nerror4\n";
         let mut search = make_search(b"error");
         search.max_matches = Some(2);
-        let path = SearchPath::Print(make_config());
+        let reporting = Reporting::Print(make_config());
         let mut max_reached = false;
         let mut output = Vec::new();
 
@@ -2855,7 +2884,7 @@ mod tests {
             data,
             "test.txt",
             &search,
-            &path,
+            &reporting,
             &mut output,
             &mut max_reached,
         )
@@ -2869,7 +2898,7 @@ mod tests {
     fn counts_without_printing() {
         let data = b"error1\nok\nerror2\n";
         let search = make_search(b"error");
-        let path = SearchPath::Tally {
+        let reporting = Reporting::Tally {
             stop_at_first: false,
         };
         let mut max_reached = false;
@@ -2879,7 +2908,7 @@ mod tests {
             data,
             "test.txt",
             &search,
-            &path,
+            &reporting,
             &mut output,
             &mut max_reached,
         )
@@ -2894,7 +2923,7 @@ mod tests {
     fn stops_the_tally_at_the_first_match() {
         let data = b"ok\nerror1\nerror2\nerror3\n";
         let search = make_search(b"error");
-        let path = SearchPath::Tally {
+        let reporting = Reporting::Tally {
             stop_at_first: true,
         };
         let mut max_reached = false;
@@ -2904,7 +2933,7 @@ mod tests {
             data,
             "test.txt",
             &search,
-            &path,
+            &reporting,
             &mut output,
             &mut max_reached,
         )
@@ -2919,14 +2948,14 @@ mod tests {
         let search = make_search(b"error");
         assert!(can_stream(
             &search,
-            &SearchPath::Tally {
+            &Reporting::Tally {
                 stop_at_first: true
             }
         ));
-        assert!(can_stream(&search, &SearchPath::Print(make_config())));
+        assert!(can_stream(&search, &Reporting::Print(make_config())));
         assert!(can_stream(
             &search,
-            &SearchPath::PrintContext(
+            &Reporting::PrintContext(
                 make_config(),
                 Context {
                     before: 0,
@@ -2936,7 +2965,7 @@ mod tests {
         ));
         assert!(!can_stream(
             &search,
-            &SearchPath::PrintContext(
+            &Reporting::PrintContext(
                 make_config(),
                 Context {
                     before: 1,
@@ -2974,12 +3003,12 @@ mod tests {
         let mut config = make_config();
         config.column_numbers = true;
 
-        let (plain, ..) = search_whole(data, &search, &SearchPath::Print(config));
+        let (plain, ..) = search_whole(data, &search, &Reporting::Print(config));
         assert_eq!(plain, b"6:lead error one error two\n");
 
         config.colors = Colors::enabled();
         config.highlight = true;
-        let (colored, ..) = search_whole(data, &search, &SearchPath::Print(config));
+        let (colored, ..) = search_whole(data, &search, &Reporting::Print(config));
         let colored = String::from_utf8(colored).unwrap();
         assert!(
             colored.starts_with("\x1b[32m6\x1b[0m:"),
@@ -2993,7 +3022,7 @@ mod tests {
         let data = b"hello\nworld\nfoo bar\n";
         let mut search = make_search(b"hello\nworld");
         search.multiline = true;
-        let path = SearchPath::Print(make_config());
+        let reporting = Reporting::Print(make_config());
         let mut max_reached = false;
         let mut output = Vec::new();
 
@@ -3001,7 +3030,7 @@ mod tests {
             data,
             "test.txt",
             &search,
-            &path,
+            &reporting,
             &mut output,
             &mut max_reached,
         )
@@ -3021,14 +3050,14 @@ mod tests {
             after: 1,
         };
 
-        let path = SearchPath::PrintContext(make_config(), context);
-        let (printed, ..) = search_whole(data, &search, &path);
+        let reporting = Reporting::PrintContext(make_config(), context);
+        let (printed, ..) = search_whole(data, &search, &reporting);
         assert_eq!(printed, b"\nbeta MATCH here\n\n");
 
         let mut config = make_config();
         config.line_numbers = true;
-        let path = SearchPath::PrintContext(config, context);
-        let (numbered, ..) = search_whole(data, &search, &path);
+        let reporting = Reporting::PrintContext(config, context);
+        let (numbered, ..) = search_whole(data, &search, &reporting);
         assert_eq!(numbered, b"2:\n3:beta MATCH here\n4:\n");
     }
 
@@ -3039,9 +3068,9 @@ mod tests {
         let data = b"MATCH l1\nl2\nl3\nl4\nl5 MATCH\nl6\n";
         let mut search = make_search(b"MATCH");
         search.multiline = true;
-        let path = SearchPath::Print(make_config());
+        let reporting = Reporting::Print(make_config());
 
-        let (printed, ..) = search_whole(data, &search, &path);
+        let (printed, ..) = search_whole(data, &search, &reporting);
         assert_eq!(printed, b"MATCH l1\nl5 MATCH\n");
     }
 
@@ -3056,9 +3085,9 @@ mod tests {
             before: 1,
             after: 1,
         };
-        let path = SearchPath::PrintContext(make_config(), context);
+        let reporting = Reporting::PrintContext(make_config(), context);
 
-        let (printed, ..) = search_whole(data, &search, &path);
+        let (printed, ..) = search_whole(data, &search, &reporting);
         assert_eq!(printed, b"MATCH one\n\n\nMATCH two\n");
     }
 
@@ -3072,11 +3101,11 @@ mod tests {
             before: 1,
             after: 1,
         };
-        let path = SearchPath::PrintContext(make_config(), context);
+        let reporting = Reporting::PrintContext(make_config(), context);
 
-        let (by_line, ..) = search_whole(data, &search, &path);
+        let (by_line, ..) = search_whole(data, &search, &reporting);
         search.multiline = true;
-        let (by_region, ..) = search_whole(data, &search, &path);
+        let (by_region, ..) = search_whole(data, &search, &reporting);
         assert_eq!(
             by_region,
             b"alpha\nbeta MATCH one\ngamma\n--\nepsilon\nzeta MATCH two\neta\n"
@@ -3095,11 +3124,11 @@ mod tests {
             before: 1,
             after: 1,
         };
-        let path = SearchPath::PrintContext(make_config(), context);
+        let reporting = Reporting::PrintContext(make_config(), context);
 
-        let (by_line, ..) = search_whole(data, &search, &path);
+        let (by_line, ..) = search_whole(data, &search, &reporting);
         search.multiline = true;
-        let (by_region, ..) = search_whole(data, &search, &path);
+        let (by_region, ..) = search_whole(data, &search, &reporting);
         assert_eq!(by_region, data);
         assert_eq!(by_line, by_region);
     }
@@ -3166,8 +3195,8 @@ mod tests {
 
         for (data, before, after, expected) in cases {
             let search = make_search(b"MATCH");
-            let path = SearchPath::PrintContext(make_config(), Context { before, after });
-            let (printed, ..) = search_whole(data, &search, &path);
+            let reporting = Reporting::PrintContext(make_config(), Context { before, after });
+            let (printed, ..) = search_whole(data, &search, &reporting);
             assert_eq!(
                 String::from_utf8_lossy(&printed),
                 String::from_utf8_lossy(expected),
@@ -3184,9 +3213,9 @@ mod tests {
         let data = b"alpha\nbeta MATCH one\ngamma\ndelta\nepsilon\nzeta MATCH two\neta\n";
         let mut search = make_search(b"MATCH");
         search.multiline = true;
-        let path = SearchPath::Print(make_config());
+        let reporting = Reporting::Print(make_config());
 
-        let (printed, ..) = search_whole(data, &search, &path);
+        let (printed, ..) = search_whole(data, &search, &reporting);
         assert_eq!(printed, b"beta MATCH one\nzeta MATCH two\n");
     }
 
@@ -3220,9 +3249,9 @@ mod tests {
         search.multiline = true;
         let mut config = make_config();
         config.line_numbers = true;
-        let path = SearchPath::Print(config);
+        let reporting = Reporting::Print(config);
 
-        let (printed, matches, _) = search_whole(&data, &search, &path);
+        let (printed, matches, _) = search_whole(&data, &search, &reporting);
         assert_eq!(matches, 200);
         let text = String::from_utf8(printed).unwrap();
         let numbers: Vec<&str> = text
@@ -3237,22 +3266,22 @@ mod tests {
     #[test]
     fn never_streams_a_multiline_search() {
         let mut search = make_search(b"error");
-        let path = SearchPath::Print(make_config());
-        assert!(can_stream(&search, &path));
+        let reporting = Reporting::Print(make_config());
+        assert!(can_stream(&search, &reporting));
 
         search.multiline = true;
-        assert!(!can_stream(&search, &path));
+        assert!(!can_stream(&search, &reporting));
     }
 
     #[test]
     fn streams_the_same_output_at_tiny_capacities() {
         let config = make_config();
         let paths = [
-            SearchPath::Tally {
+            Reporting::Tally {
                 stop_at_first: false,
             },
-            SearchPath::Print(config),
-            SearchPath::PrintContext(
+            Reporting::Print(config),
+            Reporting::PrintContext(
                 config,
                 Context {
                     before: 0,
@@ -3262,12 +3291,12 @@ mod tests {
         ];
 
         for newlines in [Newlines::Lf, Newlines::Unicode] {
-            for path in &paths {
+            for reporting in &paths {
                 let mut search = make_search(b"error");
                 search.newlines = newlines;
-                let expected = search_whole(SEAM_CORPUS, &search, path);
+                let expected = search_whole(SEAM_CORPUS, &search, reporting);
                 for capacity in [1, 2, 3, 7, 13, 64, 4096] {
-                    let streamed = search_streamed(SEAM_CORPUS, capacity, &search, path);
+                    let streamed = search_streamed(SEAM_CORPUS, capacity, &search, reporting);
                     assert_eq!(streamed, expected, "capacity {}", capacity);
                 }
             }
@@ -3281,12 +3310,12 @@ mod tests {
         config.byte_offset = true;
         config.column_numbers = true;
         config.line_hashes = true;
-        let path = SearchPath::Print(config);
+        let reporting = Reporting::Print(config);
         let search = make_search(b"error");
 
-        let (expected, ..) = search_whole(SEAM_CORPUS, &search, &path);
+        let (expected, ..) = search_whole(SEAM_CORPUS, &search, &reporting);
         for capacity in [1, 7, 13, 64] {
-            let (streamed, ..) = search_streamed(SEAM_CORPUS, capacity, &search, &path);
+            let (streamed, ..) = search_streamed(SEAM_CORPUS, capacity, &search, &reporting);
             assert_eq!(streamed, expected, "capacity {}", capacity);
         }
         // The last line starts well past any of the tiny windows, so a window-relative
@@ -3308,10 +3337,10 @@ mod tests {
     fn opens_and_closes_one_json_record_per_streamed_file() {
         let mut config = make_config();
         config.output_format = OutputFormat::Json;
-        let path = SearchPath::Print(config);
+        let reporting = Reporting::Print(config);
         let search = make_search(b"error");
 
-        let (streamed, ..) = search_streamed(SEAM_CORPUS, 7, &search, &path);
+        let (streamed, ..) = search_streamed(SEAM_CORPUS, 7, &search, &reporting);
         let text = String::from_utf8(streamed).unwrap();
         assert_eq!(text.matches(r#""type":"begin""#).count(), 1);
         assert_eq!(text.matches(r#""type":"end""#).count(), 1);
@@ -3323,7 +3352,7 @@ mod tests {
         let data = b"alpha\nbeta MATCH one\ngamma\ndelta MATCH two\n";
         let mut config = make_config();
         config.output_format = OutputFormat::Json;
-        let path = SearchPath::Print(config);
+        let reporting = Reporting::Print(config);
         let mut search = make_search(b"MATCH");
 
         let record_types = |printed: Vec<u8>| -> Vec<String> {
@@ -3333,9 +3362,9 @@ mod tests {
                 .map(|record| record.split('"').nth(3).unwrap().to_string())
                 .collect()
         };
-        let by_line = record_types(search_whole(data, &search, &path).0);
+        let by_line = record_types(search_whole(data, &search, &reporting).0);
         search.multiline = true;
-        let by_region = record_types(search_whole(data, &search, &path).0);
+        let by_region = record_types(search_whole(data, &search, &reporting).0);
 
         assert_eq!(by_region, ["begin", "match", "match", "end"]);
         assert_eq!(by_region, by_line);
@@ -3343,16 +3372,16 @@ mod tests {
 
     #[test]
     fn names_the_file_once_per_multiline_run() {
-        // `--heading` prints the name as a header rather than as a per-line prefix, and
+        // `--heading` prints the path as a header rather than as a per-line prefix, and
         // multiline mode reads the same writer, so the header appears there too.
         let data = b"alpha\nbeta MATCH one\ngamma\ndelta MATCH two\n";
         let mut config = make_config();
         config.output_format = OutputFormat::Heading;
-        let path = SearchPath::Print(config);
+        let reporting = Reporting::Print(config);
         let mut search = make_search(b"MATCH");
         search.multiline = true;
 
-        let (printed, ..) = search_whole(data, &search, &path);
+        let (printed, ..) = search_whole(data, &search, &reporting);
         assert_eq!(printed, b"test.txt\nbeta MATCH one\ndelta MATCH two\n");
     }
 
@@ -3360,7 +3389,7 @@ mod tests {
     fn stops_reading_the_stream_at_the_first_match() {
         let data = b"error one\nerror two\nerror three\nerror four\n";
         let search = make_search(b"error");
-        let path = SearchPath::Tally {
+        let reporting = Reporting::Tally {
             stop_at_first: true,
         };
         // A budget of one window proves nothing past it was ever requested.
@@ -3377,7 +3406,7 @@ mod tests {
             &mut refill,
             "test.txt",
             &search,
-            &path,
+            &reporting,
             &mut output,
             &mut max_reached,
         )
@@ -3392,7 +3421,7 @@ mod tests {
         let data = b"error one\nerror two\nerror three\nerror four\n";
         let mut search = make_search(b"error");
         search.max_matches = Some(1);
-        let path = SearchPath::Print(make_config());
+        let reporting = Reporting::Print(make_config());
         // Two lines fit the budget: the second is where the max-count test fires.
         let reader = BudgetedReader {
             data,
@@ -3407,7 +3436,7 @@ mod tests {
             &mut refill,
             "test.txt",
             &search,
-            &path,
+            &reporting,
             &mut output,
             &mut max_reached,
         )
@@ -3437,15 +3466,15 @@ mod tests {
         // the same bytes — with no special case anywhere.
         let mut config = make_config();
         config.line_hashes = true;
-        let path = SearchPath::Print(config);
+        let reporting = Reporting::Print(config);
 
         let mut lf = make_search(b"error");
         lf.newlines = Newlines::Lf;
         let mut unicode = make_search(b"error");
         unicode.newlines = Newlines::Unicode;
 
-        let (under_lf, ..) = search_whole(SEAM_CORPUS, &lf, &path);
-        let (under_unicode, ..) = search_whole(SEAM_CORPUS, &unicode, &path);
+        let (under_lf, ..) = search_whole(SEAM_CORPUS, &lf, &reporting);
+        let (under_unicode, ..) = search_whole(SEAM_CORPUS, &unicode, &reporting);
 
         let expected = {
             let mut buffer = [0u8; HASH_CHARS];
@@ -3476,7 +3505,7 @@ mod tests {
         config.file_hash = true;
         let corpus = b"alpha\nbeta error\ngamma\n";
 
-        let (output, ..) = search_whole(corpus, &make_search(b"error"), &SearchPath::Print(config));
+        let (output, ..) = search_whole(corpus, &make_search(b"error"), &Reporting::Print(config));
         let text = String::from_utf8(output).unwrap();
 
         let mut buffer = [0u8; HASH_CHARS];
@@ -3501,11 +3530,11 @@ mod tests {
         // one between them does not, whatever their line numbers are.
         let mut config = make_config();
         config.line_hashes = true;
-        let path = SearchPath::Print(config);
+        let reporting = Reporting::Print(config);
         let search = make_search(b"error");
 
         let corpus = b"dup error\nother error\ndup error\n";
-        let (output, ..) = search_whole(corpus, &search, &path);
+        let (output, ..) = search_whole(corpus, &search, &reporting);
         let named = printed_hashes(&output, 0);
 
         assert_eq!(named.len(), 3);
@@ -3519,7 +3548,7 @@ mod tests {
         // line is nameable, and a context record carries a name as a match record does.
         let mut config = make_config();
         config.line_hashes = true;
-        let path = SearchPath::PrintContext(
+        let reporting = Reporting::PrintContext(
             config,
             Context {
                 before: 1,
@@ -3528,7 +3557,7 @@ mod tests {
         );
         let search = make_search(b"beta");
 
-        let (output, ..) = search_whole(b"alpha\n\nbeta error\n", &search, &path);
+        let (output, ..) = search_whole(b"alpha\n\nbeta error\n", &search, &reporting);
         let named = printed_hashes(&output, 0);
 
         assert_eq!(named.len(), 2, "a context line and its match");
@@ -3548,7 +3577,7 @@ mod tests {
 
         let mut plain = make_config();
         plain.line_hashes = true;
-        let (expected, ..) = search_whole(corpus, &search, &SearchPath::Print(plain));
+        let (expected, ..) = search_whole(corpus, &search, &Reporting::Print(plain));
         let expected = printed_hashes(&expected, 0);
 
         let mut colored = plain;
@@ -3564,7 +3593,7 @@ mod tests {
             ("trimmed", trimmed),
             ("reduced", reduced),
         ] {
-            let (output, ..) = search_whole(corpus, &search, &SearchPath::Print(config));
+            let (output, ..) = search_whole(corpus, &search, &Reporting::Print(config));
             let text = String::from_utf8(output).unwrap();
             assert!(
                 text.contains(&expected[0]),
@@ -3582,14 +3611,14 @@ mod tests {
         config.line_hashes = true;
         let search = make_search(b"beta");
 
-        let path = SearchPath::PrintContext(
+        let reporting = Reporting::PrintContext(
             config,
             Context {
                 before: 1,
                 after: 1,
             },
         );
-        let (output, ..) = search_whole(b"alpha\nbeta error\ngamma\n", &search, &path);
+        let (output, ..) = search_whole(b"alpha\nbeta error\ngamma\n", &search, &reporting);
         let text = String::from_utf8(output).unwrap();
 
         for kind in [r#""type":"match""#, r#""type":"context""#] {
@@ -3607,7 +3636,7 @@ mod tests {
         config.output_format = OutputFormat::Json;
         config.line_hashes = true;
         config.locates_matches = false;
-        let (output, ..) = search_whole(b"alpha\nbeta\n", &inverted, &SearchPath::Print(config));
+        let (output, ..) = search_whole(b"alpha\nbeta\n", &inverted, &Reporting::Print(config));
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains(r#""line_hash":""#), "{text}");
         assert!(text.contains(r#""submatches":[]"#), "{text}");
@@ -3623,7 +3652,7 @@ mod tests {
         let mut json = make_config();
         json.output_format = OutputFormat::Json;
         json.file_hash = true;
-        let (output, ..) = search_whole(corpus, &search, &SearchPath::Print(json));
+        let (output, ..) = search_whole(corpus, &search, &Reporting::Print(json));
         let text = String::from_utf8(output).unwrap();
         assert_eq!(
             text.matches(&format!(r#""file_hash":"{expected}""#))
@@ -3635,7 +3664,7 @@ mod tests {
         let mut heading = make_config();
         heading.output_format = OutputFormat::Heading;
         heading.file_hash = true;
-        let (output, ..) = search_whole(corpus, &search, &SearchPath::Print(heading));
+        let (output, ..) = search_whole(corpus, &search, &Reporting::Print(heading));
         let text = String::from_utf8(output).unwrap();
         assert_eq!(text.matches(&expected).count(), 1, "{text}");
         // The token it prints is the one `sz-replace --expect-hash` accepts.
@@ -3651,12 +3680,12 @@ mod tests {
         let mut json = make_config();
         json.output_format = OutputFormat::Json;
         json.file_hash = true;
-        assert!(can_stream(&search, &SearchPath::Print(json)));
+        assert!(can_stream(&search, &Reporting::Print(json)));
 
         let mut heading = make_config();
         heading.output_format = OutputFormat::Heading;
         heading.file_hash = true;
-        assert!(!can_stream(&search, &SearchPath::Print(heading)));
+        assert!(!can_stream(&search, &Reporting::Print(heading)));
     }
 
     #[test]
@@ -3671,10 +3700,10 @@ mod tests {
         search.max_matches = Some(1);
         let corpus = b"alpha error\nbeta\ngamma\ndelta\nepsilon\n";
 
-        let (hashed, ..) = search_streamed(corpus, 7, &search, &SearchPath::Print(config));
+        let (hashed, ..) = search_streamed(corpus, 7, &search, &Reporting::Print(config));
         let mut plain = make_config();
         plain.output_format = OutputFormat::Json;
-        let (unhashed, ..) = search_streamed(corpus, 7, &search, &SearchPath::Print(plain));
+        let (unhashed, ..) = search_streamed(corpus, 7, &search, &Reporting::Print(plain));
 
         let searched = |output: Vec<u8>| {
             String::from_utf8(output)
@@ -3698,7 +3727,7 @@ mod tests {
         let (output, ..) = search_whole(
             b"alpha error\n",
             &make_search(b"error"),
-            &SearchPath::Print(config),
+            &Reporting::Print(config),
         );
         let text = String::from_utf8(output).unwrap();
         let begin = text.lines().next().unwrap();
@@ -3714,17 +3743,17 @@ mod tests {
         let mut config = make_config();
         config.output_format = OutputFormat::Json;
         config.file_hash = true;
-        let path = SearchPath::Print(config);
+        let reporting = Reporting::Print(config);
         let search = make_search(b"error");
         let mut buffer = [0u8; HASH_CHARS];
         let file = format_hash(&mut buffer, content_hash(SEAM_CORPUS), HASH_CHARS);
         let expected = format!(r#""file_hash":"{file}""#);
 
-        let (whole, ..) = search_whole(SEAM_CORPUS, &search, &path);
+        let (whole, ..) = search_whole(SEAM_CORPUS, &search, &reporting);
         assert!(String::from_utf8(whole).unwrap().contains(&expected));
 
         for capacity in [1, 7, 13, 64] {
-            let (streamed, ..) = search_streamed(SEAM_CORPUS, capacity, &search, &path);
+            let (streamed, ..) = search_streamed(SEAM_CORPUS, capacity, &search, &reporting);
             let text = String::from_utf8(streamed).unwrap();
             assert!(text.contains(&expected), "capacity {capacity}:\n{text}");
         }
@@ -3740,7 +3769,7 @@ mod tests {
         let mut search = make_search(b"error");
         search.max_matches = Some(1);
 
-        let (streamed, ..) = search_streamed(SEAM_CORPUS, 7, &search, &SearchPath::Print(config));
+        let (streamed, ..) = search_streamed(SEAM_CORPUS, 7, &search, &Reporting::Print(config));
         let text = String::from_utf8(streamed).unwrap();
         let mut buffer = [0u8; HASH_CHARS];
         let file = format_hash(&mut buffer, content_hash(SEAM_CORPUS), HASH_CHARS);
@@ -3760,7 +3789,7 @@ mod tests {
         let (output, ..) = search_whole(
             b"alpha\nbeta\ngamma\ndelta\n",
             &search,
-            &SearchPath::Print(config),
+            &Reporting::Print(config),
         );
         let text = String::from_utf8(output).unwrap();
 

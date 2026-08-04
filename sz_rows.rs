@@ -246,7 +246,7 @@ struct OutputConfig<'a> {
     /// Whether the run reports the whole file's hash, which costs it the whole input.
     show_file_hash: bool,
     hash_width: usize,
-    /// Input name carried into the JSON envelope.
+    /// The input's path, carried into the JSON envelope.
     path: &'a str,
 }
 
@@ -382,7 +382,7 @@ fn extract_forward(
     output: &mut dyn Write,
 ) -> io::Result<ControlFlow<()>> {
     for named in named_lines(data, newlines) {
-        let line = named.line;
+        let line = named.as_cut;
         if selector.exhausted(state) {
             return Ok(ControlFlow::Break(()));
         }
@@ -428,7 +428,7 @@ fn extract_data(
                     0
                 };
                 for (index_in_span, named) in named_lines(&data[start..], newlines).enumerate() {
-                    let line = named.line;
+                    let line = named.as_cut;
                     write_row(
                         output,
                         config,
@@ -458,7 +458,7 @@ fn extract_data(
                     ring.push_back((index, named));
                 }
                 for (index, named) in ring {
-                    write_row(output, config, named.line, index, config.naming(&named))?;
+                    write_row(output, config, named.as_cut, index, config.naming(&named))?;
                     state.emitted += 1;
                 }
             }
@@ -550,7 +550,7 @@ fn extract_tail_stream<R: Read>(
     let mut ring = TailRing::new(wanted);
     refill.for_each_window(newlines.into(), |window| {
         for named in named_lines(window, newlines) {
-            ring.push(named.line, config.naming(&named));
+            ring.push(named.as_cut, config.naming(&named));
         }
         Ok(())
     })?;
@@ -588,7 +588,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         RowSelector::Forward(ForwardSelector::Every(args.every.expect("validated above")))
     };
 
-    let name = args.input.as_deref().unwrap_or("-");
+    let path = args.input.as_deref().unwrap_or("-");
     // A file's hash covers bytes the header line is written long before a stream reaches, so
     // a text run that asked for one holds the input; JSON names the file again on the record
     // that closes it, which a stream does reach.
@@ -598,7 +598,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     } else {
         get_input_streaming(args.input.as_deref())
     }
-    .at(name)?;
+    .at(path)?;
 
     let config = OutputConfig {
         json: args.format == Format::Json,
@@ -607,7 +607,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         show_line_hashes: args.fields.contains(&Field::LineHashes),
         show_file_hash: args.fields.contains(&Field::FileHash),
         hash_width: args.hash_width.unwrap_or(DEFAULT_HASH_WIDTH),
-        path: name,
+        path,
     };
 
     // A quiet run still extracts, so the row count that answers it stays honest.
@@ -630,7 +630,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
                 let mut buffer = [0u8; HASH_CHARS];
                 writeln!(
                     writer,
-                    "{name}  {}",
+                    "{path}  {}",
                     format_hash(&mut buffer, hash, HASH_CHARS)
                 )
                 .at("-")?;
@@ -661,7 +661,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     if let Some(hash) = file_hash.filter(|_| config.json && !args.quiet) {
         let mut buffer = [0u8; HASH_CHARS];
         write!(output, r#"{{"type":"end","data":{{"path":"#).at("-")?;
-        json_text_field_to(output, name.as_bytes()).at("-")?;
+        json_text_field_to(output, path.as_bytes()).at("-")?;
         writeln!(
             output,
             r#","file_hash":"{}"}}}}"#,

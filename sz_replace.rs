@@ -735,7 +735,7 @@ fn main() -> std::process::ExitCode {
 fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
-    let name = args.input.as_deref().unwrap_or("-");
+    let path = args.input.as_deref().unwrap_or("-");
     let counting_only = args.dry_run || args.quiet;
     let reports_hashes = args.summary || args.dry_run || args.format == Format::Json;
 
@@ -750,7 +750,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     } else {
         get_input_streaming(args.input.as_deref())
     }
-    .at(name)?;
+    .at(path)?;
 
     let pattern = args.pattern.as_bytes();
     let replacement = args.replacement.as_bytes();
@@ -776,7 +776,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     if let Some((expected, actual)) = args.expect_hash.zip(mapped_hash) {
         if actual != expected {
             return Err(Failure::Stale {
-                path: name.to_string(),
+                path: path.to_string(),
                 expected,
                 actual,
             });
@@ -785,18 +785,18 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
 
     let edit = match source.whole() {
         Some(data) if args.match_kind == Match::LineHash => {
-            Edit::Lines(resolve_lines(args, data, name)?)
+            Edit::Lines(resolve_lines(args, data, path)?)
         }
         Some(data) => Edit::Substring {
             pattern,
             replacement,
             ignore_case: args.ignore_case,
-            limit: substring_limit(args, data, name)?,
+            limit: substring_limit(args, data, path)?,
         },
         // A window is only ever handed over when nothing about the whole input is needed, so
         // there is nothing to count before the limit is known. If that ever stopped being
-        // true the modes below would quietly answer a different question — a name would
-        // become a substring, `one` would become `first` — so it fails loudly instead.
+        // true the modes below would quietly answer a different question — a line name
+        // would become a substring, `one` would become `first` — so it fails loudly instead.
         None => {
             assert!(
                 !args.needs_whole_input(),
@@ -823,15 +823,16 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     let produced = if counting_only {
         // Discarding the output still reads the input, so this reports a failed read rather
         // than panicking on it, as its two siblings do.
-        substitution.write_to(&mut io::sink()).at(name)?
+        substitution.write_to(&mut io::sink()).at(path)?
     } else if args.in_place {
-        let path = args.input.as_deref().expect("validated");
         write_replacing("sz-replace", path, |output| substitution.write_to(output))?
-    } else if let Some(path) = args.output.as_deref().filter(|path| *path != "-") {
+    } else if let Some(destination) = args.output.as_deref().filter(|path| *path != "-") {
         // Through a temporary like `--in-place`, so an interrupted run leaves the previous
         // file rather than a half-written one — and so naming the input as the output does
         // not truncate the mapping this run is still reading from.
-        write_creating("sz-replace", path, |output| substitution.write_to(output))?
+        write_creating("sz-replace", destination, |output| {
+            substitution.write_to(output)
+        })?
     } else {
         // Straight to stdout — no full-output buffer. A pipe closing during the flush ends
         // the run where one closing during the write does.
@@ -844,7 +845,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         Source::Whole(_) => None,
     });
     let summary = Summary {
-        path: name,
+        path,
         replacements: produced.replacements,
         dry_run: args.dry_run,
         hashes: hash_before.zip(produced.hash),

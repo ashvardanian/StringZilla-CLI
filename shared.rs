@@ -624,11 +624,13 @@ fn drop_trailing_empty<'a, I: Iterator<Item = &'a [u8]>>(
 pub struct NamedLine<'a> {
     /// Where the line starts in the input.
     pub offset: usize,
-    /// The line and its terminator: the bytes [`NamedLine::name`] hashes.
+    /// The line and its terminator: the bytes [`NamedLine::hash`] covers.
     pub whole: &'a [u8],
-    /// The line as [`LineIter`] yields it, which under [`Newlines::Lf`] keeps the carriage
-    /// return of a CRLF pair — what a search matches against and what `grep` prints.
-    pub line: &'a [u8],
+    /// The line as the newline set cut it, which under [`Newlines::Lf`] keeps the carriage
+    /// return of a CRLF pair — what a search matches against and what `grep` prints. Named
+    /// for the cut rather than for the line, because `whole` and [`NamedLine::body`] are
+    /// equally the line and the three differ only in what they include of its ending.
+    pub as_cut: &'a [u8],
     /// How much of `whole` precedes the terminator.
     body_len: usize,
 }
@@ -697,7 +699,7 @@ impl<'a> Iterator for NamedLines<'a> {
         Some(NamedLine {
             offset,
             whole: &self.data[offset..end],
-            line,
+            as_cut: line,
             body_len,
         })
     }
@@ -1567,11 +1569,14 @@ pub enum Failure {
         /// that widens the selection differs between them.
         note: &'static str,
     },
-    /// A name that picked out nothing. Distinct from [`Failure::Ambiguous`] because the
-    /// recoveries differ: one narrows the name, the other re-reads the file.
+    /// A name or a pattern that picked out nothing. Distinct from [`Failure::Ambiguous`],
+    /// which found too many rather than none. Which recovery applies depends on what was
+    /// looked for — a name that resolves nowhere means the file moved, a substring that
+    /// matches nothing means the text is not there — so the caller supplies it in `note`.
     Unresolved {
         path: String,
         subject: String,
+        /// How this caller suggests recovering, since only it knows what was looked for.
         note: &'static str,
     },
 }
@@ -2048,9 +2053,9 @@ mod tests {
 
     #[test]
     fn splits_every_line_where_its_name_was_taken() {
-        // The invariant the whole rewrite path rests on: `body` is what was hashed, and
-        // `body + tail` concatenated reproduces the input, so a rewrite copies terminators
-        // rather than reconstructing them.
+        // The invariant the whole rewrite path rests on: `whole` is what was hashed, it is
+        // exactly `body` plus the terminator, and concatenating it over every line
+        // reproduces the input — so a rewrite copies terminators rather than rebuilding them.
         for input in [
             &b"alpha\nbeta\ngamma\n"[..],
             &b"alpha\r\nbeta\r\n"[..],

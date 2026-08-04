@@ -29,7 +29,10 @@ stringtape = "2.4" # Compact (offset, length) storage for line collections
 # makes to its callers, since every hash it prints names a line or a file that a later run
 # has to match. A minor bump free to change that would silently invalidate every name ever
 # issued, so the range excludes one and `pins_the_hash_of_known_bytes` catches the rest.
-stringzilla = "~5.0" # SIMD string ops; `szs` multicore kernels arrive with `fuzzy-find`
+# Pinned exactly, not `~5.0`: every hash this suite prints is a promise about `sz::hash`,
+# and `pins_the_hash_of_known_bytes` guards it. A patch release would reissue different
+# names for the same lines, and `--locked` on the install lines keeps a user on this one.
+stringzilla = "=5.0.7" # SIMD string ops; `szs` multicore kernels arrive with `fuzzy-find`
 
 [dev-dependencies]
 tempfile = "3.10"

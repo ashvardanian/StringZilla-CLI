@@ -820,8 +820,8 @@ fn header_exceeds_input(lines: NonZeroUsize) -> Failure {
 fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
-    let name = args.input.as_deref().unwrap_or("-");
-    let input = get_input_streaming(args.input.as_deref()).at(name)?;
+    let path = args.input.as_deref().unwrap_or("-");
+    let input = get_input_streaming(args.input.as_deref()).at(path)?;
 
     // The delimiter outlives the config that borrows it.
     let pattern = args.chunk_pattern.clone().unwrap_or_default();
