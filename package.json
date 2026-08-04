@@ -1,0 +1,10 @@
+{
+    "name": "stringzilla-cli",
+    "private": true,
+    "description": "Tooling-only manifest: remark formats README.md the way .zed/settings.json asks for, with underscore emphasis and dash bullets rather than Zed's built-in asterisks.",
+    "license": "Apache-2.0",
+    "devDependencies": {
+        "remark-cli": "^12.0.1",
+        "remark-gfm": "^4.0.1"
+    }
+}

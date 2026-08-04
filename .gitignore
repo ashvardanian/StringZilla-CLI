@@ -22,3 +22,7 @@ target
 
 # Local path override rerouting `stringzilla` to a neighboring check-out
 .cargo/
+
+# Node is here only for `remark`, which formats the README the way .zed/settings.json asks
+node_modules/
+package-lock.json
