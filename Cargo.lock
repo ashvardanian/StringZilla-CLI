@@ -414,9 +414,9 @@ dependencies = [
 
 [[package]]
 name = "stringzilla"
-version = "5.0.3"
+version = "5.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0892c20dc05b4db5cc3ecc394ecdc2f610c90aca75bbef77f9f8ab115c99f91"
+checksum = "3cb974b460a35fc20eea54df68173a309baada00d8aa290b9303582396559606"
 dependencies = [
  "allocator-api2",
  "cc",

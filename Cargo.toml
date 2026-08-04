@@ -13,7 +13,10 @@ version = "0.1.0"
 [features]
 cuda = ["stringzilla/cuda"]
 default = []
-fuzzy-find = [] # Pre-production, opt-in: `sz-fuzzy-find` is being reimplemented
+# Pre-production, opt-in: `sz-fuzzy-find` is being reimplemented. It is the only binary
+# that reaches for the multicore `szs` kernels, so the `cpus` feature — and the allocator,
+# tape and fork-union crates behind it — comes in with the binary rather than with the suite.
+fuzzy-find = ["stringzilla/cpus"]
 outline = []    # Pre-production, opt-in: `sz-outline` is being reimplemented
 
 [dependencies]
@@ -22,9 +25,11 @@ glob = "0.3" # Glob pattern matching
 ignore = "0.4" # .gitignore support
 memmap2 = "0.9" # Memory-mapped file I/O
 stringtape = "2.4" # Compact (offset, length) storage for line collections
-stringzilla = { version = "5", features = [
-    "cpus",
-] } # SIMD string ops + szs multicore kernels
+# Pinned to a minor line rather than a major one: `sz_hash` output is a promise this suite
+# makes to its callers, since every hash it prints names a line or a file that a later run
+# has to match. A minor bump free to change that would silently invalidate every name ever
+# issued, so the range excludes one and `pins_the_hash_of_known_bytes` catches the rest.
+stringzilla = "~5.0" # SIMD string ops; `szs` multicore kernels arrive with `fuzzy-find`
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -85,3 +90,4 @@ required-features = ["fuzzy-find"]
 [[bin]]
 name = "sz-segment-utf8"
 path = "sz_segment_utf8.rs"
+
