@@ -96,7 +96,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["quiet", "summary"])]
     dry_run: bool,
 
-    /// Refuse the edit unless the input still hashes to this, as --summary prints it
+    /// Refuse the edit unless the input still hashes to this, as `sz-find --fields file-hash` prints it
     #[arg(long, value_name = "HASH", value_parser = parse_content_hash)]
     expect_hash: Option<u64>,
 
@@ -686,9 +686,12 @@ fn write_summary_json(output: &mut dyn Write, summary: &Summary) -> io::Result<(
         summary.replacements, summary.dry_run
     )?;
     if let Some((before, after)) = summary.hashes {
+        let (mut was, mut is) = ([0u8; HASH_CHARS], [0u8; HASH_CHARS]);
         write!(
             output,
-            r#","hash_before":"{before:016x}","hash_after":"{after:016x}""#
+            r#","hash_before":"{}","hash_after":"{}""#,
+            format_hash(&mut was, before, HASH_CHARS),
+            format_hash(&mut is, after, HASH_CHARS)
         )?;
     }
     output.write_all(b"}}\n")
@@ -707,7 +710,12 @@ fn write_summary_text(output: &mut dyn Write, summary: &Summary) -> io::Result<(
     write!(output, "{} {} occurrence(s)", verb, summary.replacements)?;
     if let Some((_, after)) = summary.hashes {
         let tense = if summary.dry_run { "would be" } else { "is" };
-        write!(output, "; content {tense} {after:016x}")?;
+        let mut buffer = [0u8; HASH_CHARS];
+        write!(
+            output,
+            "; content {tense} {}",
+            format_hash(&mut buffer, after, HASH_CHARS)
+        )?;
     }
     output.write_all(b"\n")
 }
@@ -927,7 +935,9 @@ mod tests {
 
     /// Test helper: the token `--expect-hash` accepts for a file's current contents.
     fn token_of(path: &Path) -> String {
-        format!("{:016x}", content_hash(&fs::read(path).unwrap()))
+        let mut buffer = [0u8; HASH_CHARS];
+        let hash = content_hash(&fs::read(path).unwrap());
+        format_hash(&mut buffer, hash, HASH_CHARS).to_string()
     }
 
     #[test]
@@ -1125,11 +1135,11 @@ mod tests {
         // Verifying a token is orthogonal to where the bytes go, and `--dry-run` verifying
         // one without writing is the cheapest probe an agent has.
         for flags in [
-            vec!["--expect-hash", "0123456789abcdef"],
-            vec!["--expect-hash", "0123456789abcdef", "--dry-run"],
-            vec!["--expect-hash", "0123456789abcdef", "--quiet"],
-            vec!["--expect-hash", "0123456789abcdef", "--in-place"],
-            vec!["--expect-hash", "0123456789abcdef", "--output", "o"],
+            vec!["--expect-hash", "0000006ynpzey"],
+            vec!["--expect-hash", "0000006ynpzey", "--dry-run"],
+            vec!["--expect-hash", "0000006ynpzey", "--quiet"],
+            vec!["--expect-hash", "0000006ynpzey", "--in-place"],
+            vec!["--expect-hash", "0000006ynpzey", "--output", "o"],
             vec!["--occurrences", "one"],
             vec!["--occurrences", "first", "--in-place"],
         ] {
@@ -1139,9 +1149,10 @@ mod tests {
 
     #[test]
     fn refuses_a_token_that_is_not_a_whole_hash() {
-        // Zero-extending a truncated paste would compare against a different file, so the
-        // parser refuses it before the run begins rather than after it has written.
-        for token in ["", "deadbeef", "0123456789abcdef0", "0x123456789abcde"] {
+        // Zero-extending a truncated paste would compare against a different file, and a
+        // line name is a prefix of a whole one, so the parser refuses both before the run
+        // begins rather than after it has written.
+        for token in ["", "6ynpzey", "0000006ynpzeyy", "0000006ynpzez"] {
             let parsed =
                 Args::try_parse_from(["sz-replace", "a", "b", "f", "--expect-hash", token]);
             assert!(parsed.is_err(), "`{token}` must not parse");
@@ -1152,7 +1163,7 @@ mod tests {
             "b",
             "f",
             "--expect-hash",
-            "0123456789ABCDEF"
+            "0000006YNPZEY"
         ])
         .is_ok());
     }
@@ -1443,7 +1454,7 @@ mod tests {
         };
 
         for flags in [
-            vec!["--expect-hash", "0123456789abcdef"],
+            vec!["--expect-hash", "0000006ynpzey"],
             vec!["--occurrences", "one"],
             vec!["--match", "line-hash"],
         ] {
@@ -1480,10 +1491,9 @@ mod tests {
         let (outcome, printed) = run_with(&["beta", "BETA", path.to_str().unwrap(), "--summary"]);
         outcome.unwrap();
         let text = String::from_utf8(printed).unwrap();
-        assert!(
-            text.contains(&format!("{:016x}", content_hash(b"alpha\nBETA\n"))),
-            "{text}"
-        );
+        let mut buffer = [0u8; HASH_CHARS];
+        let after = format_hash(&mut buffer, content_hash(b"alpha\nBETA\n"), HASH_CHARS);
+        assert!(text.contains(after), "{text}");
     }
 
     #[test]
@@ -1956,7 +1966,7 @@ aaa
         fs::write(&path, b"alpha\n").unwrap();
         fs::write(&out, b"previous\n").unwrap();
         let (file, target) = (path.to_str().unwrap(), out.to_str().unwrap());
-        let stale = "0000000000000000";
+        let stale = "0000000000000";
 
         for flags in [
             vec!["alpha", "A", file, "--in-place", "--expect-hash", stale],
@@ -2116,11 +2126,10 @@ aaa
         // Untouched, but the record still names what the edit would have produced.
         assert_eq!(fs::read(&path).unwrap(), b"alpha\nbeta\n");
         let record = String::from_utf8(printed).unwrap();
+        let mut buffer = [0u8; HASH_CHARS];
+        let after = format_hash(&mut buffer, content_hash(b"alpha\nBETA\n"), HASH_CHARS);
         assert!(
-            record.contains(&format!(
-                r#""hash_after":"{:016x}""#,
-                content_hash(b"alpha\nBETA\n")
-            )),
+            record.contains(&format!(r#""hash_after":"{after}""#)),
             "{record}"
         );
     }
@@ -2139,12 +2148,11 @@ aaa
         let text = String::from_utf8(printed).unwrap();
         let (body, summary) = text.split_once("Replaced").expect("the summary is printed");
         assert_eq!(body, "alpha\nBETA\n");
+        let mut buffer = [0u8; HASH_CHARS];
+        let after = format_hash(&mut buffer, content_hash(b"alpha\nBETA\n"), HASH_CHARS);
         assert_eq!(
             summary.trim(),
-            format!(
-                "1 occurrence(s); content is {:016x}",
-                content_hash(b"alpha\nBETA\n")
-            )
+            format!("1 occurrence(s); content is {after}")
         );
     }
 

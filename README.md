@@ -600,8 +600,8 @@ The file's name is a token for the whole content; a line's name is derived from 
 
 ```bash
 $ sz-find --heading --fields line-numbers,line-hashes,file-hash TODO parser.c
-parser.c  54cb6b8cbdf213ac
-2:5npdz5bs:    // TODO: handle EOF
+parser.c  ak5pq35xy89tr
+2:bbcvyaqk:    // TODO: handle EOF
 ```
 
 Or, for a program reading the output, one record per file and one per line:
@@ -609,29 +609,29 @@ Or, for a program reading the output, one record per file and one per line:
 ```bash
 $ sz-find --fields line-hashes,file-hash --format json TODO parser.c
 {"type":"begin","data":{"path":{"text":"parser.c"}}}
-{"type":"match","data":{"path":{"text":"parser.c"},"lines":{"text":"    // TODO: handle EOF"},"line_number":2,"absolute_offset":31,"line_hash":"5npdz5bs","submatches":[{"match":{"text":"TODO"},"start":7,"end":11}]}}
-{"type":"end","data":{"path":{"text":"parser.c"},"file_hash":"54cb6b8cbdf213ac","stats":{"matches":1,"lines_searched":4}}}
+{"type":"match","data":{"path":{"text":"parser.c"},"lines":{"text":"    // TODO: handle EOF"},"line_number":2,"absolute_offset":31,"line_hash":"bbcvyaqk","submatches":[{"match":{"text":"TODO"},"start":7,"end":11}]}}
+{"type":"end","data":{"path":{"text":"parser.c"},"file_hash":"ak5pq35xy89tr","stats":{"matches":1,"lines_searched":4}}}
 ```
 
 __The edit names both.__
 `--expect-hash` is the file token; the pattern is the line name; `--occurrences one` asserts the name picks out exactly one line:
 
 ```bash
-$ sz-replace --in-place --expect-hash 54cb6b8cbdf213ac \
-             --match line-hash --occurrences one 5npdz5bs '    if (at_eof(s)) return 1;' \
+$ sz-replace --in-place --expect-hash ak5pq35xy89tr \
+             --match line-hash --occurrences one bbcvyaqk '    if (at_eof(s)) return 1;' \
              --format json parser.c
-{"type":"summary","data":{"path":{"text":"parser.c"},"replacements":1,"dry_run":false,"hash_before":"54cb6b8cbdf213ac","hash_after":"af697883fe502ac7"}}
+{"type":"summary","data":{"path":{"text":"parser.c"},"replacements":1,"dry_run":false,"hash_before":"ak5pq35xy89tr","hash_after":"nxmqh0zya0nce"}}
 ```
 
 __The token it hands back is the one the next edit passes__, so a run of edits costs one read rather than one per edit:
 
 ```bash
 $ sz-find --fields line-hashes at_eof parser.c
-fdffa87e:    if (at_eof(s)) return 1;
+ytyymgew:    if (at_eof(s)) return 1;
 
-$ sz-replace --in-place --expect-hash af697883fe502ac7 \
-             --match line-hash --after fdffa87e '    flush(s);' --format json parser.c
-{"type":"summary","data":{"path":{"text":"parser.c"},"replacements":1,"dry_run":false,"hash_before":"af697883fe502ac7","hash_after":"d50af765dc7423d5"}}
+$ sz-replace --in-place --expect-hash nxmqh0zya0nce \
+             --match line-hash --after ytyymgew '    flush(s);' --format json parser.c
+{"type":"summary","data":{"path":{"text":"parser.c"},"replacements":1,"dry_run":false,"hash_before":"nxmqh0zya0nce","hash_after":"tm5feseweghxa"}}
 ```
 
 __Both names refuse rather than guess.__
@@ -639,13 +639,13 @@ A spent file token means the file moved; a name that picks out nothing means the
 Either way the file is untouched and the exit code says to look again:
 
 ```bash
-$ sz-replace --in-place --expect-hash 54cb6b8cbdf213ac --match line-hash 5npdz5bs x parser.c
-sz-replace: parser.c: content is d50af765dc7423d5, not the expected 54cb6b8cbdf213ac; re-read it before editing
+$ sz-replace --in-place --expect-hash ak5pq35xy89tr --match line-hash bbcvyaqk x parser.c
+sz-replace: parser.c: content is tm5feseweghxa, not the expected ak5pq35xy89tr; re-read it before editing
 $ echo $?
 3
 
-$ sz-replace --in-place --match line-hash 5npdz5bs x parser.c
-sz-replace: parser.c: `5npdz5bs` names no line here; re-read the file
+$ sz-replace --in-place --match line-hash bbcvyaqk x parser.c
+sz-replace: parser.c: `bbcvyaqk` names no line here; re-read the file
 $ echo $?
 3
 ```
@@ -667,13 +667,17 @@ A name identifies content rather than position, so identical lines share one, an
 Every candidate is found before a byte is written, so __a name too short to be unique can only ever cause a refused edit, never an edit to the wrong line__ — which is what makes the default eight characters safe.
 `--hash-width` goes up to 13 for the whole 64 bits, and because rendering truncates rather than folds, a short name is always a prefix of the long one.
 
+Both names are written in the same alphabet — Crockford's base32, less `i`, `l`, `o` and `u`, so nothing needs shell quoting and no character is confusable with another.
+A file token is simply a name at the full 13 characters; anything shorter is a line name, and `--expect-hash` refuses it rather than zero-extending a truncated paste into a match against some other file.
+Each character pins five bits, so eight characters is forty.
+
 A name covers the line's terminator as well as its text.
 That is what makes it mean the same thing whether a file is read as LF or CRLF, and it is why every line operation falls out of one replacement argument:
 
 ```bash
-$ sz-replace --match line-hash 5npdz5bs '    return 1;' parser.c   # rewrite
-$ sz-replace --match line-hash 5npdz5bs '' parser.c                # delete
-$ sz-replace --match line-hash 5npdz5bs $'\n' parser.c             # blank, keeping the line
+$ sz-replace --match line-hash bbcvyaqk '    return 1;' parser.c   # rewrite
+$ sz-replace --match line-hash bbcvyaqk '' parser.c                # delete
+$ sz-replace --match line-hash bbcvyaqk $'\n' parser.c             # blank, keeping the line
 ```
 
 The cost of covering the terminator is that adding a final newline renames the last line of a file.

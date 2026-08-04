@@ -1225,8 +1225,8 @@ pub fn format_grouped_number(buffer: &mut [u8; 26], value: usize) -> &str {
 
 // region: Content Hashing
 
-/// How many characters render a whole 64-bit hash in [`format_hash`]. Twelve carry five bits
-/// each and the leading one carries the remaining four, which covers a `u64` exactly.
+/// How many characters render a whole 64-bit hash in [`format_hash`]. Thirteen carry five
+/// bits each, which is one more bit than a `u64` holds; the spare one is a zero at the end.
 pub const HASH_CHARS: usize = 13;
 
 /// The shortest prefix a caller may name a line by. Four characters is twenty bits, which
@@ -1273,20 +1273,25 @@ pub fn content_hash(data: &[u8]) -> u64 {
 /// `sz-find --hash-width 4` agrees with the first four characters of `--hash-width 13`.
 pub fn format_hash(buffer: &mut [u8; HASH_CHARS], hash: u64, width: usize) -> &str {
     let width = width.clamp(1, HASH_CHARS);
+    // Sixty-five bits are rendered, not sixty-four: appending a zero puts the one symbol
+    // that cannot range over the whole alphabet at the *end*, where only a full-width name
+    // reaches it. Every shorter name then pins a clean five bits per character.
+    let padded = (hash as u128) << 1;
     for (index, slot) in buffer.iter_mut().enumerate() {
         let shift = 5 * (HASH_CHARS - 1 - index);
-        *slot = HASH_ALPHABET[((hash >> shift) & 0x1F) as usize];
+        *slot = HASH_ALPHABET[((padded >> shift) & 0x1F) as usize];
     }
     // Only alphabet bytes were written.
     core::str::from_utf8(&buffer[..width]).expect("the alphabet is ASCII")
 }
 
-/// The bits a line name constrains: a hash renders through [`format_hash`] beginning with
-/// this name exactly when `hash & mask == value`.
+/// The bits a name constrains: a hash renders through [`format_hash`] beginning with this
+/// name exactly when `hash & mask == value`. A file's token is the case where every bit is
+/// pinned, which is why one type serves both.
 ///
 /// Because rendering truncates rather than folds, a name of `n` characters pins the leading
-/// `5n - 1` bits, so matching is one AND and one compare per line — no line is ever
-/// rendered to be compared.
+/// `5n` bits, so matching is one AND and one compare per line — no line is ever rendered to
+/// be compared.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HashPrefix {
     value: u64,
@@ -1300,65 +1305,62 @@ impl HashPrefix {
     }
 }
 
-/// Parse a line name, as `sz-find --fields line-hashes` prints one.
+/// Parse a name, as `sz-find` prints one: a line's under `--fields line-hashes`, a file's
+/// under `--fields file-hash`. One alphabet and one length rule serve both — a full-width
+/// name pins a whole hash, a shorter one pins its leading bits.
 pub fn parse_hash_prefix(name: &str) -> Result<HashPrefix, String> {
     if !(HASH_CHARS_MIN..=HASH_CHARS).contains(&name.len()) {
-        // Sixteen hex digits is the whole-file token, which callers do reach for by mistake.
-        let hint = if name.len() == 16 {
-            ", which is the length of a whole-file hash"
-        } else {
-            ""
-        };
         return Err(format!(
-            "`{name}` is {} characters{hint}; a line name is {HASH_CHARS_MIN} to {HASH_CHARS}",
+            "`{name}` is {} characters; a name is {HASH_CHARS_MIN} to {HASH_CHARS}",
             name.len()
         ));
     }
 
-    let mut value = 0u64;
+    let mut padded = 0u128;
     for (index, byte) in name.bytes().enumerate() {
         let lowered = byte.to_ascii_lowercase();
         let Some(digit) = HASH_ALPHABET.iter().position(|entry| *entry == lowered) else {
             return Err(format!(
-                "`{name}` is not a line name: `{}` is not in the alphabet, which drops \
+                "`{name}` is not a name: `{}` is not in the alphabet, which drops \
                  i, l, o and u to keep names legible",
                 byte as char
             ));
         };
-        // The leading character carries only the hash's top four bits, so half the alphabet
-        // can never appear there and a name that opens with one names nothing.
-        if index == 0 && digit > 0xF {
+        // The last character of a full-width name carries the hash's final four bits against
+        // the padding zero [`format_hash`] appends, so an odd symbol cannot close one. Every
+        // earlier character, and every character of a shorter name, ranges over all thirty-two.
+        if index == HASH_CHARS - 1 && digit % 2 == 1 {
             return Err(format!(
-                "no line name begins with `{}`: the first character carries four bits, \
-                 so it is always one of 0-9 or a-f",
+                "no name ends with `{}`: the last character carries four bits against a \
+                 padding zero, so it is always one of 02468acegjmprtwy",
                 byte as char
             ));
         }
-        value |= (digit as u64) << (5 * (HASH_CHARS - 1 - index));
+        padded |= (digit as u128) << (5 * (HASH_CHARS - 1 - index));
     }
 
+    // Shifted back off the padding bit, so both halves describe the hash itself and matching
+    // needs no rendering. `5 * HASH_CHARS` bits wide, one more than the hash it carries.
     let unpinned = 5 * (HASH_CHARS - name.len());
-    let mask = if unpinned >= u64::BITS as usize {
-        0
-    } else {
-        !0u64 << unpinned
-    };
+    let mask = (((!0u128 << unpinned) & ((1u128 << (5 * HASH_CHARS)) - 1)) >> 1) as u64;
     Ok(HashPrefix {
-        value: value & mask,
+        value: (padded >> 1) as u64 & mask,
         mask,
     })
 }
 
-/// Parse a whole-file token: exactly sixteen hex digits, in either case, as `{:016x}` writes
-/// them. A short or long token is refused rather than zero-extended, so a truncated paste
-/// fails loudly instead of matching some other file.
+/// Parse a whole-file token: a name at full width, as `sz-find --fields file-hash` prints
+/// one. Anything shorter is refused rather than zero-extended, so a truncated paste fails
+/// loudly instead of standing in for some other file.
 pub fn parse_content_hash(value: &str) -> Result<u64, String> {
-    if value.len() != 16 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() != HASH_CHARS {
         return Err(format!(
-            "`{value}` is not a content hash; expected 16 hex digits, as --summary prints"
+            "`{value}` is {} characters; a file's hash is {HASH_CHARS}, as \
+             `sz-find --fields file-hash` prints it",
+            value.len()
         ));
     }
-    u64::from_str_radix(value, 16).map_err(|error| error.to_string())
+    Ok(parse_hash_prefix(value)?.value)
 }
 
 /// A writer that hashes every byte on its way through, so a stream can be checksummed
@@ -1599,11 +1601,15 @@ impl std::fmt::Display for Failure {
                 path,
                 expected,
                 actual,
-            } => write!(
-                formatter,
-                "{path}: content is {actual:016x}, not the expected {expected:016x}; \
-                 re-read it before editing"
-            ),
+            } => {
+                let (mut found, mut wanted) = ([0u8; HASH_CHARS], [0u8; HASH_CHARS]);
+                write!(
+                    formatter,
+                    "{path}: content is {}, not the expected {}; re-read it before editing",
+                    format_hash(&mut found, *actual, HASH_CHARS),
+                    format_hash(&mut wanted, *expected, HASH_CHARS)
+                )
+            }
             Failure::Ambiguous {
                 path,
                 subject,
@@ -2029,10 +2035,15 @@ mod tests {
         }
         .to_string();
 
+        let mut buffer = [0u8; HASH_CHARS];
+        let actual = format_hash(&mut buffer, 0x3f2a_1c88_de10_b4e7, HASH_CHARS).to_string();
         assert!(message.contains("notes.md"), "{message}");
-        assert!(message.contains("91bc0d2f5a7e3c11"), "{message}");
-        assert!(message.contains("3f2a1c88de10b4e7"), "{message}");
-        assert!(parse_content_hash("3f2a1c88de10b4e7").is_ok());
+        assert!(
+            message.contains(format_hash(&mut buffer, 0x91bc_0d2f_5a7e_3c11, HASH_CHARS)),
+            "{message}"
+        );
+        assert!(message.contains(&actual), "{message}");
+        assert!(parse_content_hash(&actual).is_ok());
     }
 
     #[test]
@@ -2110,10 +2121,28 @@ mod tests {
             for width in HASH_CHARS_MIN..=HASH_CHARS {
                 let name = format_hash(&mut buffer, hash, width).to_string();
                 let prefix = parse_hash_prefix(&name).expect("a rendered name parses");
-                assert!(prefix.matches(hash), "`{name}` did not match {hash:016x}");
+                assert!(prefix.matches(hash), "`{name}` did not match {hash:#018x}");
                 // And it declines a hash that differs inside the bits it pins.
                 assert!(!prefix.matches(hash ^ (1 << 63)));
             }
+        }
+    }
+
+    #[test]
+    fn pins_five_bits_for_every_character_of_a_name() {
+        // The reason the rendering pads to sixty-five bits. With the spare bit at the front
+        // a four-character name pinned nineteen bits, not twenty, and half the alphabet
+        // could never open a name; with it at the back every prefix is a clean five per
+        // character and only the full width is constrained.
+        let mut buffer = [0u8; HASH_CHARS];
+        let hash = content_hash(b"    return 0;\n");
+        for width in HASH_CHARS_MIN..=HASH_CHARS {
+            let name = format_hash(&mut buffer, hash, width).to_string();
+            let pinned = parse_hash_prefix(&name)
+                .expect("a rendered name parses")
+                .mask
+                .count_ones() as usize;
+            assert_eq!(pinned, (5 * width).min(u64::BITS as usize), "`{name}`");
         }
     }
 
@@ -2129,9 +2158,8 @@ mod tests {
         for (name, expected) in [
             ("abc", "4 to 13"),
             ("abcdefghijklmn", "4 to 13"),
-            ("2544218206cee57b", "whole-file hash"),
             ("6vzvxbwi", "not in the alphabet"),
-            ("g6vzvxbw", "first character"),
+            ("zzzzzzzzzzzzz", "last character"),
         ] {
             let error = parse_hash_prefix(name).expect_err("`{name}` must not parse");
             assert!(
@@ -2145,11 +2173,11 @@ mod tests {
     fn renders_a_hash_at_the_width_asked_for() {
         let mut buffer = [0u8; HASH_CHARS];
         assert_eq!(format_hash(&mut buffer, 0, HASH_CHARS), "0000000000000");
-        // Every bit set. The leading character carries the top four and the twelve after it
-        // five each, which is what makes thirteen cover a `u64` exactly.
+        // Every bit set. Twelve characters of five bits each, then the last four against the
+        // padding zero — which is why the closing symbol is `y` (30) rather than `z` (31).
         assert_eq!(
             format_hash(&mut buffer, u64::MAX, HASH_CHARS),
-            "fzzzzzzzzzzzz"
+            "zzzzzzzzzzzzy"
         );
         for width in 1..=HASH_CHARS {
             assert_eq!(
@@ -2299,22 +2327,25 @@ mod tests {
     #[test]
     fn parses_a_content_hash_token_in_either_case() {
         assert_eq!(
-            parse_content_hash("00000000deadbeef").unwrap(),
-            parse_content_hash("00000000DEADBEEF").unwrap()
+            parse_content_hash("0000006ynpzey").unwrap(),
+            parse_content_hash("0000006YNPZEY").unwrap()
         );
+        let mut buffer = [0u8; HASH_CHARS];
         let value = content_hash(b"round trip");
-        assert_eq!(parse_content_hash(&format!("{value:016x}")).unwrap(), value);
+        let token = format_hash(&mut buffer, value, HASH_CHARS).to_string();
+        assert_eq!(parse_content_hash(&token).unwrap(), value);
     }
 
     #[test]
-    fn refuses_a_content_hash_that_is_not_exactly_sixteen_digits() {
-        // Zero-extending a truncated paste would silently compare against another file.
+    fn refuses_a_content_hash_that_is_not_a_whole_name() {
+        // Zero-extending a truncated paste would silently compare against another file, and
+        // a line name is a prefix of one — accepting it would edit against the wrong subject.
         for token in [
             "",
-            "deadbeef",
-            "00000000deadbeef0",
-            "0x0000000deadbeef",
-            "gggggggggggggggg",
+            "6ynpzey",
+            "0000006ynpzeyy",
+            "0000006ynpzei",
+            "0000006ynpzez",
         ] {
             assert!(
                 parse_content_hash(token).is_err(),
@@ -2329,14 +2360,21 @@ mod tests {
         // `sz::hash`, so a dependency bump that changes it must fail the build rather than
         // silently reissue different names for the same lines.
         let mut buffer = [0u8; HASH_CHARS];
-        assert_eq!(format!("{:016x}", content_hash(b"")), "066e609969a45246");
         assert_eq!(
-            format!("{:016x}", content_hash(b"the quick brown fox\n")),
-            "dc66974a586d8b9a"
+            format_hash(&mut buffer, content_hash(b""), HASH_CHARS),
+            "0sq616b9mh94c"
+        );
+        assert_eq!(
+            format_hash(
+                &mut buffer,
+                content_hash(b"the quick brown fox\n"),
+                HASH_CHARS
+            ),
+            "vhk9ejjrdp5sm"
         );
         assert_eq!(
             format_hash(&mut buffer, content_hash(b"    return 0;\n"), HASH_CHARS),
-            "efq8svzx6km8r"
+            "wzehkqztd78hg"
         );
     }
 

@@ -1479,10 +1479,13 @@ impl Emitter<'_, '_> {
                 if let Some(hash) = file_hash {
                     // Two spaces rather than `:`, which would read as a `file:line` prefix,
                     // and outside the colour span as every other column's separator is.
+                    let mut buffer = [0u8; HASH_CHARS];
                     write!(
                         self.output,
-                        "  {}{hash:016x}{}",
-                        config.colors.hash, config.colors.reset
+                        "  {}{}{}",
+                        config.colors.hash,
+                        format_hash(&mut buffer, hash, HASH_CHARS),
+                        config.colors.reset
                     )?;
                 }
                 self.output.write_all(b"\n")?;
@@ -1812,7 +1815,12 @@ fn print_json_end(
     // the opening record is written long before a stream reaches. Naming it here is what
     // lets a piped search report one without holding the pipe in memory.
     if let Some(hash) = file_hash {
-        write!(output, r#","file_hash":"{hash:016x}""#)?;
+        let mut buffer = [0u8; HASH_CHARS];
+        write!(
+            output,
+            r#","file_hash":"{}""#,
+            format_hash(&mut buffer, hash, HASH_CHARS)
+        )?;
     }
     write!(
         output,
@@ -3435,13 +3443,12 @@ mod tests {
             DEFAULT_HASH_WIDTH,
         );
         assert!(text.contains(&format!(r#""line_hash":"{name}""#)), "{text}");
-        assert!(
-            text.contains(&format!(r#""file_hash":"{:016x}""#, content_hash(corpus))),
-            "{text}"
-        );
+        let mut whole = [0u8; HASH_CHARS];
+        let file = format_hash(&mut whole, content_hash(corpus), HASH_CHARS);
+        assert!(text.contains(&format!(r#""file_hash":"{file}""#)), "{text}");
         // And both are in the form the consuming side parses.
         assert!(parse_hash_prefix(name).is_ok());
-        assert!(parse_content_hash(&format!("{:016x}", content_hash(corpus))).is_ok());
+        assert!(parse_content_hash(file).is_ok());
     }
 
     #[test]
@@ -3566,7 +3573,8 @@ mod tests {
     fn names_the_whole_file_once_beside_its_name() {
         let search = make_search(b"error");
         let corpus = b"alpha error one\nbeta error two\n";
-        let expected = format!("{:016x}", content_hash(corpus));
+        let mut buffer = [0u8; HASH_CHARS];
+        let expected = format_hash(&mut buffer, content_hash(corpus), HASH_CHARS).to_string();
 
         let mut json = make_config();
         json.output_format = OutputFormat::Json;
@@ -3664,7 +3672,9 @@ mod tests {
         config.file_hash = true;
         let path = SearchPath::Print(config);
         let search = make_search(b"error");
-        let expected = format!(r#""file_hash":"{:016x}""#, content_hash(SEAM_CORPUS));
+        let mut buffer = [0u8; HASH_CHARS];
+        let file = format_hash(&mut buffer, content_hash(SEAM_CORPUS), HASH_CHARS);
+        let expected = format!(r#""file_hash":"{file}""#);
 
         let (whole, ..) = search_whole(SEAM_CORPUS, &search, &path);
         assert!(String::from_utf8(whole).unwrap().contains(&expected));
@@ -3688,13 +3698,9 @@ mod tests {
 
         let (streamed, ..) = search_streamed(SEAM_CORPUS, 7, &search, &SearchPath::Print(config));
         let text = String::from_utf8(streamed).unwrap();
-        assert!(
-            text.contains(&format!(
-                r#""file_hash":"{:016x}""#,
-                content_hash(SEAM_CORPUS)
-            )),
-            "{text}"
-        );
+        let mut buffer = [0u8; HASH_CHARS];
+        let file = format_hash(&mut buffer, content_hash(SEAM_CORPUS), HASH_CHARS);
+        assert!(text.contains(&format!(r#""file_hash":"{file}""#)), "{text}");
         assert_eq!(text.matches(r#""type":"match""#).count(), 1);
     }
 
