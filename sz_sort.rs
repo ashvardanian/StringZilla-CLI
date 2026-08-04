@@ -363,19 +363,17 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         let path = args.input.as_deref().expect("validated");
         write_replacing("sz-sort", path, |output| {
             write_sorted(&lines, &permutation, order, &config, output)
-        })
-        .at(path)?
+        })?
     } else {
-        let target = args.output.as_deref().unwrap_or("-");
-        let mut opened;
-        let destination: &mut dyn Write = match target {
-            "-" => &mut *output,
-            path => {
-                opened = get_output(Some(path)).at(path)?;
-                &mut *opened
-            }
-        };
-        write_sorted(&lines, &permutation, order, &config, destination).at(target)?
+        // Through a temporary like `--in-place`, so an interrupted run leaves the previous
+        // file rather than a half-written one, and naming the input as the output does not
+        // truncate the mapping this run is still reading from.
+        match args.output.as_deref().filter(|path| *path != "-") {
+            Some(path) => write_creating("sz-sort", path, |output| {
+                write_sorted(&lines, &permutation, order, &config, output)
+            })?,
+            None => write_sorted(&lines, &permutation, order, &config, output).at("-")?,
+        }
     };
 
     if args.format == Format::Json {

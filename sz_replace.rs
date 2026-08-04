@@ -199,24 +199,19 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         let path = args.input.as_deref().expect("validated");
         write_replacing("sz-replace", path, |output| {
             replace_all_to(data, pattern, replacement, args.ignore_case, output)
-        })
-        .at(path)?
+        })?
     } else {
         // Stream directly to stdout / --output — no full-output buffer. A pipe closing
         // during the flush ends the run where one closing during the write does.
-        let target = args.output.as_deref().unwrap_or("-");
-        let mut opened;
-        let destination: &mut dyn Write = match target {
-            "-" => &mut *output,
-            path => {
-                opened = get_output(Some(path)).at(path)?;
-                &mut *opened
-            }
-        };
-        let count =
-            replace_all_to(data, pattern, replacement, args.ignore_case, destination).at(target)?;
-        destination.flush().at(target)?;
-        count
+        // Through a temporary like `--in-place`, so an interrupted run leaves the previous
+        // file rather than a half-written one — and so naming the input as the output does
+        // not truncate the mapping this run is still reading from.
+        match args.output.as_deref().filter(|path| *path != "-") {
+            Some(path) => write_creating("sz-replace", path, |output| {
+                replace_all_to(data, pattern, replacement, args.ignore_case, output)
+            })?,
+            None => replace_all_to(data, pattern, replacement, args.ignore_case, output).at("-")?,
+        }
     };
 
     if args.format == Format::Json {

@@ -182,28 +182,193 @@ pub fn is_readable_entry(entry: &ignore::DirEntry) -> bool {
 /// hardlink, so a file carrying more than one link is instead copied back over the original
 /// inode — preserving the link at the cost of a window where the file is neither version.
 /// Symlinks survive either way, since `path` is resolved before anything is written.
+///
+/// The path is attached here rather than by the caller, since every failure below is about
+/// this one file and the function already knows which.
 pub fn write_replacing<T>(
     tool: &str,
     path: &str,
     write: impl FnOnce(&mut dyn Write) -> io::Result<T>,
+) -> Result<T, Failure> {
+    (|| {
+        // Resolve first: editing through a symlink must change the file it names, not replace
+        // the link with a regular file. The input has to exist, so there is no create case.
+        let resolved = std::fs::canonicalize(path)?;
+        let (file, metadata) = open_target(&resolved)?;
+        let target = if metadata.is_file() {
+            Target::Replaceable {
+                resolved,
+                file,
+                metadata,
+            }
+        } else {
+            Target::Direct(file)
+        };
+        write_through_temporary(tool, path, target, write)
+    })()
+    .at(path)
+}
+
+/// Put the result at `path`, creating it if nothing is there yet and swapping it in only
+/// once the bytes are on disk — so an interrupted run leaves the previous file, or no file,
+/// rather than a truncated one. The temporary is a sibling of the target, so the rename
+/// stays inside one filesystem.
+///
+/// Unlike [`write_replacing`] this is the destination rather than the source, so a target
+/// that is not a regular file — `/dev/null`, a FIFO, a terminal — is written straight
+/// through. Renaming a regular file over a device node would replace it.
+pub fn write_creating<T>(
+    tool: &str,
+    path: &str,
+    write: impl FnOnce(&mut dyn Write) -> io::Result<T>,
+) -> Result<T, Failure> {
+    (|| write_through_temporary(tool, path, resolve_target(path)?, write))().at(path)
+}
+
+/// Open an existing target for writing, with its metadata.
+///
+/// A rename needs only write permission on the directory, so it would happily replace a file
+/// the caller cannot write. Opening the target settles that question the way the kernel
+/// would, before anything is created.
+fn open_target(resolved: &Path) -> io::Result<(File, std::fs::Metadata)> {
+    let file = OpenOptions::new().write(true).open(resolved)?;
+    let metadata = file.metadata()?;
+    Ok((file, metadata))
+}
+
+/// What a destination turns out to be, which decides whether the result can be swapped in
+/// or has to be written where it stands.
+enum Target {
+    /// A regular file at a name a rename can replace.
+    Replaceable {
+        resolved: std::path::PathBuf,
+        file: File,
+        metadata: std::fs::Metadata,
+    },
+    /// A stream or device — `/dev/null`, `/dev/stdout`, a FIFO, a terminal. There is nothing
+    /// to preserve and no name a rename could put the result at.
+    Direct(File),
+    /// Nothing is there yet, so the result is created at this name.
+    Fresh(std::path::PathBuf),
+}
+
+/// Decide what `path` denotes.
+///
+/// Opening comes before resolving, deliberately. `/dev/stdout` and `/dev/fd/N` are openable
+/// but resolve to names that denote something else — on macOS `realpath("/dev/stdout")` under
+/// a redirect yields `/dev/fd/<the target's basename>`, which does not exist — so a
+/// resolve-first order turns a stream to write into a file to create, next to the device
+/// nodes. A rename may only replace a name that denotes the very file that was opened, and
+/// anything failing that test is written where it stands.
+fn resolve_target(path: &str) -> io::Result<Target> {
+    match OpenOptions::new().write(true).open(path) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            if metadata.is_file() {
+                if let Ok(resolved) = std::fs::canonicalize(path) {
+                    if denotes(&resolved, &metadata) {
+                        return Ok(Target::Replaceable {
+                            resolved,
+                            file,
+                            metadata,
+                        });
+                    }
+                }
+            }
+            Ok(Target::Direct(file))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A symlink whose target does not exist yet is still the caller's chosen name
+            // for the file, so the result lands where the link points rather than over it.
+            let target = link_target(Path::new(path));
+            let name = target
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a file name"))?;
+            let directory = target
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            Ok(Target::Fresh(std::fs::canonicalize(directory)?.join(name)))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `resolved` names the same file as the one already opened.
+fn denotes(resolved: &Path, opened: &std::fs::Metadata) -> bool {
+    let Ok(named) = std::fs::metadata(resolved) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        named.dev() == opened.dev() && named.ino() == opened.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = opened;
+        named.is_file()
+    }
+}
+
+/// Follow a chain of symlinks that ends somewhere nothing exists, so a write through a
+/// dangling link creates its target rather than replacing the link. Bounded, since a link
+/// may point at itself.
+fn link_target(path: &Path) -> std::path::PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(next) = std::fs::read_link(&current) else {
+            return current;
+        };
+        current = match current.parent() {
+            Some(directory) if next.is_relative() => directory.join(next),
+            _ => next,
+        };
+    }
+    current
+}
+
+fn write_through_temporary<T>(
+    tool: &str,
+    path: &str,
+    target: Target,
+    write: impl FnOnce(&mut dyn Write) -> io::Result<T>,
 ) -> io::Result<T> {
-    // Resolve first: editing through a symlink must change the file it names, not replace
-    // the link with a regular file.
-    let resolved = std::fs::canonicalize(path)?;
-    // A rename needs only write permission on the directory, so it would happily replace a
-    // file the caller cannot write. Opening the target settles that question the way the
-    // kernel would, before anything is created.
-    let target = OpenOptions::new().write(true).open(&resolved)?;
-    let metadata = target.metadata()?;
+    // Nothing to preserve and no name to rename to, so the bytes go in where they stand,
+    // exactly as `File::create` would have put them.
+    let (resolved, existing) = match target {
+        Target::Direct(file) => {
+            let mut writer = BufWriter::new(&file);
+            let value = write(&mut writer)?;
+            writer.flush()?;
+            return Ok(value);
+        }
+        Target::Replaceable {
+            resolved,
+            file,
+            metadata,
+        } => (resolved, Some((file, metadata))),
+        Target::Fresh(resolved) => (resolved, None),
+    };
+    let resolved = resolved.as_path();
+
     let directory = resolved.parent().unwrap_or(Path::new("."));
-    let (mut temporary, temporary_path) = create_temporary(directory)?;
+    // Always private to start with. The window a temporary spends incomplete is exactly the
+    // window its content is half-written, and a half-written file can hold a prefix the
+    // finished one never does — a redaction that has not reached its subject yet.
+    let (mut temporary, temporary_path) = create_temporary(directory, 0o600)?;
 
     let written = (|| {
         let mut writer = BufWriter::new(&mut temporary);
         let value = write(&mut writer)?;
         writer.flush()?;
         drop(writer);
-        let _ = temporary.set_permissions(metadata.permissions());
+        // Widened only now the content is complete: a replacement lands on the mode its
+        // file already had, and a fresh file lands where `File::create` would have put it.
+        let landing = landing_permissions(existing.as_ref().map(|(_, data)| data), directory);
+        if let Some(permissions) = landing {
+            let _ = temporary.set_permissions(permissions);
+        }
         temporary.sync_all()?;
         temporary.seek(io::SeekFrom::Start(0))?;
         Ok(value)
@@ -217,8 +382,13 @@ pub fn write_replacing<T>(
         }
     };
 
-    if !is_hardlinked(&metadata) {
-        return match std::fs::rename(&temporary_path, &resolved) {
+    // Only a file that already exists can carry other names for its inode, so a fresh one
+    // always takes the atomic path.
+    let hardlinked = existing
+        .as_ref()
+        .is_some_and(|(_, metadata)| is_hardlinked(metadata));
+    if !hardlinked {
+        return match std::fs::rename(&temporary_path, resolved) {
             Ok(()) => Ok(value),
             Err(error) => {
                 let _ = std::fs::remove_file(&temporary_path);
@@ -234,7 +404,7 @@ pub fn write_replacing<T>(
 
     // The one window where the file is neither version. The result is already durable in the
     // temporary, so a failure here keeps it and names it rather than deleting the only copy.
-    let mut target = target;
+    let (mut target, _) = existing.expect("only an existing file reports hardlinks");
     let copied = (|| {
         target.set_len(0)?;
         io::copy(&mut temporary, &mut target)?;
@@ -256,6 +426,56 @@ pub fn write_replacing<T>(
     }
 }
 
+/// The mode a finished temporary should land on: the one its target already had, or the one
+/// an ordinary create would have produced.
+#[cfg(unix)]
+fn landing_permissions(
+    existing: Option<&std::fs::Metadata>,
+    directory: &Path,
+) -> Option<std::fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(match existing {
+        Some(metadata) => metadata.permissions(),
+        None => std::fs::Permissions::from_mode(0o666 & !cleared_by_umask(directory)),
+    })
+}
+
+/// Windows carries no mode; a replacement keeps its target's read-only bit and a fresh file
+/// inherits the directory's ACL, which is what `File::create` gives it too.
+#[cfg(not(unix))]
+fn landing_permissions(
+    existing: Option<&std::fs::Metadata>,
+    _directory: &Path,
+) -> Option<std::fs::Permissions> {
+    existing.map(|metadata| metadata.permissions())
+}
+
+/// The permission bits this process's umask clears.
+///
+/// POSIX offers no way to *read* a umask — only to set it and be handed back the old value —
+/// and doing that would leave every other thread creating mode-zero files for the duration.
+/// Asking the filesystem what an ordinary create produces answers the same question and races
+/// with nothing. The probe is empty, so the moment it is visible reveals nothing, and it is
+/// taken once for the life of the process.
+#[cfg(unix)]
+fn cleared_by_umask(directory: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    static CLEARED: OnceLock<u32> = OnceLock::new();
+    *CLEARED.get_or_init(|| {
+        // A directory that cannot be probed cannot be written either, so the run is about to
+        // fail on its own; the common default keeps the guess sane until it does.
+        const COMMON: u32 = 0o022;
+        let Ok((probe, path)) = create_temporary(directory, 0o666) else {
+            return COMMON;
+        };
+        let cleared = probe.metadata().map_or(COMMON, |metadata| {
+            0o666 & !(metadata.permissions().mode() & 0o777)
+        });
+        let _ = std::fs::remove_file(&path);
+        cleared
+    })
+}
+
 /// Whether replacing this file by rename would detach it from other names for the same
 /// inode. Platforms that do not report a link count take the atomic path.
 fn is_hardlinked(metadata: &std::fs::Metadata) -> bool {
@@ -270,14 +490,16 @@ fn is_hardlinked(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-/// Create a fresh temporary in `directory`, readable and writable by its owner alone.
+/// Create a fresh temporary in `directory` at `mode`, which the umask still narrows.
 /// `create_new` refuses both an existing path and a symlink, so a planted link cannot
 /// redirect the write; the nonce keeps concurrent runs in one directory apart.
-fn create_temporary(directory: &Path) -> io::Result<(File, std::path::PathBuf)> {
+fn create_temporary(directory: &Path, mode: u32) -> io::Result<(File, std::path::PathBuf)> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    #[cfg(not(unix))]
+    let _ = mode;
 
     for attempt in 0..u16::MAX {
         let nonce = std::time::SystemTime::now()
@@ -297,17 +519,6 @@ fn create_temporary(directory: &Path) -> io::Result<(File, std::path::PathBuf)> 
         io::ErrorKind::AlreadyExists,
         "could not create a temporary file",
     ))
-}
-
-/// Create an output writer from either a file path or stdout
-pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
-    match path {
-        None | Some("-") => Ok(Box::new(stdout_writer())),
-        Some(path) => {
-            let file = File::create(path)?;
-            Ok(Box::new(BufWriter::new(file)))
-        }
-    }
 }
 
 /// Buffered, locked stdout. `io::Stdout` is line-buffered, costing a syscall per record.
@@ -1199,15 +1410,182 @@ mod tests {
         assert_eq!(fs::read(&second).unwrap(), b"a\nb\n");
     }
     #[test]
+    fn creates_an_output_file_through_a_temporary() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("fresh.txt");
+
+        write_creating("sz-test", path.to_str().unwrap(), |output| {
+            output.write_all(b"written\n")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"written\n");
+        // The temporary is gone, so the directory holds only what was asked for.
+        let mut names: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![std::ffi::OsString::from("fresh.txt")]);
+    }
+
+    #[test]
+    fn keeps_the_previous_output_when_the_write_fails() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("out.txt");
+        fs::write(&path, b"previous\n").unwrap();
+
+        let failed: Result<(), Failure> =
+            write_creating("sz-test", path.to_str().unwrap(), |output| {
+                output.write_all(b"partial\n")?;
+                Err(io::Error::other("interrupted"))
+            });
+
+        // `File::create` would have truncated it before the closure ever ran.
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"previous\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preserves_the_permissions_of_an_existing_output_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("out.txt");
+        fs::write(&path, b"previous\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_creating("sz-test", path.to_str().unwrap(), |output| {
+            output.write_all(b"written\n")
+        })
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn keeps_a_temporary_private_while_it_is_incomplete() {
+        // The window a temporary spends unfinished is the window its content is a prefix of
+        // what was meant, so it is nobody's business until the rename. Checked from inside
+        // the write, because by the time the call returns there is no temporary to look at.
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("fresh.txt");
+        let mut seen = None;
+
+        write_creating("sz-test", path.to_str().unwrap(), |output| {
+            output.write_all(b"half a secret")?;
+            seen = fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .find(|entry| entry.file_name().to_string_lossy().starts_with(".sz."))
+                .map(|entry| entry.metadata().unwrap().permissions().mode() & 0o777);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            Some(0o600),
+            "the temporary was readable before it was finished"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn leaves_a_fresh_output_file_to_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let ours = directory.path().join("ours.txt");
+        let theirs = directory.path().join("theirs.txt");
+
+        write_creating("sz-test", ours.to_str().unwrap(), |output| {
+            output.write_all(b"written\n")
+        })
+        .unwrap();
+        // What `File::create` produces under the same umask, which is what `--output` used
+        // to do and must keep doing.
+        File::create(&theirs).unwrap();
+
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&ours), mode_of(&theirs));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writes_through_a_name_that_does_not_denote_what_it_opens() {
+        // `/dev/stdout` opens fine and, under a redirect to a regular file, resolves to
+        // `/dev/fd/<the target's basename>` — a name that does not exist. Deciding by
+        // `is_file` alone would send that down the rename path and fail; the round-trip
+        // test is what catches it.
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("out.txt");
+        fs::write(&path, b"seed\n").unwrap();
+        let opened = OpenOptions::new().write(true).open(&path).unwrap();
+        let metadata = opened.metadata().unwrap();
+
+        assert!(denotes(&path, &metadata));
+        assert!(!denotes(Path::new("/dev/fd/out.txt"), &metadata));
+        assert!(!denotes(directory.path(), &metadata));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn creates_the_target_of_a_dangling_symlink_rather_than_replacing_the_link() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let link = directory.path().join("link.txt");
+        let target = directory.path().join("target.txt");
+        std::os::unix::fs::symlink("target.txt", &link).unwrap();
+
+        write_creating("sz-test", link.to_str().unwrap(), |output| {
+            output.write_all(b"written\n")
+        })
+        .unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"written\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writes_straight_through_a_target_that_is_not_a_regular_file() {
+        // Renaming a regular file over `/dev/null` would replace the device node for every
+        // process on the machine, so this path must never reach the temporary. A run that
+        // could create the temporary in `/dev` is exactly the run where a regression does
+        // that damage, so it declines to be the one that finds out.
+        let probe = Path::new("/dev/.sz-write-probe");
+        if File::create(probe).is_ok() {
+            let _ = fs::remove_file(probe);
+            return;
+        }
+
+        write_creating("sz-test", "/dev/null", |output| {
+            output.write_all(b"discarded\n")
+        })
+        .unwrap();
+
+        assert!(!fs::metadata("/dev/null").unwrap().is_file());
+    }
+
+    #[test]
     fn leaves_the_input_untouched_when_the_rewrite_fails() {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("lines.txt");
         fs::write(&path, b"original\n").unwrap();
 
-        let failed: io::Result<()> = write_replacing("sz-test", path.to_str().unwrap(), |output| {
-            output.write_all(b"partial\n")?;
-            Err(io::Error::other("interrupted"))
-        });
+        let failed: Result<(), Failure> =
+            write_replacing("sz-test", path.to_str().unwrap(), |output| {
+                output.write_all(b"partial\n")?;
+                Err(io::Error::other("interrupted"))
+            });
 
         assert!(failed.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"original\n");

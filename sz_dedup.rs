@@ -462,8 +462,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         };
         write_replacing("sz-dedup", path, |output| {
             dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
-        })
-        .at(path)?
+        })?
     } else if args.dry_run || args.quiet {
         let config = OutputConfig {
             rendering: Rendering::Terminated(Terminator::from_null(args.null)),
@@ -478,16 +477,15 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
             },
             path: name,
         };
-        let target = args.output.as_deref().unwrap_or("-");
-        let mut opened;
-        let destination: &mut dyn Write = match target {
-            "-" => &mut *output,
-            path => {
-                opened = get_output(Some(path)).at(path)?;
-                &mut *opened
-            }
-        };
-        dedup_to_writer(data, destination, args.ignore_case, utf8_mode, &config).at(target)?
+        // Through a temporary like `--in-place`, so an interrupted run leaves the previous
+        // file rather than a half-written one, and naming the input as the output does not
+        // truncate the mapping this run is still reading from.
+        match args.output.as_deref().filter(|path| *path != "-") {
+            Some(path) => write_creating("sz-dedup", path, |output| {
+                dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
+            })?,
+            None => dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config).at("-")?,
+        }
     };
 
     if args.format == Format::Json {
