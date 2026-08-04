@@ -143,6 +143,20 @@ struct Args {
     quiet: bool,
 }
 
+impl Args {
+    /// Whether this run must see the whole input before it may write.
+    ///
+    /// Three questions cannot be answered from a window: whether the input still hashes to
+    /// what the caller expects, whether a pattern occurs exactly once, and which line a name
+    /// picks out. Read by the code that chooses how to open the input *and* by the code that
+    /// decides what to edit, so the two cannot drift into answering different questions.
+    fn needs_whole_input(&self) -> bool {
+        self.occurrences == Occurrences::One
+            || self.match_kind == Match::LineHash
+            || self.expect_hash.is_some()
+    }
+}
+
 /// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
 /// same usage block, same exit code. The kind is never displayed, so one kind serves all.
 fn reject(message: impl std::fmt::Display) -> clap::Error {
@@ -612,10 +626,17 @@ fn resolve_lines(args: &Args, data: &[u8], path: &str) -> Result<Vec<Splice>, Fa
                 line.terminator()
             };
             match placement {
+                // The breaks *inside* the text are rendered with the terminator the file
+                // uses; only the trailing one follows the line being replaced, which the
+                // last line of a file may not have.
                 Placement::Over => Splice {
                     start: line.offset,
                     end: line.end(),
-                    text: as_line(&args.replacement, line.terminator()),
+                    text: if line.terminator().is_empty() {
+                        joined(&args.replacement, borrowed)
+                    } else {
+                        as_line(&args.replacement, line.terminator())
+                    },
                 },
                 // Past the line's terminator, so the new line follows it whole. A line that
                 // has none is the file's last, and then the terminator goes in front of the
@@ -709,15 +730,9 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     // whole of it before it may write, *and* its destination cannot take the write back.
     // Every other combination has a way out: a mapped file is already whole, and a temporary
     // can be discarded once the answer arrives at the end.
-    let needs_whole_input = args.occurrences == Occurrences::One
-        || args.match_kind == Match::LineHash
-        // A refusal tells the caller to read the file again, which a pipe cannot do, so the
-        // one destination that could act on it is the one that already holds the input.
-        || args.expect_hash.is_some();
-    let sink_retracts =
-        args.in_place || counting_only || args.output.as_deref().is_some_and(|path| path != "-");
-
-    let input = if needs_whole_input && !sink_retracts {
+    // Whatever it writes to. An answer that depended on how the caller happened to open the
+    // file would be worse than no answer, and a mapped file is unaffected either way.
+    let input = if args.needs_whole_input() {
         get_input(args.input.as_deref())
     } else {
         get_input_streaming(args.input.as_deref())
@@ -765,17 +780,25 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
             ignore_case: args.ignore_case,
             limit: substring_limit(args, data, name)?,
         },
-        // Streaming is reached only when nothing about the whole input is needed, so there
-        // is nothing to count before the limit is known.
-        None => Edit::Substring {
-            pattern,
-            replacement,
-            ignore_case: args.ignore_case,
-            limit: match args.occurrences {
-                Occurrences::All => usize::MAX,
-                _ => 1,
-            },
-        },
+        // A window is only ever handed over when nothing about the whole input is needed, so
+        // there is nothing to count before the limit is known. If that ever stopped being
+        // true the modes below would quietly answer a different question — a name would
+        // become a substring, `one` would become `first` — so it fails loudly instead.
+        None => {
+            assert!(
+                !args.needs_whole_input(),
+                "a run that needs the whole input was handed a window"
+            );
+            Edit::Substring {
+                pattern,
+                replacement,
+                ignore_case: args.ignore_case,
+                limit: match args.occurrences {
+                    Occurrences::All => usize::MAX,
+                    Occurrences::First | Occurrences::One => 1,
+                },
+            }
+        }
     };
 
     let mut substitution = Substitution {
@@ -785,9 +808,9 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     };
 
     let produced = if counting_only {
-        substitution
-            .write_to(&mut io::sink())
-            .expect("writing to a sink cannot fail")
+        // Discarding the output still reads the input, so this reports a failed read rather
+        // than panicking on it, as its two siblings do.
+        substitution.write_to(&mut io::sink()).at(name)?
     } else if args.in_place {
         let path = args.input.as_deref().expect("validated");
         write_replacing("sz-replace", path, |output| substitution.write_to(output))?
@@ -1406,39 +1429,44 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_pipe_whole_only_when_it_must() {
-        // The model, stated as a table: a run holds an unbounded input only when it must
-        // know something about the whole of it before writing *and* cannot take the write
-        // back. Read here off the same predicates `run` computes.
-        let holds = |flags: &[&str]| {
+    fn holds_the_input_for_every_question_a_window_cannot_answer() {
+        // The three modes below once depended on how the caller opened the file: a pipe took
+        // the streaming path, where the whole input is unavailable, and each fell through to
+        // a default that answered a different question and exited 0. Asserted against the
+        // method `run` itself reads, so a copy cannot drift from it.
+        let needs = |flags: &[&str]| {
             let mut argv = vec!["sz-replace", "old", "new"];
             argv.extend_from_slice(flags);
-            let args = Args::try_parse_from(argv).expect("flags must parse");
-            let reports = args.summary || args.dry_run || args.format == Format::Json;
-            let needs = args.occurrences == Occurrences::One
-                || args.match_kind == Match::LineHash
-                || args.expect_hash.is_some();
-            let retracts = args.in_place
-                || args.dry_run
-                || args.quiet
-                || args.output.as_deref().is_some_and(|path| path != "-");
-            let _ = reports;
-            needs && !retracts
+            Args::try_parse_from(argv)
+                .expect("flags must parse")
+                .needs_whole_input()
         };
 
-        // Nothing about the whole input is needed.
-        assert!(!holds(&[]));
-        // A hash of what was read is accumulated as it arrives, so reporting one is free.
-        assert!(!holds(&["--summary"]));
-        // These cannot be answered without the whole input, and stdout cannot be retracted.
-        assert!(holds(&["--occurrences", "one"]));
-        assert!(holds(&["--expect-hash", "0123456789abcdef"]));
-        // Folding does not hold the input: how far a match can run follows from what the
-        // pattern folds to.
-        assert!(!holds(&["--ignore-case"]));
-        // The same questions become answerable once the destination can be discarded.
-        assert!(!holds(&["--occurrences", "one", "--output", "o.txt"]));
-        assert!(!holds(&["--occurrences", "one", "--dry-run"]));
+        for flags in [
+            vec!["--expect-hash", "0123456789abcdef"],
+            vec!["--occurrences", "one"],
+            vec!["--match", "line-hash"],
+        ] {
+            assert!(needs(&flags), "{flags:?} must hold the input");
+            // And still does once the destination could have been discarded, which is what
+            // the escape hatch keyed on.
+            for sink in [
+                vec!["--output", "o.txt"],
+                vec!["--dry-run"],
+                vec!["--quiet"],
+                vec!["--in-place"],
+            ] {
+                let mut both = flags.clone();
+                both.extend_from_slice(&sink);
+                assert!(needs(&both), "{both:?} must hold the input");
+            }
+        }
+
+        // And the questions a window can answer are still answered from one.
+        assert!(!needs(&[]));
+        assert!(!needs(&["--summary"]));
+        assert!(!needs(&["--ignore-case"]));
+        assert!(!needs(&["--occurrences", "first"]));
     }
 
     #[test]
@@ -1695,6 +1723,16 @@ aaa
                 "under {flags:?}"
             );
         }
+    }
+
+    #[test]
+    fn keeps_the_breaks_inside_a_replacement_for_a_file_with_no_final_newline() {
+        // The last line of a file has no terminator to lend, and asking for "no terminator"
+        // once erased the replacement's own line breaks as well as the trailing one.
+        assert_eq!(
+            line_edit(b"alpha\nbeta", &name_of(b"beta"), "B1\nB2", &[]),
+            b"alpha\nB1\nB2"
+        );
     }
 
     #[test]

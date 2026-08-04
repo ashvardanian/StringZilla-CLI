@@ -814,6 +814,13 @@ impl<R: Read> Refill<R> {
     /// out* would double-count every byte a cut retained, re-count the whole window each time
     /// it grew, and miss whatever a caller consumed outside the driver.
     pub fn hash_stream(&mut self) {
+        // A hash covers bytes that have not gone past yet, and a window filled before this
+        // call has already taken some. Asserted rather than tolerated: the result would be a
+        // digest of a suffix, which is indistinguishable from a digest of the input.
+        debug_assert!(
+            self.valid == 0 && !self.reached_eof,
+            "a stream is hashed from its first byte or not at all"
+        );
         self.hasher
             .get_or_insert_with(|| Box::new(sz::Hasher::new(0)));
     }
@@ -2228,6 +2235,17 @@ mod tests {
                 "capacity {capacity}"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "hashed from its first byte")]
+    #[cfg(debug_assertions)]
+    fn refuses_to_hash_a_stream_it_has_already_read_from() {
+        // A digest of a suffix is indistinguishable from a digest of the input, so the one
+        // ordering that produces it is a failure rather than a tolerated case.
+        let mut refill = Refill::new(&b"alpha\nbeta\n"[..], 8);
+        refill.advance(0).unwrap();
+        refill.hash_stream();
     }
 
     #[test]
