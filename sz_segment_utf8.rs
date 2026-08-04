@@ -62,9 +62,14 @@ struct Args {
     #[arg(long, help_heading = "Output Formats")]
     format: Option<Format>,
 
-    /// Prefix each record with `start<TAB>end<TAB>`, as byte offsets into the input
-    #[arg(long, help_heading = "Output Formats")]
-    byte_offsets: bool,
+    /// Which columns each record carries, comma-separated; none by default
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help_heading = "Output Formats"
+    )]
+    fields: Vec<Field>,
 
     /// NUL-terminate each output record instead of newline; segments may contain newlines
     #[arg(long, help_heading = "Output Formats")]
@@ -80,7 +85,7 @@ struct Args {
     chunk_bytes: Option<NonZeroUsize>,
 
     /// Suppress all output; exit 0 if any segment was produced, 1 otherwise
-    #[arg(long, conflicts_with_all = ["show", "format", "byte_offsets", "null"], help_heading = "Output Formats")]
+    #[arg(long, conflicts_with_all = ["show", "format", "fields", "null"], help_heading = "Output Formats")]
     quiet: bool,
 
     /// Filter walked files by type (e.g., rust, py, js); named files are always segmented
@@ -127,6 +132,13 @@ enum By {
     Newlines,
 }
 
+/// One column a record can carry, prefixed before its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Field {
+    /// `start<TAB>end<TAB>`, as byte offsets into the input
+    ByteOffsets,
+}
+
 /// Which record kind the run emits.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Show {
@@ -153,18 +165,16 @@ fn reject(message: impl std::fmt::Display) -> clap::Error {
 
 /// Reject the combinations clap cannot, because they turn on a value rather than a flag.
 fn validate(args: &Args) -> Result<(), clap::Error> {
-    if args.show == Some(Show::Count) && args.byte_offsets {
-        return Err(reject(
-            "--show count cannot be combined with --byte-offsets",
-        ));
+    if args.show == Some(Show::Count) && !args.fields.is_empty() {
+        return Err(reject("--show count cannot be combined with --fields"));
     }
     if args.format == Some(Format::Json) {
         if args.null {
             return Err(reject("--format json cannot be combined with --null"));
         }
-        if args.byte_offsets {
+        if args.fields.contains(&Field::ByteOffsets) {
             return Err(reject(
-                "--format json already carries offsets, so --byte-offsets is not allowed",
+                "--format json already carries offsets, so --fields byte-offsets is not allowed",
             ));
         }
     }
@@ -345,7 +355,7 @@ impl OutputConfig {
         };
         let render = if args.format == Some(Format::Json) {
             Render::Json
-        } else if args.byte_offsets {
+        } else if args.fields.contains(&Field::ByteOffsets) {
             Render::Offsets
         } else {
             Render::Plain
@@ -1072,7 +1082,10 @@ mod tests {
         let parsed = |arguments: &[&str]| Args::try_parse_from(arguments).unwrap();
         let counting = ["sz-segment-utf8", "--by", "words", "--show", "count"];
         assert!(validate(&parsed(&[&counting[..], &["--null"]].concat())).is_ok());
-        assert!(validate(&parsed(&[&counting[..], &["--byte-offsets"]].concat())).is_err());
+        assert!(validate(&parsed(
+            &[&counting[..], &["--fields", "byte-offsets"]].concat()
+        ))
+        .is_err());
     }
 
     #[test]
@@ -1106,7 +1119,7 @@ mod tests {
                 "keep-empty",
                 "show",
                 "format",
-                "byte-offsets",
+                "fields",
                 "null",
                 "chunk-bytes",
                 "quiet",

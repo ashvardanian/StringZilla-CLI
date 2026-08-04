@@ -20,7 +20,7 @@
 //! sz-find --ignore-case ERROR log.txt
 //!
 //! # Show line numbers
-//! sz-find --line-numbers error log.txt
+//! sz-find --fields line-numbers error log.txt
 //!
 //! # Count matching lines only
 //! sz-find --show count error log.txt
@@ -91,6 +91,15 @@ struct Args {
     )]
     format: Format,
 
+    /// Which columns each record carries, comma-separated; none by default
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help_heading = "Output Formats"
+    )]
+    fields: Vec<Field>,
+
     /// Match the pattern anywhere or only as a whole word
     #[arg(
         long = "match",
@@ -137,8 +146,8 @@ struct Args {
     #[arg(
         long,
         conflicts_with_all = [
-            "format", "null", "line_numbers", "column_numbers", "byte_offsets", "heading",
-            "color", "max_line_length", "context", "before_context", "after_context",
+            "format", "null", "fields", "heading", "color", "max_line_length", "context",
+            "before_context", "after_context",
         ],
         help_heading = "Output Formats"
     )]
@@ -151,18 +160,6 @@ struct Args {
     /// Colorize output (auto, always, never)
     #[arg(long, default_value = "auto", help_heading = "Output Formats")]
     color: ColorChoice,
-
-    /// Show line numbers
-    #[arg(long, help_heading = "Output Formats")]
-    line_numbers: bool,
-
-    /// Show column numbers (1-based)
-    #[arg(long, help_heading = "Output Formats")]
-    column_numbers: bool,
-
-    /// Show byte offset of each line
-    #[arg(long, help_heading = "Output Formats")]
-    byte_offsets: bool,
 
     /// Group matches by file with filename header
     #[arg(long, help_heading = "Output Formats")]
@@ -203,6 +200,18 @@ struct Args {
     /// Search binary files (don't skip them)
     #[arg(long, help_heading = "Traversal")]
     binary: bool,
+}
+
+/// One column a record can carry. `--show` picks which records the run emits; `--fields`
+/// picks what each of them says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Field {
+    /// The 1-based line number
+    LineNumbers,
+    /// The 1-based column of the first match on the line
+    ColumnNumbers,
+    /// The line's byte offset from the start of the input
+    ByteOffsets,
 }
 
 /// Which record kind the run emits.
@@ -266,9 +275,7 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     // A record naming a whole file carries no position, no line and no trimmed text.
     if matches!(show, Show::Count | Show::Files | Show::FilesWithout) {
         let decorations = [
-            (args.line_numbers, "--line-numbers"),
-            (args.column_numbers, "--column-numbers"),
-            (args.byte_offsets, "--byte-offsets"),
+            (!args.fields.is_empty(), "--fields"),
             (args.heading, "--heading"),
             (args.max_line_length.is_some(), "--max-line-length"),
             (
@@ -290,18 +297,21 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     let colored = !matches!(args.color, ColorChoice::Auto);
     let carried: Vec<(bool, &str)> = match args.format {
         // JSON escapes nothing, names its file in every record and reproduces whole lines.
+        // JSON names its file in every record and reproduces whole lines, and it emits the
+        // position of each unasked, so naming one is inert.
         Format::Json => vec![
             (args.null, "--null"),
             (args.heading, "--heading"),
             (colored, "--color"),
             (args.max_line_length.is_some(), "--max-line-length"),
+            (!args.fields.is_empty(), "--fields"),
         ],
         // Vimgrep names its file, line and column in every record.
+        // Vimgrep names its file, line and column in every record, and a fifth column would
+        // be a different format wearing its name.
         Format::Vimgrep => vec![
             (args.heading, "--heading"),
-            (args.line_numbers, "--line-numbers"),
-            (args.column_numbers, "--column-numbers"),
-            (args.byte_offsets, "--byte-offsets"),
+            (!args.fields.is_empty(), "--fields"),
             (colored, "--color"),
         ],
         Format::Text => return Ok(()),
@@ -438,15 +448,16 @@ impl OutputConfig {
             Colors::disabled()
         };
         let only_matches = show == Show::Matches;
+        let carries = |field| args.fields.contains(&field);
 
         Self {
             output_format,
             colors,
             show_name: multiple_inputs && output_format != OutputFormat::Heading,
             // Vimgrep implies line numbers and columns.
-            line_numbers: args.line_numbers || output_format == OutputFormat::Vimgrep,
-            column_numbers: args.column_numbers || output_format == OutputFormat::Vimgrep,
-            byte_offsets: args.byte_offsets,
+            line_numbers: carries(Field::LineNumbers) || output_format == OutputFormat::Vimgrep,
+            column_numbers: carries(Field::ColumnNumbers) || output_format == OutputFormat::Vimgrep,
+            byte_offsets: carries(Field::ByteOffsets),
             only_matches,
             max_line_length: args.max_line_length.map(NonZeroUsize::get),
             character_units: uses_unicode(args.utf8, args.ignore_case),
@@ -2190,6 +2201,7 @@ mod tests {
             [
                 "show",
                 "format",
+                "fields",
                 "match",
                 "ignore-case",
                 "before-context",
@@ -2202,9 +2214,6 @@ mod tests {
                 "quiet",
                 "summary",
                 "color",
-                "line-numbers",
-                "column-numbers",
-                "byte-offsets",
                 "heading",
                 "max-line-length",
                 "null",
@@ -2252,9 +2261,9 @@ mod tests {
         for flags in [
             vec!["--quiet", "--format", "json"],
             vec!["--quiet", "--null"],
-            vec!["--quiet", "--line-numbers"],
-            vec!["--quiet", "--column-numbers"],
-            vec!["--quiet", "--byte-offsets"],
+            vec!["--quiet", "--fields", "line-numbers"],
+            vec!["--quiet", "--fields", "column-numbers"],
+            vec!["--quiet", "--fields", "byte-offsets"],
             vec!["--quiet", "--heading"],
             vec!["--quiet", "--color", "always"],
             vec!["--quiet", "--max-line-length", "10"],
@@ -2266,12 +2275,12 @@ mod tests {
             vec!["--format", "json", "--color", "always"],
             vec!["--format", "json", "--max-line-length", "10"],
             vec!["--format", "vimgrep", "--heading"],
-            vec!["--format", "vimgrep", "--line-numbers"],
-            vec!["--format", "vimgrep", "--byte-offsets"],
+            vec!["--format", "vimgrep", "--fields", "line-numbers"],
+            vec!["--format", "vimgrep", "--fields", "byte-offsets"],
             vec!["--format", "vimgrep", "--color", "always"],
-            vec!["--show", "count", "--line-numbers"],
+            vec!["--show", "count", "--fields", "line-numbers"],
             vec!["--show", "count", "--heading"],
-            vec!["--show", "files", "--line-numbers"],
+            vec!["--show", "files", "--fields", "line-numbers"],
             vec!["--show", "files", "--context", "2"],
             vec!["--show", "matches", "--invert-match"],
             vec!["--multiline", "--invert-match"],

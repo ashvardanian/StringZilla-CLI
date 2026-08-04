@@ -653,6 +653,13 @@ enum Match {
     Word,
 }
 
+/// One column a record can carry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Field {
+    /// The 1-based line number
+    LineNumbers,
+}
+
 /// Which record kind to emit
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Show {
@@ -734,9 +741,14 @@ struct Args {
     #[arg(long)]
     ignore_case: bool,
 
-    /// Prefix each record with its line number
-    #[arg(long)]
-    line_numbers: bool,
+    /// Which columns each record carries, comma-separated; none by default
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help_heading = "Output Formats"
+    )]
+    fields: Vec<Field>,
 
     /// Treat the input as UTF-8 text
     #[arg(long)]
@@ -759,7 +771,7 @@ struct Args {
     null: bool,
 
     /// Suppress all output; exit 0 if any match was found, 1 otherwise
-    #[arg(long, conflicts_with_all = ["show", "format", "null", "line_numbers", "summary"], help_heading = "Output Formats")]
+    #[arg(long, conflicts_with_all = ["show", "format", "null", "fields", "summary"], help_heading = "Output Formats")]
     quiet: bool,
 }
 
@@ -794,7 +806,7 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     if args.null && args.format == Some(Format::Json) {
         return Err(reject("--format json cannot be combined with --null"));
     }
-    if args.line_numbers && args.show == Some(Show::Count) {
+    if args.fields.contains(&Field::LineNumbers) && args.show == Some(Show::Count) {
         return Err(reject(
             "--line-numbers has no record to number under --show count",
         ));
@@ -882,7 +894,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         utf8: args.utf8 || args.ignore_case,
     };
     let output_config = OutputConfig {
-        line_numbers: args.line_numbers,
+        line_numbers: args.fields.contains(&Field::LineNumbers),
         count: args.show == Some(Show::Count),
         prefix: inputs.len() > 1,
         json: args.format == Some(Format::Json),
@@ -1092,7 +1104,7 @@ mod tests {
                 "threads",
                 "gpu-id",
                 "ignore-case",
-                "line-numbers",
+                "fields",
                 "utf8",
                 "show",
                 "summary",

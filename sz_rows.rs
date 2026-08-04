@@ -58,9 +58,14 @@ struct Args {
     #[arg(long, value_parser = parse_at_least_one, conflicts_with_all = ["rows", "tail"])]
     every: Option<NonZeroUsize>,
 
-    /// Prefix each row with its one-based line number
-    #[arg(long)]
-    line_numbers: bool,
+    /// Which columns each record carries, comma-separated; none by default
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help_heading = "Output Formats"
+    )]
+    fields: Vec<Field>,
 
     /// Treat the input as UTF-8 text
     #[arg(long)]
@@ -80,8 +85,15 @@ struct Args {
     null: bool,
 
     /// Suppress all output; exit 0 if any row was extracted, 1 otherwise
-    #[arg(long, conflicts_with_all = ["format", "null", "line_numbers"], help_heading = "Output Formats")]
+    #[arg(long, conflicts_with_all = ["format", "null", "fields"], help_heading = "Output Formats")]
     quiet: bool,
+}
+
+/// One column a record can carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Field {
+    /// The 1-based line number
+    LineNumbers,
 }
 
 /// How records are rendered.
@@ -106,7 +118,7 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
         return Err(reject("must specify --rows, --tail, or --every"));
     }
     if args.format == Format::Json {
-        if args.line_numbers {
+        if args.fields.contains(&Field::LineNumbers) {
             return Err(reject("--format json already carries a line number"));
         }
         if args.null {
@@ -534,7 +546,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let config = OutputConfig {
         json: args.format == Format::Json,
         terminator: Terminator::from_null(args.null),
-        show_line_numbers: args.line_numbers,
+        show_line_numbers: args.fields.contains(&Field::LineNumbers),
         path: name,
     };
 
@@ -670,7 +682,14 @@ mod tests {
         let rejected = [
             vec!["sz-rows", "--rows", "1", "--quiet", "--format", "json"],
             vec!["sz-rows", "--rows", "1", "--quiet", "--null"],
-            vec!["sz-rows", "--rows", "1", "--quiet", "--line-numbers"],
+            vec![
+                "sz-rows",
+                "--rows",
+                "1",
+                "--quiet",
+                "--fields",
+                "line-numbers",
+            ],
         ];
         for arguments in rejected {
             assert!(
@@ -706,15 +725,7 @@ mod tests {
         assert_eq!(
             longs,
             [
-                "rows",
-                "tail",
-                "every",
-                "line-numbers",
-                "utf8",
-                "format",
-                "null",
-                "quiet",
-                "help",
+                "rows", "tail", "every", "fields", "utf8", "format", "null", "quiet", "help",
                 "version",
             ]
         );
@@ -748,14 +759,22 @@ mod tests {
             "1",
             "--format",
             "json",
-            "--line-numbers"
+            "--fields",
+            "line-numbers"
         ]))
         .is_err());
         assert!(validate(&parsed(&[
             "sz-rows", "--rows", "1", "--format", "json", "--null"
         ]))
         .is_err());
-        assert!(validate(&parsed(&["sz-rows", "--rows", "1", "--line-numbers"])).is_ok());
+        assert!(validate(&parsed(&[
+            "sz-rows",
+            "--rows",
+            "1",
+            "--fields",
+            "line-numbers"
+        ]))
+        .is_ok());
         assert!(validate(&parsed(&["sz-rows", "file.txt"])).is_err());
     }
 

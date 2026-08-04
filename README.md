@@ -67,12 +67,14 @@ Unlike `grep` and `ripgrep`, `sz-find` performs __full Unicode-compliant case fo
 ```bash
 $ sz-find "error" log.txt                                      # literal substring search (replaces: grep -F, rg -F)
 $ sz-find --ignore-case "error" log.txt                        # full Unicode folding (replaces: grep -i, rg -i)
-$ sz-find --line-numbers "pattern" file.txt                    # number every match (replaces: grep -n)
+$ sz-find --fields line-numbers "pattern" file.txt             # number every match (replaces: grep -n)
 $ sz-find --show count "pattern" file.txt                      # count only (replaces: grep -c)
 $ sz-find --before-context 2 --after-context 2 "error" log.txt # surrounding lines (replaces: grep -B/-A/-C)
 $ sz-find --multiline $'hello\nworld' file.txt                 # match across line boundaries
 $ sz-find --utf8 "pattern" file.txt                            # break lines on the Unicode newline set
 ```
+
+`--show` picks which records a run emits; `--fields` picks which columns each of them carries, comma-separated: `line-numbers`, `column-numbers`, `byte-offsets`.
 
 Beyond the flags above, `sz-find` also covers most of the `grep`/`ripgrep` surface: whole-word matching (`--match word`), inverted matches (`--invert-match`), only-matching output (`--show matches`), recursive directory walking with `.gitignore` awareness, type/glob filters (`--type`, `--glob`), and `--format json`/`--format vimgrep` output.
 
@@ -236,7 +238,7 @@ $ sz-rows --rows 1-10 file.txt                # the first ten (replaces: head -n
 $ sz-rows --tail 10 file.txt                  # the last ten (replaces: tail -n 10)
 $ sz-rows --rows 1,5,10 file.txt              # scattered lines in one pass (replaces: sed -n '1p;5p;10p')
 $ sz-rows --every 5 file.txt                  # every fifth (replaces: awk 'NR % 5 == 0')
-$ sz-rows --line-numbers --rows 5-10 file.txt # numbered output, as grep -n writes it
+$ sz-rows --fields line-numbers --rows 5-10 file.txt # numbered output, as grep -n writes it
 ```
 
 Reaching a range deep in the same 5 GB, and sampling every thousandth line:
@@ -265,7 +267,7 @@ Coreutils has nothing, ICU ships `genbrk` and `uconv` but neither segments text,
 ```bash
 $ sz-segment-utf8 --by sentences book.txt                               # one UAX-29 sentence per line
 $ sz-segment-utf8 --by graphemes --show count emoji.txt                 # count user-perceived characters
-$ sz-segment-utf8 --by sentences --byte-offsets doc.txt                 # offsets, for citing back to source
+$ sz-segment-utf8 --by sentences --fields byte-offsets doc.txt          # offsets, for citing back to source
 $ sz-segment-utf8 --by sentences --chunk-bytes 2000 --format json c.txt # 2 KB records for an embedder
 ```
 
