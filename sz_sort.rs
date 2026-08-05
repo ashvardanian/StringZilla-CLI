@@ -1,39 +1,16 @@
-//! SIMD-accelerated line sorting utility
+//! Stable line sorting in `LC_ALL=C` byte order, standing in for `sort`.
 //!
-//! A faster, Unicode-correct replacement for `sort`, built on StringZilla's
-//! `argsort` — case-insensitive folding and reversal happen inside the kernel.
-//! Comparison is unsigned byte-wise, which for valid UTF-8 is identical to Unicode
-//! code-point order, so `--utf8` only affects newline handling.
+//! Ordering is unsigned byte-wise, which over valid UTF-8 is identical to code-point order, so
+//! `--utf8` decides only which terminators end a line. `--ignore-case` is the exception: it orders
+//! through `utf8_uncased_order`, full Unicode folding rather than a byte compare.
 //!
-//! Lines are held in a `BytesCowsAuto` borrowing the input buffer, which stores a
-//! packed offset and length per line and picks their widths from the data size and
-//! the longest line. A `Vec<&[u8]>` would spend 16 bytes per line on fat pointers
-//! against 5 or 6 for the packed entry, which on a large file dominates the input
-//! itself. `argsort_by` reaches the lines through a callback, so the kernel never
-//! needs a materialized slice array either way.
+//! Lines are held in a `BytesCowsAuto` borrowing the input buffer, which packs an offset and a
+//! length per line and sizes both from the data. A `Vec<&[u8]>` would spend 16 bytes per line on
+//! fat pointers against 5 or 6 for the packed entry, which over a large file outweighs the input
+//! itself. `argsort_by` reaches the lines through a callback, so neither form needs a materialized
+//! slice array.
 //!
-//! # Examples
-//!
-//! ```bash
-//! # Sort a file to stdout
-//! sz-sort file.txt
-//!
-//! # Reverse (descending) order
-//! sz-sort --reverse file.txt
-//!
-//! # Sort and drop duplicate lines (like `sort -u`)
-//! sz-sort --unique file.txt
-//!
-//! # Case-insensitive sort (full Unicode case folding)
-//! sz-sort --ignore-case file.txt
-//!
-//! # Write to a file instead of stdout, or back into the input
-//! sz-sort file.txt --output sorted.txt
-//! sz-sort file.txt --in-place
-//!
-//! # Verify a file is already sorted (exit 1 if not)
-//! sz-sort --check file.txt
-//! ```
+//! Exit: 0 wrote a line, 1 wrote none or `--check` found the input unsorted, 2 could not run.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -226,7 +203,9 @@ fn check_sorted(lines: &BytesCowsAuto<'_>, order: SortOrder) -> Option<usize> {
 /// How records are rendered.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
+    /// One sorted line per record.
     Text,
+    /// JSON Lines, one record per line plus a closing summary.
     Json,
 }
 
@@ -246,7 +225,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["dry_run", "null", "quiet"])]
     in_place: bool,
 
-    /// Sort the input and write nothing
+    /// Report what would be written without writing anything
     #[arg(long)]
     dry_run: bool,
 
@@ -278,7 +257,7 @@ struct Args {
     #[arg(long, conflicts_with = "dry_run", help_heading = "Output Formats")]
     summary: bool,
 
-    /// NUL-terminate each output record instead of newline
+    /// NUL-terminate each output record instead of newline, for `xargs -0`
     #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
@@ -664,7 +643,7 @@ mod tests {
             format: Format::Json,
             unique: false,
             terminator: Terminator::Newline,
-            path: "f.txt",
+            path: "trex.txt",
         };
         let mut output = Vec::new();
 

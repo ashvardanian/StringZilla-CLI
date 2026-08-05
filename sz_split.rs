@@ -1,20 +1,15 @@
-//! SIMD-accelerated file splitting utility
+//! Split one input into many, standing in for `split` and `csplit`.
 //!
-//! A faster replacement for `split` with UTF-8 awareness.
-//! Uses StringZilla for fast line detection.
+//! Four ways to cut: by line count, by byte budget, into a fixed number of shares, or before every
+//! line matching a needle. The last has no `split` equivalent and is what makes this a `csplit`
+//! replacement too, without the regex.
 //!
-//! # Examples
+//! Every chunk is a verbatim byte range of the input. Nothing is re-emitted line by line, so CR,
+//! CRLF, NEL, LS and PS survive and an input that never ended in a terminator does not gain one.
+//! `--header-lines` repeats a prefix into each chunk, which is the one case where a chunk is not a
+//! single contiguous range.
 //!
-//! ```bash
-//! # Split by line count
-//! sz-split --chunk-lines 1000 large.txt output_prefix
-//!
-//! # Split on Unicode newlines rather than LF alone
-//! sz-split --utf8 --chunk-lines 1000 utf8_file.txt output
-//!
-//! # From stdin
-//! cat large.txt | sz-split --chunk-lines 1000 output
-//! ```
+//! Exit: 0 wrote a chunk, 1 wrote none, 2 could not run.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
@@ -76,7 +71,7 @@ struct Args {
     #[arg(long)]
     utf8: bool,
 
-    /// Suffix length (default: 2, gives aa, ab, ac...)
+    /// Suffix length, so 2 gives aa, ab, ac
     #[arg(long, value_parser = parse_at_least_one, default_value = "2")]
     suffix_length: NonZeroUsize,
 
@@ -352,7 +347,7 @@ impl OpenChunk {
     }
 }
 
-/// What [`split_by_lines`] carries between windows, so a second call resumes where the
+/// What the line splitter carries between windows, so a second call resumes where the
 /// first stopped. It owns the chunk still being filled, and allocates only when one opens.
 #[derive(Default)]
 struct SplitState {
@@ -1026,7 +1021,7 @@ mod tests {
     fn requires_exactly_one_chunking_rule() {
         // Naming none used to be impossible, since `--chunk-lines` was required; the error
         // now lists every way to say how big a chunk is.
-        let Err(error) = Args::try_parse_from(["sz-split", "f.txt"]) else {
+        let Err(error) = Args::try_parse_from(["sz-split", "trex.txt"]) else {
             panic!("a run without a chunking rule must be rejected");
         };
         let rendered = error.to_string();

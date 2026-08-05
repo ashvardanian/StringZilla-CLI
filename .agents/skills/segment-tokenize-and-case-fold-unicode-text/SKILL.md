@@ -21,10 +21,10 @@ allowed-tools: Bash(sz-segment-utf8:*) Bash(sz-count:*) Bash(sz-find:*)
 ## Boundaries
 
 ```bash
-sz-segment-utf8 --by graphemes text.txt              # user-perceived characters, emoji sequences intact
-sz-segment-utf8 --by words --show count text.txt     # tiles the input: spaces and punctuation are segments too
-sz-segment-utf8 --by sentences --format json text.txt
-sz-segment-utf8 --by linebreaks text.txt             # soft-wrap opportunities, not lines
+sz-segment-utf8 --by graphemes herd.txt              # user-perceived characters, emoji sequences intact
+sz-segment-utf8 --by words --show count herd.txt     # tiles the input: spaces and punctuation are segments too
+sz-segment-utf8 --by sentences --format json herd.txt
+sz-segment-utf8 --by linebreaks herd.txt             # soft-wrap opportunities, not lines
 ```
 
 | `--by`       | Boundary                                     | Note                                                          |
@@ -63,8 +63,8 @@ Normalize upstream if the corpus needs it.
 ## Counting and Line Sets
 
 ```bash
-sz-count --fields chars text.txt   # code points, not bytes
-sz-count text.txt                  # lines, words, bytes, as `wc` defines them
+sz-count --fields chars herd.txt   # code points, not bytes
+sz-count herd.txt                  # lines, words, bytes, as `wc` defines them
 ```
 
 `--utf8` widens the newline set from LF alone to the Unicode set — VT, FF, NEL, LS and PS — everywhere a command splits lines.

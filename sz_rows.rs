@@ -1,32 +1,15 @@
-//! SIMD-accelerated row extraction utility
+//! Row selection by index, range, stride or tail, standing in for `sed -n 'Np'`, `head`, `tail`
+//! and `awk 'NR==N'`.
 //!
-//! A simpler, faster replacement for `sed -n 'Np'`, `head`, `tail`, and `awk 'NR==N'`.
-//! Uses StringZilla for fast line scanning.
+//! One selector covers what those four spell four ways, and every selection is answered in a
+//! single forward pass: scattered indices are walked in ascending order rather than re-scanned per
+//! index, and a stride never materializes the rows it skips.
 //!
-//! # Examples
+//! `--tail` is the one selector that cannot be answered forward, since the count is relative to an
+//! end the scan has not reached, so it keeps a ring of the last N line spans instead of buffering
+//! the input.
 //!
-//! ```bash
-//! # Extract line 5
-//! sz-rows --rows 5 file.txt
-//!
-//! # Extract lines 10-20
-//! sz-rows --rows 10-20 file.txt
-//!
-//! # Extract first 10 lines (like head -n 10)
-//! sz-rows --rows 1-10 file.txt
-//!
-//! # Extract last 10 lines (like tail -n 10)
-//! sz-rows --tail 10 file.txt
-//!
-//! # Extract multiple specific lines
-//! sz-rows --rows 1,5,10 file.txt
-//!
-//! # Extract every 5th line
-//! sz-rows --every 5 file.txt
-//!
-//! # From stdin
-//! cat file.txt | sz-rows --rows 5-10
-//! ```
+//! Exit: 0 wrote a row, 1 ran and selected nothing, 2 could not run.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -84,7 +67,7 @@ struct Args {
     )]
     format: Format,
 
-    /// NUL-terminate each output record instead of newline
+    /// NUL-terminate each output record instead of newline, for `xargs -0`
     #[arg(long, help_heading = "Output Formats")]
     null: bool,
 

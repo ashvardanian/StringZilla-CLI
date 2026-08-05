@@ -1,70 +1,29 @@
-//! SIMD-accelerated line deduplication utility
+//! Drop repeated lines, keeping the first of each, without sorting.
 //!
-//! Remove duplicate lines from files, keeping the first occurrence of each unique line.
-//! Uses StringZilla's SIMD hash for fast deduplication with minimal memory overhead.
+//! `uniq` collapses only adjacent duplicates and so needs sorted input, and `sort -u` gets there
+//! by discarding the original order. The idiom that preserves it is `awk '!seen[$0]++'`, and this
+//! is that, with a SIMD hash under it.
 //!
 //! # Algorithm
 //!
-//! This implementation uses an open-addressed flat hash set with linear probing:
+//! An open-addressed flat set holds one 24-byte entry per __distinct__ line, so memory follows the
+//! number of unique lines rather than the length of the input. Insert and lookup both mask the
+//! hash to a slot and probe forward; an empty slot is marked by `offset = u64::MAX`, which no real
+//! file can produce. The table starts at 1024 slots and doubles past a 60% load factor.
 //!
 //! ```text
-//! AppendOnlyFlatHashSet: Vec<LineEntry>
-//!     slot[0]: { hash: 0x1234,    offset: 0,         length: 10       }
-//!     slot[1]: { hash: 0,         offset: u64::MAX,  length: u64::MAX }  ← empty
-//!     slot[2]: { hash: 0xABCD,    offset: 15,        length: 8        }
-//!     ...
-//!
-//! LineEntry = 24 bytes (hash: u64, offset: u64, length: u64)
+//! slot[0]: { hash: 0x1234, offset: 0,        length: 10       }
+//! slot[1]: { hash: 0,      offset: u64::MAX, length: u64::MAX }  ← empty
+//! slot[2]: { hash: 0xABCD, offset: 15,       length: 8        }
 //! ```
 //!
-//! ## Open Addressing with Linear Probing
+//! `--ignore-case` folds each line into a scratch buffer and hashes the folded form, then settles
+//! collisions with `utf8_uncased_order` on the originals, so no line is folded twice.
 //!
-//! - Insert: `slot = hash & mask`, probe forward until empty slot
-//! - Lookup: `slot = hash & mask`, probe forward checking hash matches
-//! - Empty slots marked by `offset = u64::MAX` (impossible for real files)
+//! Every line keeps the terminator it arrived with, so nothing but the duplicates changes.
 //!
-//! ## Growth Strategy
-//!
-//! - Start with 1024 slots (24 KB)
-//! - Grow 2x when load factor exceeds 60%
-//! - Rehash all entries into new larger array
-//!
-//! ## In-Place Rewriting
-//!
-//! `--in-place` writes the surviving lines to a temporary file beside the input and then
-//! copies them back over the original, so the file keeps its identity — symlinks and
-//! hardlinks to it survive — and an interrupted run leaves the input intact. Each line
-//! keeps the terminator it arrived with, so nothing but the duplicates changes.
-//!
-//! ## Case-Insensitive Mode
-//!
-//! `--ignore-case` uses proper Unicode case folding via `utf8_uncased_fold()`:
-//!
-//! 1. **Hashing**: Case-fold line into scratch buffer, then hash the folded form
-//! 2. **Collision check**: Use `utf8_uncased_order()` directly on original
-//!    lines (no re-folding needed for comparison)
-//!
-//! # Examples
-//!
-//! ```bash
-//! # Write unique lines to stdout
-//! sz-dedup file.txt
-//!
-//! # Rewrite the file in place
-//! sz-dedup --in-place file.txt
-//!
-//! # Case-insensitive deduplication (full Unicode support)
-//! sz-dedup --ignore-case file.txt
-//!
-//! # Output to different file (streaming mode)
-//! sz-dedup file.txt --output unique.txt
-//!
-//! # From stdin to stdout
-//! cat file.txt | sz-dedup
-//!
-//! # Show one line about the whole run
-//! sz-dedup --summary file.txt
-//! ```
+//! Exit: 0 wrote a line, or under `--in-place` actually dropped one; 1 neither happened;
+//! 2 could not run.
 
 use std::cmp::Ordering;
 use std::io::{self, Write};
@@ -362,7 +321,9 @@ fn dedup_to_writer(
 /// How records are rendered.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
+    /// One surviving line per record.
     Text,
+    /// JSON Lines, one record per line plus a closing summary.
     Json,
 }
 
@@ -382,7 +343,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["dry_run", "null", "quiet"])]
     in_place: bool,
 
-    /// Deduplicate the input and write nothing
+    /// Report what would be dropped without writing anything
     #[arg(long)]
     dry_run: bool,
 
@@ -402,7 +363,7 @@ struct Args {
     #[arg(long, conflicts_with = "dry_run", help_heading = "Output Formats")]
     summary: bool,
 
-    /// NUL-terminate each output record instead of newline
+    /// NUL-terminate each output record instead of newline, for `xargs -0`
     #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
@@ -740,7 +701,7 @@ mod tests {
         let mut output = Vec::new();
         let config = OutputConfig {
             rendering: Rendering::Json,
-            path: "f.txt",
+            path: "trex.txt",
         };
 
         dedup_to_writer(data, &mut output, false, false, &config).unwrap();

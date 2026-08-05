@@ -1,6 +1,10 @@
-//! Primitives shared by every `sz-*` binary: input sources and windows, line and
-//! segment iteration, output terminators, argument parsers, and the error type each
-//! tool forwards to `main`.
+//! Primitives shared by every `sz-*` binary: input sources and windows, line and segment
+//! iteration, output terminators, argument parsers, and the error type each tool forwards to
+//! `main`.
+//!
+//! The recurring shape is that a tool should not care whether its input is a mapped file, a
+//! buffered stdin, or a pipe it may only read once. [`InputSource`] hides that, and the one place
+//! it leaks — a true pipe has no whole slice — is visible in the type rather than in a comment.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, Write};
@@ -16,7 +20,7 @@ use stringzilla::sz::{FindSplits, StringZillableBinary, StringZillableUnary, Utf
 
 // region: Input Sources
 
-/// Represents the input source - either a memory-mapped file or buffered stdin
+/// Where a tool's bytes come from: a mapped file, a drained stdin, or a pipe read once.
 pub enum InputSource {
     /// Memory-mapped file for zero-copy access (read-only)
     MappedFile(Mmap),
@@ -36,7 +40,8 @@ pub enum InputWindow {
 }
 
 impl InputSource {
-    /// Get the input data as a byte slice
+    /// The whole input as one slice. A [`InputSource::Pipe`] has no whole slice and returns
+    /// empty after tripping a debug assertion; use [`InputSource::into_window`] for that case.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             InputSource::MappedFile(mmap) => &mmap[..],
@@ -811,7 +816,7 @@ impl<R: Read> Refill<R> {
     /// Hash the stream as it is read, so a whole-input hash costs no second pass and no
     /// buffer holding the input.
     ///
-    /// Accumulated in [`Refill::fill`], which is the only place a byte enters the window and
+    /// Accumulated in `Refill::fill`, which is the only place a byte enters the window and
     /// so the only place that sees each one exactly once. Hashing where windows are *handed
     /// out* would double-count every byte a cut retained, re-count the whole window each time
     /// it grew, and miss whatever a caller consumed outside the driver.
@@ -2387,10 +2392,10 @@ mod tests {
     #[test]
     fn writes_a_one_based_line_record() {
         let mut output = Vec::new();
-        write_line_record(&mut output, "f.txt", b"hello", 0, None).unwrap();
+        write_line_record(&mut output, "trex.txt", b"hello", 0, None).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "{\"type\":\"line\",\"data\":{\"path\":{\"text\":\"f.txt\"},\"text\":{\"text\":\"hello\"},\"line_number\":1}}\n"
+            "{\"type\":\"line\",\"data\":{\"path\":{\"text\":\"trex.txt\"},\"text\":{\"text\":\"hello\"},\"line_number\":1}}\n"
         );
     }
 
@@ -2398,7 +2403,7 @@ mod tests {
     fn names_a_line_record_when_one_was_asked_for() {
         // The same key `sz-find` prints, so a record from either tool reads the same way.
         let mut output = Vec::new();
-        write_line_record(&mut output, "f.txt", b"hello", 0, Some("2xg6k171")).unwrap();
+        write_line_record(&mut output, "trex.txt", b"hello", 0, Some("2xg6k171")).unwrap();
         assert!(String::from_utf8(output)
             .unwrap()
             .contains(r#""line_number":1,"line_hash":"2xg6k171""#));

@@ -25,12 +25,12 @@ Both come out of one read, and `sz-replace` refuses rather than guesses when eit
 ## Finding
 
 ```bash
-sz-find error log.txt                                      # literal substring, no regex
-sz-find --fields line-numbers,column-numbers error log.txt # which columns each record carries
-sz-find --show count error log.txt                         # or matches, files, files-without
-sz-find --match word --invert-match error log.txt          # whole-word, negated
-sz-find --before-context 2 --after-context 2 error log.txt
-sz-find --glob '*.rs' --format json error src/             # recursive, .gitignore-aware
+sz-find electrified paddocks.toml                                      # literal substring, no regex
+sz-find --fields line-numbers,column-numbers electrified paddocks.toml # which columns each record carries
+sz-find --show count electrified paddocks.toml                         # or matches, files, files-without
+sz-find --match word --invert-match electrified paddocks.toml          # whole-word, negated
+sz-find --before-context 2 --after-context 2 electrified paddocks.toml
+sz-find --glob '*.toml' --format json electrified .             # recursive, .gitignore-aware
 ```
 
 `--show` picks which records a run emits, `--fields` picks their columns, and `--format json` gives one JSON Lines record per match.
@@ -38,13 +38,17 @@ sz-find --glob '*.rs' --format json error src/             # recursive, .gitigno
 ## Replacing, Guarded
 
 ```bash
+# 0. Everything below writes, so run it somewhere disposable.
+cd "$(mktemp -d)"
+printf '[paddock.raptor]\nfeed_kg = 40.5\nelectrified = true\n\n[paddock.trex]\nfeed_kg = 250.0\nelectrified = false\n' > paddocks.toml
+
 # 1. Read once. `line_hash` is on each `match`; `file_hash` is on the `end` record.
-sz-find --fields line-hashes,file-hash --format json TODO parser.c
+sz-find --fields line-hashes,file-hash --format json electrified paddocks.toml
 
 # 2. Edit, naming both. `--occurrences one` asserts the name picks out exactly one line.
-sz-replace --in-place --expect-hash ak5pq35xy89tr \
-           --match line-hash --occurrences one bbcvyaqk '    if (at_eof(s)) return 1;' \
-           --format json parser.c
+sz-replace --in-place --expect-hash d9xqrcystscnp \
+           --match line-hash --occurrences one 5j5wg73n 'electrified = true' \
+           --format json paddocks.toml
 
 # 3. Pass the summary's `hash_after` as the next `--expect-hash`, and repeat from 2.
 # 4. On exit 3, go back to 1. Nothing was written.
@@ -53,22 +57,22 @@ sz-replace --in-place --expect-hash ak5pq35xy89tr \
 One read covers a whole run of edits, because each edit hands back the token the next one passes.
 Exit 3 means look at the file again, 2 means fix the arguments, 1 means the run found nothing:
 
-| Message                            | What to do                                   |
-| ---------------------------------- | -------------------------------------------- |
-| `content is X, not the expected Y` | the file moved — re-read                     |
-| `names no line here`               | the line moved or is gone — re-read          |
-| `matches N places, not one`        | `--hash-width` up to 13, or name a neighbour |
+| Message                            | What to do                                                                                           |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `content is X, not the expected Y` | the file moved — re-read                                                                             |
+| `names no line here`               | the line moved or is gone — re-read                                                                  |
+| `matches N places, not one`        | name a neighbouring line; `--hash-width` separates a prefix collision but never byte-identical lines |
 
 ## Every Line Operation Is One Argument
 
 A name covers the line's terminator as well as its text:
 
 ```bash
-sz-replace --match line-hash bbcvyaqk '    return 1;' parser.c            # rewrite
-sz-replace --match line-hash bbcvyaqk '' parser.c                         # delete
-sz-replace --match line-hash bbcvyaqk $'\n' parser.c                      # blank, keep the line
-sz-replace --match line-hash --after bbcvyaqk '    flush(s);' parser.c    # insert below
-sz-replace --match line-hash --before bbcvyaqk '    assert(s);' parser.c  # insert above
+sz-replace --match line-hash jx0ehpn9 'feed_kg = 45.0' paddocks.toml       # rewrite
+sz-replace --match line-hash jx0ehpn9 '' paddocks.toml                     # delete
+sz-replace --match line-hash jx0ehpn9 $'\n' paddocks.toml                  # blank, keep the line
+sz-replace --match line-hash --after jx0ehpn9 'fence_volts = 10000' paddocks.toml  # insert below
+sz-replace --match line-hash --before jx0ehpn9 '# reviewed 1993-06-11' paddocks.toml  # insert above
 ```
 
 ## Rules Worth Not Rediscovering
@@ -82,6 +86,11 @@ sz-replace --match line-hash --before bbcvyaqk '    assert(s);' parser.c  # inse
   Fan out on the read side, and accept that such a sweep is unguarded because `--expect-hash` takes a single hash:
 
   ```bash
+  # Count first. `--dry-run` writes nothing and reports what each file would lose.
+  sz-find --show files --glob '*.rs' OLD src/ | xargs -n1 sz-replace --dry-run --format json OLD NEW
+
+  # Only then drop --dry-run. Nothing here checks that a file is still what was read,
+  # so use it for a mechanical rename and never for a planned edit.
   sz-find --show files --glob '*.rs' OLD src/ | xargs -n1 sz-replace --in-place --format json OLD NEW
   ```
 

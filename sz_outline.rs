@@ -1,26 +1,13 @@
-//! SIMD-accelerated file outlining utility
+//! Structural outlines of source files, for sampling a large file into an LLM context.
 //!
-//! Extract structural outlines from source files including:
-//! - Markdown (`.md`, `.markdown`): headings, code blocks, tables, blockquotes, images
-//! - C (`.c`, `.h`): includes, function declarations, function definitions
+//! Markdown yields headings, code blocks, tables, blockquotes and images; C yields includes and
+//! function declarations and definitions. The parser comes from the extension unless `--language`
+//! forces one, so an outline can be taken of a file whose name says nothing.
 //!
-//! The parser is taken from the extension or forced with `--language {md,c,h}`.
+//! Matching is anchored and literal rather than a grammar, which is why the C side reports
+//! signatures and not a parse tree: it is a sampler, not a compiler front end.
 //!
-//! # Examples
-//!
-//! ```bash
-//! # Outline a Markdown file
-//! sz-outline README.md
-//!
-//! # Add line numbers and byte offsets
-//! sz-outline --detail positions README.md
-//!
-//! # Add block sizes and nested blocks
-//! sz-outline --detail blocks src/main.c
-//!
-//! # Force the parser
-//! sz-outline --language md document.txt
-//! ```
+//! Exit: 0 outlined something, 1 found no structure, 2 could not run.
 
 use std::borrow::Cow;
 use std::io::{self, Write};
@@ -153,23 +140,31 @@ struct Fence<'a> {
 /// How much of each element the human renderer prints
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
 enum Detail {
+    /// Names alone.
     Headings,
+    /// Names with line numbers and byte offsets.
     Positions,
+    /// Names, positions, and the size and nesting of each block.
     Blocks,
 }
 
 /// Which parser reads the input
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Language {
+    /// Markdown: headings, code blocks, tables, blockquotes, images.
     Md,
+    /// C source: includes, function declarations and definitions.
     C,
+    /// C header, read the same way as `c`.
     H,
 }
 
 /// How records are rendered
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Format {
+    /// One outline entry per line, indented by depth.
     Text,
+    /// JSON Lines, one object per entry.
     Json,
 }
 
@@ -1232,7 +1227,8 @@ mod tests {
             clap::error::ErrorKind::MissingRequiredArgument
         );
         // A typo is a usage error rather than a runtime message naming the flag you used.
-        let Err(error) = Args::try_parse_from(["sz-outline", "--language", "rust", "a.txt"]) else {
+        let Err(error) = Args::try_parse_from(["sz-outline", "--language", "rust", "trex.txt"])
+        else {
             panic!("unknown language must be rejected");
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);

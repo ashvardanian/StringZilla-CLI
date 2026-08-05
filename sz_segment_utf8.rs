@@ -1,27 +1,16 @@
-//! SIMD-accelerated Unicode text segmentation
+//! Unicode text segmentation, following UAX-29 and UAX-14. Nothing in coreutils does this, and
+//! ICU ships the break iterator as a library with no user-facing binary.
 //!
-//! Splits text into grapheme clusters, words, sentences, or line-break opportunities
-//! following the Unicode standard (UAX-29 and UAX-14). Nothing in coreutils does this,
-//! and ICU ships the break iterator as a library with no user-facing binary.
+//! Seven boundaries, in two families that are easy to confuse. The tilers — `graphemes`, `words`,
+//! `sentences`, `linebreaks` — assign every byte to exactly one segment, so concatenating the
+//! output reproduces the input and a word count has to filter for segments carrying a letter or
+//! digit. The splitters — `whitespace`, `delimiters`, `newlines` — discard what they split on.
 //!
-//! # Examples
+//! `--chunk-bytes` packs consecutive segments into records under a budget without splitting one,
+//! and is defined only over the tilers, since a packed span cannot reinsert a discarded separator.
+//! A segment larger than the budget is emitted whole.
 //!
-//! ```bash
-//! # One sentence per line
-//! sz-segment-utf8 --by sentences book.txt
-//!
-//! # Count UAX-29 words (not the same as `wc -w`)
-//! sz-segment-utf8 --by words --show count book.txt
-//!
-//! # NUL-delimited grapheme clusters, safe for xargs
-//! sz-segment-utf8 --by graphemes --null emoji.txt
-//!
-//! # Byte offsets back into the source, for retrieval pipelines
-//! sz-segment-utf8 --by sentences --fields byte-span book.txt
-//!
-//! # Pack sentences into 2 KB chunks for embedding
-//! sz-segment-utf8 --by sentences --chunk-bytes 2000 --format json book.txt
-//! ```
+//! Exit: 0 emitted a record, 1 emitted none, 2 could not run.
 
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
@@ -42,7 +31,7 @@ use shared::*;
 #[command(name = "sz-segment-utf8")]
 #[command(version, about = "SIMD-accelerated Unicode text segmentation", long_about = None)]
 struct Args {
-    /// Input files or directories (use '-' for stdin, default: stdin)
+    /// Input files or directories (use '-' or omit for stdin)
     #[arg(default_value = "-")]
     inputs: Vec<String>,
 

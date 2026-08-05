@@ -1,51 +1,16 @@
-//! SIMD-accelerated substring search utility
+//! Literal substring search, standing in for `grep -F` and `rg -F`.
 //!
-//! A grep-like tool with simpler syntax, using StringZilla for fast searching.
-//! Unlike grep, uses literal substring matching (not regex) for maximum speed.
-//! For find-and-replace, use the dedicated `sz-replace` utility.
+//! Patterns are substrings, never regular expressions, which is what makes a single SIMD pass
+//! enough. `--ignore-case` folds through StringZilla's full-Unicode `utf8_uncased_search`, so it
+//! answers a wider question than `grep -i` — "Straße" matches `strasse` — and a match can be a
+//! different length from the needle.
 //!
-//! # Examples
+//! `--fields line-hashes,file-hash` is the read half of the editing handshake: a line's name comes
+//! from its own bytes and survives edits elsewhere, and the file's token is what
+//! `sz-replace --expect-hash` compares against. The file token is written only after the whole
+//! input has been read, so it names what was actually seen.
 //!
-//! ```bash
-//! # Search single file
-//! sz-find error log.txt
-//!
-//! # Search multiple files
-//! sz-find error src/*.rs tests/*.rs
-//!
-//! # Search directory recursively
-//! sz-find error src/
-//!
-//! # Case-insensitive search
-//! sz-find --ignore-case ERROR log.txt
-//!
-//! # Show line numbers
-//! sz-find --fields line-numbers error log.txt
-//!
-//! # Count matching lines only
-//! sz-find --show count error log.txt
-//!
-//! # Show context lines
-//! sz-find --context 2 error log.txt
-//!
-//! # Filter by file type
-//! sz-find error src/ --type rust
-//!
-//! # Filter by glob pattern
-//! sz-find error src/ --glob "*.rs"
-//!
-//! # Invert match (show non-matching lines)
-//! sz-find --invert-match error log.txt
-//!
-//! # Match whole words only
-//! sz-find --match word error log.txt
-//!
-//! # Stop after N matches
-//! sz-find --max-matches 10 error log.txt
-//!
-//! # From stdin
-//! cat log.txt | sz-find error
-//! ```
+//! Exit: 0 found something, 1 ran and found nothing, 2 could not run.
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Write};
@@ -241,17 +206,22 @@ enum Show {
 /// How records are rendered.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum Format {
+    /// The matching line, with any requested fields ahead of it.
     #[default]
     Text,
+    /// JSON Lines, one object per match plus begin and end records.
     Json,
+    /// `path:line:column:text`, which editors follow back to the match.
     Vimgrep,
 }
 
 /// What the needle is matched against.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum Match {
+    /// A literal substring, matched anywhere in the line.
     #[default]
     Substring,
+    /// The same substring, but only where a whole word.
     Word,
 }
 

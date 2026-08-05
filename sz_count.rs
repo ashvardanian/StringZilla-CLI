@@ -1,36 +1,14 @@
-//! SIMD-accelerated word count utility
+//! Line, word, byte and code-point counting, standing in for `wc`.
 //!
-//! A faster replacement for `wc` with proper UTF-8 support and directory traversal.
-//! Uses StringZilla for SIMD-accelerated counting operations.
+//! A word is a maximal run of non-whitespace, exactly as `wc -w` defines it, so this measures the
+//! same thing rather than a better thing. `--fields` chooses the columns outright rather than
+//! adding to the defaults, and `--posix` restores `wc`'s reading of a final line without a
+//! terminator.
 //!
-//! Counting measures rather than searches, so an empty input is a successful answer:
-//! a row of zeros and exit 0, as `wc` reports it, where the tools that search exit 1
-//! on finding nothing.
+//! Counting measures rather than searches, so an empty input is a successful answer: a row of
+//! zeros and exit 0, where the tools that search exit 1 on finding nothing.
 //!
-//! # Examples
-//!
-//! ```bash
-//! # Count single file
-//! sz-count file.txt
-//!
-//! # Count multiple files
-//! sz-count src/*.rs
-//!
-//! # Count directory recursively
-//! sz-count src/
-//!
-//! # Human-readable output
-//! sz-count --format human src/
-//!
-//! # UTF-8 mode (count characters, Unicode whitespace/newlines)
-//! sz-count --utf8 --fields lines,words,chars docs/
-//!
-//! # Just the line count, as a bare integer for scripts
-//! sz-count --fields lines file.txt
-//!
-//! # Match `wc` byte-for-byte
-//! sz-count --posix file.txt
-//! ```
+//! Exit: 0 counted, 1 only under `--quiet` with nothing to report, 2 could not run.
 
 use std::borrow::Cow;
 use std::fs::{self, File};
@@ -50,7 +28,7 @@ use shared::*;
 #[command(name = "sz-count")]
 #[command(version, about = "SIMD-accelerated word count", long_about = None)]
 struct Args {
-    /// Input files or directories (use '-' for stdin, default: stdin)
+    /// Input files or directories (use '-' or omit for stdin)
     #[arg(default_value = "-")]
     inputs: Vec<String>,
 
@@ -113,10 +91,15 @@ struct Args {
 /// One measurement a row can carry, in the order [`HEADERS`] lists them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Field {
+    /// Lines, counted as lines rather than as terminators; see `--posix`.
     Lines,
+    /// Maximal runs of non-whitespace, exactly as `wc -w` counts them.
     Words,
+    /// Bytes, terminators included.
     Bytes,
+    /// Unicode code points, which needs `--utf8`.
     Chars,
+    /// The longest line's width, terminator excluded.
     MaxLineLength,
 }
 
@@ -951,7 +934,7 @@ enum Resolved {
 }
 
 /// Resolve every input, warning on the ones that cannot be stat'ed and counting them,
-/// so a missing file no longer abandons the inputs beside it.
+/// so a missing file does not abandon the inputs beside it.
 fn resolve_inputs(inputs: &[String], failures: &mut usize) -> Vec<Resolved> {
     let mut resolved = Vec::new();
     for input in inputs {
@@ -1485,7 +1468,7 @@ mod tests {
         assert!(outcome(&report, failures) == Status::NoResult);
 
         // A readable file found something, however quiet the run.
-        let file = directory.path().join("a.txt");
+        let file = directory.path().join("trex.txt");
         fs::write(&file, b"a b\n").unwrap();
         let mut failures = 0;
         let report = counted(
@@ -1621,8 +1604,8 @@ mod tests {
             11
         );
         // The widest row sets the column, and truncation bounds it at `NAME_WIDTH`.
-        let names = [("a.txt", 0), ("nested/directory/b.txt", 0)];
-        assert_eq!(name_width(names.into_iter()), 22);
+        let names = [("trex.txt", 0), ("nested/directory/dodo.txt", 0)];
+        assert_eq!(name_width(names.into_iter()), 25);
         let long = "é".repeat(60);
         assert_eq!(name_width(std::iter::once((long.as_str(), 0))), NAME_WIDTH);
         // Empty input renders a header alone, so the column collapses rather than pads.

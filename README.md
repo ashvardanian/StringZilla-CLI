@@ -165,6 +165,15 @@ $ gnu-wc   -lwc xlsum.csv # 🐌 5.64 s — 0.89 GB/s
 $ sz-count      xlsum.csv # ⚡ 1.19 s — 4.2 GB/s, 4.7x faster than GNU
 ```
 
+Bytes, code points and graphemes are three different questions, and one short line answers them differently — the German flag is two code points and one grapheme:
+
+```bash
+$ cd "$(mktemp -d)" && printf 'Straße 😀🇩🇪\n' > label.txt
+
+$ sz-count --utf8 --fields bytes,chars label.txt  # 21 bytes, 11 code points
+$ sz-segment-utf8 --by graphemes --show count label.txt  # 10
+```
+
 The table itself is labelled and sized to its contents:
 
 ```bash
@@ -208,6 +217,14 @@ $ sz-replace --occurrences one "old" "new" file.txt    # exactly one, or exit 3 
 Note `first` means the first match in the _file_, where `sed 's/old/new/'` means the first on every _line_.
 `one` turns "I expect this to be unique" from an assumption into an assertion, which is what makes it safe to hand a pattern to something that cannot look at the file first.
 
+```bash
+$ cd "$(mktemp -d)" && printf 'trex trex\ntrex trex\n' > roar.txt
+
+$ sed 's/trex/dodo/' roar.txt     $ sz-replace --occurrences first trex dodo roar.txt
+dodo trex                        dodo trex
+dodo trex                        trex trex
+```
+
 Substituting one literal for another over the same 5 GB, every tool below writes byte-identical output:
 
 ```bash
@@ -234,6 +251,17 @@ $ sz-cols --columns 1,3 --delimiter ',' --output-delimiter ';' data.csv # re-del
 $ sz-cols --columns 2-5 data.tsv                                        # a range (replaces: cut -f2-5)
 $ sz-cols --columns 1,3-5,8 data.tsv                                    # columns and ranges mixed (replaces: cut -f1,3-5,8)
 $ sz-cols --columns 3,1 data.tsv                                        # reordered, which `cut` cannot do at all
+```
+
+`cut` does not refuse a reordering — it silently emits ascending order instead, which is the behaviour worth seeing rather than reading about:
+
+```bash
+$ cd "$(mktemp -d)" && printf 'name\tera\ttons\ntrex\tCretaceous\t7\nraptor\tCretaceous\t0.02\n' > dinos.tsv
+
+$ cut -f3,1 dinos.tsv        $ sz-cols --columns 3,1 dinos.tsv
+name    tons                 tons    name
+trex    7                    7       trex
+raptor  0.02                 0.02    raptor
 ```
 
 Extracting one comma-separated field from the same 5 GB, where every tool but `xsv` writes byte-identical output:
@@ -310,7 +338,7 @@ Coreutils has nothing, ICU ships `genbrk` and `uconv` but neither segments text,
 $ sz-segment-utf8 --by sentences book.txt                               # one UAX-29 sentence per line
 $ sz-segment-utf8 --by graphemes --show count emoji.txt                 # count user-perceived characters
 $ sz-segment-utf8 --by sentences --fields byte-span doc.txt             # start and end, for citing back to source
-$ sz-segment-utf8 --by sentences --chunk-bytes 2000 --format json c.txt # 2 KB records for an embedder
+$ sz-segment-utf8 --by sentences --chunk-bytes 2000 --format json book.txt # 2 KB records for an embedder
 ```
 
 Seven modes, each named for the iterator behind it, over the same 5 GB corpus.
@@ -400,6 +428,15 @@ Its index is the smallest of the three per line, but unbounded: GNU caps its buf
 
 Drop repeated lines, keeping the first of each, __without sorting__.
 `uniq` collapses only adjacent duplicates and so needs sorted input, and `sort -u` gets there by discarding the original order; the idiom that actually preserves order is `awk '!seen[$0]++'`.
+
+```bash
+$ cd "$(mktemp -d)" && printf 'trex\nraptor\ntrex\nmoa\n' > sightings.txt
+
+$ sort -u sightings.txt          $ sz-dedup sightings.txt
+moa                              trex
+raptor                           raptor
+trex                             moa
+```
 
 ```bash
 $ sz-dedup file.txt               # first of each, input order kept (replaces: awk '!seen[$0]++')
@@ -532,13 +569,11 @@ $ sz-outline --detail blocks README.md
 For C source files, `sz-outline` extracts includes and function signatures:
 
 ```bash
-$ sz-outline --detail positions src/parser.c
-#include <stdio.h>                        [L1, @0]
-#include <stdlib.h>                       [L2, @19]
-#include "parser.h"                       [L3, @39]
-static int parse_token(const char *input) [L12-45, @156, definition]
-int parse_file(FILE *fp)                  [L47-123, @892, definition]
-void cleanup(void)                        [L125-130, @2341, definition]
+$ sz-outline --detail positions herd.c
+#include <stdio.h>                      [L1, @0]
+#include "herd.h"                       [L2, @19]
+static int count_dinos(const char *pen) [L4-6, @38, definition]
+void feed_herd(FILE *log)               [L8-9, @97, definition]
 ```
 
 Every bracketed detail starts in one column, sized to the longest name the run prints rather than to a fixed width.
@@ -626,10 +661,10 @@ Line numbers have the same problem one level down: change line 10 and every numb
 The three ways a script rewrites one line it has already read — the first is what a language model writes when asked to edit a file, the second what it writes when asked for a one-liner:
 
 ```bash
-$ python3 -c "p = Path('parser.c'); p.write_text(p.read_text().replace(old, new))"
-$ sed -i 's|// TODO: handle EOF|if (at_eof(s)) return 1;|' parser.c
-$ sz-replace --in-place --expect-hash ak5pq35xy89tr \
-             --match line-hash --occurrences one bbcvyaqk '    if (at_eof(s)) return 1;' parser.c
+$ python3 -c "p = Path('paddocks.toml'); p.write_text(p.read_text().replace(old, new))"
+$ sed -i 's|electrified = false|electrified = true|' paddocks.toml
+$ sz-replace --in-place --expect-hash d9xqrcystscnp \
+             --match line-hash --occurrences one 5j5wg73n 'electrified = true' paddocks.toml
 ```
 
 They differ only once the file stops being what the read said it was:
@@ -648,46 +683,63 @@ Two names solve the two halves, and both come out of the same read.
 Everything below runs against one small file:
 
 ```bash
-$ printf 'static int parse(state_t *s) {\n    // TODO: handle EOF\n    return 0;\n}\n' > parser.c
+$ cd "$(mktemp -d)"
+$ cat > paddocks.toml <<'EOF'
+[park]
+name = "Isla Nublar"
+opened = 1993-06-11
+
+[paddock.raptor]
+feed_kg = 40.5
+fence_volts = 10000
+electrified = true
+
+[paddock.trex]
+feed_kg = 250.0
+fence_volts = 24000
+electrified = false
+EOF
 ```
 
 __One read names the file and every line it prints.__
 The file's name is a token for the whole content; a line's name is derived from its own bytes, so it survives edits elsewhere where a number would shift:
 
 ```bash
-$ sz-find --heading --fields line-numbers,line-hashes,file-hash TODO parser.c
-parser.c  ak5pq35xy89tr
-2:bbcvyaqk:    // TODO: handle EOF
+$ sz-find --heading --fields line-numbers,line-hashes,file-hash electrified paddocks.toml
+paddocks.toml  d9xqrcystscnp
+8:2jtd2d8j:electrified = true
+13:5j5wg73n:electrified = false
 ```
 
 Or, for a program reading the output, one record per file and one per line:
 
 ```bash
-$ sz-find --fields line-hashes,file-hash --format json TODO parser.c
-{"type":"begin","data":{"path":{"text":"parser.c"}}}
-{"type":"match","data":{"path":{"text":"parser.c"},"lines":{"text":"    // TODO: handle EOF"},"line_number":2,"absolute_offset":31,"line_hash":"bbcvyaqk","submatches":[{"match":{"text":"TODO"},"start":7,"end":11}]}}
-{"type":"end","data":{"path":{"text":"parser.c"},"file_hash":"ak5pq35xy89tr","stats":{"matches":1,"lines_searched":4}}}
+$ sz-find --fields line-hashes,file-hash --format json 'electrified = false' paddocks.toml
+{"type":"begin","data":{"path":{"text":"paddocks.toml"}}}
+{"type":"match","data":{"path":{"text":"paddocks.toml"},"lines":{"text":"electrified = false"},"line_number":13,"absolute_offset":172,"line_hash":"5j5wg73n","submatches":[{"match":{"text":"electrified = false"},"start":0,"end":19}]}}
+{"type":"end","data":{"path":{"text":"paddocks.toml"},"file_hash":"d9xqrcystscnp","stats":{"matches":1,"lines_searched":13}}}
 ```
 
 __The edit names both.__
 `--expect-hash` is the file token; the pattern is the line name; `--occurrences one` asserts the name picks out exactly one line:
 
 ```bash
-$ sz-replace --in-place --expect-hash ak5pq35xy89tr \
-             --match line-hash --occurrences one bbcvyaqk '    if (at_eof(s)) return 1;' \
-             --format json parser.c
-{"type":"summary","data":{"path":{"text":"parser.c"},"replacements":1,"dry_run":false,"hash_before":"ak5pq35xy89tr","hash_after":"nxmqh0zya0nce"}}
+$ sz-replace --in-place --expect-hash d9xqrcystscnp \
+             --match line-hash --occurrences one 5j5wg73n 'electrified = true' \
+             --format json paddocks.toml
+{"type":"summary","data":{"path":{"text":"paddocks.toml"},"replacements":1,"dry_run":false,"hash_before":"d9xqrcystscnp","hash_after":"bj64vz585f0wy"}}
 ```
 
 __The token it hands back is the one the next edit passes__, so a run of edits costs one read rather than one per edit:
 
 ```bash
-$ sz-find --fields line-hashes at_eof parser.c
-ytyymgew:    if (at_eof(s)) return 1;
+$ sz-find --fields line-hashes feed_kg paddocks.toml
+jx0ehpn9:feed_kg = 40.5
+ews5v0te:feed_kg = 250.0
 
-$ sz-replace --in-place --expect-hash nxmqh0zya0nce \
-             --match line-hash --after ytyymgew '    flush(s);' --format json parser.c
-{"type":"summary","data":{"path":{"text":"parser.c"},"replacements":1,"dry_run":false,"hash_before":"nxmqh0zya0nce","hash_after":"tm5feseweghxa"}}
+$ sz-replace --in-place --expect-hash bj64vz585f0wy \
+             --match line-hash --occurrences one ews5v0te 'feed_kg = 275.5' --format json paddocks.toml
+{"type":"summary","data":{"path":{"text":"paddocks.toml"},"replacements":1,"dry_run":false,"hash_before":"bj64vz585f0wy","hash_after":"417s0pmaf5fva"}}
 ```
 
 __Both names refuse rather than guess.__
@@ -695,16 +747,30 @@ A spent file token means the file moved; a name that picks out nothing means the
 Either way the file is untouched and the exit code says to look again:
 
 ```bash
-$ sz-replace --in-place --expect-hash ak5pq35xy89tr --match line-hash bbcvyaqk x parser.c
-sz-replace: parser.c: content is tm5feseweghxa, not the expected ak5pq35xy89tr; re-read it before editing
+$ sz-replace --in-place --expect-hash d9xqrcystscnp --match line-hash 5j5wg73n x paddocks.toml
+sz-replace: paddocks.toml: content is 417s0pmaf5fva, not the expected d9xqrcystscnp; re-read it before editing
 $ echo $?
 3
 
-$ sz-replace --in-place --match line-hash bbcvyaqk x parser.c
-sz-replace: parser.c: `bbcvyaqk` names no line here; re-read the file
+$ sz-replace --in-place --match line-hash 5j5wg73n x paddocks.toml
+sz-replace: paddocks.toml: `5j5wg73n` names no line here; re-read the file
 $ echo $?
 3
 ```
+
+An edit can also _create_ the ambiguity it then refuses, which is the case worth seeing. Switching the T-rex fence on made its line byte-identical to the raptor's, so both now answer to one name:
+
+```bash
+$ sz-find --fields line-numbers,line-hashes electrified paddocks.toml
+8:2jtd2d8j:electrified = true
+13:2jtd2d8j:electrified = true
+
+$ sz-replace --in-place --expect-hash bj64vz585f0wy \
+             --match line-hash --occurrences one 2jtd2d8j 'electrified = false' paddocks.toml
+sz-replace: paddocks.toml: `2jtd2d8j` matches 2 places, not one; ask sz-find for a longer name with --hash-width, or name a neighbouring line
+```
+
+Widening will not separate these two: identical bytes hash identically at every width, so the way out is a neighbouring line, or making the values differ.
 
 Exit code 3 is distinct from 1 (ran, found nothing) and 2 (could not run), because the recovery is to look at the file again rather than to fix the arguments.
 Which look depends on the message: a spent file token or a name that resolves nowhere means re-reading, while a name that resolves in several places means asking `sz-find` for a longer one with `--hash-width`.
@@ -732,9 +798,9 @@ A name covers the line's terminator as well as its text.
 That is what makes a CRLF line name the same under `--utf8` as under the default LF reading, and it is why every line operation falls out of one replacement argument:
 
 ```bash
-$ sz-replace --match line-hash bbcvyaqk '    return 1;' parser.c   # rewrite
-$ sz-replace --match line-hash bbcvyaqk '' parser.c                # delete
-$ sz-replace --match line-hash bbcvyaqk $'\n' parser.c             # blank, keeping the line
+$ sz-replace --match line-hash jx0ehpn9 'feed_kg = 45.0' paddocks.toml  # rewrite
+$ sz-replace --match line-hash jx0ehpn9 '' paddocks.toml               # delete
+$ sz-replace --match line-hash jx0ehpn9 $'\n' paddocks.toml            # blank, keeping the line
 ```
 
 The cost of covering the terminator is that adding a final newline renames the last line of a file.

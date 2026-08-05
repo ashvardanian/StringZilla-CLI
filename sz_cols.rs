@@ -1,26 +1,14 @@
-//! SIMD-accelerated column extraction utility
+//! Column extraction, standing in for `cut -f` and `awk '{print $N}'`.
 //!
-//! A simpler, faster replacement for `cut -f` and `awk '{print $N}'`.
-//! Uses StringZilla for fast delimiter scanning.
+//! Columns come out in the order they are named, so `--columns 3,1` writes the third then the
+//! first. `cut` cannot express that at all: given `-f3,1` it emits ascending order and says
+//! nothing, which is the behaviour this exists to replace rather than merely outrun.
 //!
-//! # Examples
+//! Fields are split on a single byte located by a SIMD scan, with no quote awareness — a CSV whose
+//! quoted fields contain the delimiter needs a real parser, not this.
 //!
-//! ```bash
-//! # Extract second column (tab-delimited by default)
-//! sz-cols --columns 2 data.tsv
-//!
-//! # Extract multiple columns
-//! sz-cols --columns 1,3,5 data.tsv
-//!
-//! # Use comma as delimiter (CSV)
-//! sz-cols --delimiter ',' --columns 2 data.csv
-//!
-//! # Extract column range
-//! sz-cols --columns 2-5 data.tsv
-//!
-//! # From stdin
-//! cat data.tsv | sz-cols --columns 2
-//! ```
+//! Exit: 0 wrote a record, 1 ran and wrote none, 2 could not run. A line too short for the
+//! requested column still yields an empty field, so a narrow file exits 0, not 1.
 
 use std::io::{self, Read, Write};
 
@@ -41,11 +29,11 @@ struct Args {
     #[arg(long, required = true)]
     columns: String,
 
-    /// Column delimiter (default: tab)
+    /// Column delimiter
     #[arg(long, default_value = "\t")]
     delimiter: String,
 
-    /// Output delimiter (default: same as input delimiter)
+    /// Output delimiter [default: the input delimiter]
     #[arg(long)]
     output_delimiter: Option<String>,
 
@@ -66,7 +54,7 @@ struct Args {
     )]
     format: Format,
 
-    /// NUL-terminate each output record instead of newline
+    /// NUL-terminate each output record instead of newline, for `xargs -0`
     #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
@@ -109,7 +97,6 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     Ok(())
 }
 
-/// Parse a column specification into a list of 0-based column indices
 /// Read one 1-based column number into the 0-based index the split uses.
 ///
 /// Every message names the token it read, which is why the empty case is separate: `2-`
@@ -128,6 +115,7 @@ fn parse_column(token: &str) -> Result<usize, String> {
     Ok(column - 1)
 }
 
+/// Parse a column specification — a number, a comma list, or a range — into 0-based indices.
 fn parse_columns(spec: &str) -> Result<Vec<usize>, String> {
     if spec.trim().is_empty() {
         return Err("no columns given; pass a column, a list, or a range".into());

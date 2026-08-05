@@ -1,29 +1,16 @@
-//! SIMD-accelerated substring replacement utility
+//! Literal substring replacement, standing in for `sed s///g` without the regex.
 //!
-//! A simpler alternative to sed/awk for substring replacement.
-//! Uses StringZilla for fast searching and replacing.
+//! The pattern is either a substring or a line name, and both can be guarded. `--expect-hash`
+//! refuses the edit unless the input still hashes to what the caller read, and `--occurrences one`
+//! refuses unless the pattern picks out exactly one place. Both are settled before any destination
+//! is opened, which is why a run that refuses has written nothing at all.
 //!
-//! # Examples
+//! Case folding runs through StringZilla's full-Unicode `utf8_uncased_search`, so a match can be
+//! wider or narrower than the pattern — `ß` folds to `ss`, `İ` to `i` — and the cursor advances by
+//! the matched length rather than the pattern's.
 //!
-//! ```bash
-//! # Replace all occurrences
-//! sz-replace foo bar file.txt
-//!
-//! # Replace in-place
-//! sz-replace --in-place foo bar file.txt
-//!
-//! # Case-insensitive replacement
-//! sz-replace --ignore-case foo bar file.txt
-//!
-//! # Show one line about the whole run
-//! sz-replace --summary foo bar file.txt
-//!
-//! # Refuse the edit unless the file is still what was read
-//! sz-replace --in-place --expect-hash 2544218206cee57b foo bar file.txt
-//!
-//! # From stdin
-//! cat file.txt | sz-replace foo bar
-//! ```
+//! Exit: 0 replaced something, 1 ran and matched nothing, 2 could not run, 3 the file or the name
+//! moved and the caller should read again.
 
 use std::io::{self, Read, Write};
 
@@ -35,7 +22,9 @@ use shared::*;
 /// How records are rendered.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
+    /// A single human-readable line about the run.
     Text,
+    /// One JSON summary record for the run.
     Json,
 }
 
@@ -126,7 +115,8 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Occurrences::All, help_heading = "Placement")]
     occurrences: Occurrences,
 
-    /// Fold case when searching; matching is byte-literal, so there is no --utf8 to pair it with
+    /// Fold case when searching, with full Unicode folding; line splitting stays byte-literal,
+    /// so there is no --utf8 to pair with it
     #[arg(long)]
     ignore_case: bool,
 
@@ -134,7 +124,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Format::Text, help_heading = "Output Formats")]
     format: Format,
 
-    /// Print one line about the whole run on stdout
+    /// Print one line about the whole run on stderr
     #[arg(long, help_heading = "Output Formats")]
     summary: bool,
 
@@ -602,13 +592,24 @@ fn resolve_lines(args: &Args, data: &[u8], path: &str) -> Result<Vec<Splice>, Fa
         Occurrences::First => 1,
         Occurrences::One if matched.len() == 1 => 1,
         Occurrences::One => {
+            // Widening only helps when distinct lines happen to share a prefix. Lines that
+            // are byte-identical hash identically at every width, so sending the caller to
+            // `--hash-width` there is advice that cannot work.
+            let identical = matched
+                .windows(2)
+                .all(|pair| pair[0].body() == pair[1].body());
             return Err(Failure::Ambiguous {
                 path: path.to_string(),
                 subject: args.pattern.clone(),
                 matches: matched.len(),
-                note: "ask sz-find for a longer name with --hash-width, \
-                       or name a neighbouring line",
-            })
+                note: if identical {
+                    "these lines are byte-identical, so no width separates them; \
+                     name a neighbouring line, or make the lines differ"
+                } else {
+                    "ask sz-find for a longer name with --hash-width, \
+                     or name a neighbouring line"
+                },
+            });
         }
     };
 
@@ -1469,7 +1470,7 @@ mod tests {
             // And still does once the destination could have been discarded, which is what
             // the escape hatch keyed on.
             for sink in [
-                vec!["--output", "o.txt"],
+                vec!["--output", "trex.txt"],
                 vec!["--dry-run"],
                 vec!["--quiet"],
                 vec!["--in-place"],

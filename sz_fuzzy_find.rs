@@ -1,43 +1,17 @@
-//! SIMD/GPU-accelerated fuzzy substring search utility
+//! Fuzzy substring search over StringZilla's `szs` kernels, where `sz-find` matches literally.
 //!
-//! A grep-like tool that combines exact substring matching with bounded fuzzy
-//! matching, built entirely on StringZilla's `szs` kernels:
+//! `--match line` runs Smith-Waterman local alignment of the needle against each line;
+//! `--match word` tokenizes first and measures Levenshtein against each token, which is the mode
+//! that carries true edit-distance semantics. Exact hits are claimed first by a literal scan, so
+//! only the remainder reaches the kernel.
 //!
-//! - `--match line` (default): **Smith-Waterman** local alignment of the needle
-//!   against each line. Threshold via `--max-distance` or `--min-similarity`.
-//! - `--match word`: tokenize lines and match the needle against each word using
-//!   **Levenshtein** (`--cost edit`) or Smith-Waterman (matrix costs). With
-//!   `--utf8`, word mode tokenizes on Unicode alphanumerics and counts edit
-//!   distance in code points rather than bytes.
+//! Scoring is selectable — uniform, keyboard proximity, or phonetic — and any non-uniform model
+//! routes through Smith-Waterman, which carries a `byte_to_class[256]` and a
+//! `class_substitution_costs[32][32]` matrix. Thirty-two classes cannot hold fifty-two letters, so
+//! that path folds case unconditionally and `--ignore-case` changes only the literal and
+//! Levenshtein paths.
 //!
-//! Scoring is selectable: `--cost edit` (uniform), `--cost keyboard` (QWERTY key
-//! proximity), `--cost phonetic` (articulatory similarity), or `--cost-matrix FILE`.
-//! Custom scoring routes through Smith-Waterman, which carries the
-//! `byte_to_class[256]` + `class_substitution_costs[32][32]` matrix. That matrix has
-//! 32 classes for 52 letters, so Smith-Waterman folds case unconditionally and
-//! `--ignore-case` changes only the exact and Levenshtein paths.
-//!
-//! Execution runs on the CPU multicore backend by default, or the GPU when built
-//! with `--features cuda` and invoked with `--device gpu`.
-//!
-//! # Examples
-//!
-//! ```bash
-//! # Substring fuzzy search, up to 1 edit (Smith-Waterman)
-//! sz-fuzzy-find --max-distance 1 color file.txt
-//!
-//! # Keyboard-aware scoring (fat-finger typos), 80% similarity
-//! sz-fuzzy-find --cost keyboard --min-similarity 0.8 color file.txt
-//!
-//! # Phonetic scoring (sounds-like)
-//! sz-fuzzy-find --cost phonetic --min-similarity 0.8 Smith names.txt
-//!
-//! # Word mode: needle vs each token via Levenshtein
-//! sz-fuzzy-find --match word --max-distance 1 colour file.txt
-//!
-//! # Run on the GPU (requires: cargo build --features cuda)
-//! sz-fuzzy-find --device gpu --max-distance 1 needle big.txt
-//! ```
+//! Exit: 0 matched something, 1 matched nothing, 2 could not run.
 
 use std::borrow::Cow;
 use std::io::{self, Write};
@@ -649,7 +623,10 @@ fn search_lines<'a>(
 /// What the needle is matched against
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Match {
+    /// Align the needle against the whole line, scored by Smith-Waterman.
     Line,
+    /// Tokenize first and measure Levenshtein against each token, so `--max-distance`
+    /// is an edit budget rather than a score floor.
     Word,
 }
 
@@ -663,30 +640,41 @@ enum Field {
 /// Which record kind to emit
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Show {
+    /// Every matching line.
     Lines,
+    /// One count per input.
     Count,
 }
 
 /// How records are rendered
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Format {
+    /// The matching line, with any requested fields ahead of it.
     Text,
+    /// JSON Lines, one object per match.
     Json,
 }
 
 /// Which scoring model scores a substitution
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Cost {
+    /// Every substitution costs the same, which is plain edit distance.
     Edit,
+    /// Adjacent keys cost less, for fat-finger typos: `xolor` reaches `color`.
     Keyboard,
+    /// Sounds-alike, seeded by voiced and unvoiced cognates and Editex letter groups:
+    /// `fonetik` reaches `phonetic`.
     Phonetic,
 }
 
 /// Where the kernels run
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Device {
+    /// The GPU where one was built in, the CPU otherwise.
     Auto,
+    /// Every core unless `--threads` says otherwise.
     Cpu,
+    /// Requires a build with `--features cuda`.
     Gpu,
 }
 
@@ -758,7 +746,7 @@ struct Args {
     #[arg(long, value_enum)]
     show: Option<Show>,
 
-    /// Print one line about the whole run, on stderr
+    /// Print one line about the whole run on stderr
     #[arg(long)]
     summary: bool,
 
@@ -766,7 +754,7 @@ struct Args {
     #[arg(long, value_enum, help_heading = "Output Formats")]
     format: Option<Format>,
 
-    /// NUL-terminate each output record instead of newline
+    /// NUL-terminate each output record instead of newline, for `xargs -0`
     #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
