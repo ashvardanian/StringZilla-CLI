@@ -10,6 +10,22 @@ readme = "README.md"
 repository = "https://github.com/ashvardanian/StringZilla-CLI"
 version = "0.1.0"
 
+# Lets `cargo binstall stringzilla-cli` fetch the release archive instead of compiling.
+# `{ target }` is the full triple, which is why the archives are named after triples rather
+# than friendlier labels: one template then covers every platform.
+# Takes effect only once the crate is on crates.io, since binstall reads this table from the
+# published manifest rather than from the repository.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [features]
 cuda = ["stringzilla/cuda"]
 default = []
@@ -25,7 +41,7 @@ glob = "0.3" # Glob pattern matching
 ignore = "0.4" # .gitignore support
 memmap2 = "0.9" # Memory-mapped file I/O
 stringtape = "2.4" # Compact (offset, length) storage for line collections
-stringzilla = "~5.0" # SIMD string ops; `szs` multicore kernels arrive with `fuzzy-find`
+stringzilla = "~5.1" # SIMD string ops; `szs` multicore kernels arrive with `fuzzy-find`
 
 [dev-dependencies]
 tempfile = "3.10"

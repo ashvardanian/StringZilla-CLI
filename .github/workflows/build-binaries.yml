@@ -1,0 +1,288 @@
+name: Build Binaries
+
+# One matrix, called from both `release.yml` and `prerelease.yml`, so the two paths cannot
+# drift into building different things. They differ only in `upload`.
+#
+# No top-level `permissions`: a called workflow may only narrow what its caller granted, so
+# declaring `contents: write` here would make the read-only pre-release caller invalid.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit-ish to build. Release passes `main` to pick up the version bump."
+        type: string
+        required: true
+      upload:
+        description: "Attach the archives to the GitHub release. False on pull requests."
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            archive: tar.gz
+            expect: x86-64
+            simd: zmm
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            archive: tar.gz
+            expect: ARM aarch64
+            simd: \bz[0-9]+\.[bhsd]\b
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            archive: tar.gz
+            expect: arm64
+            macos_min: "11.0"
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            archive: tar.gz
+            expect: x86_64
+            macos_min: "10.15"
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            archive: zip
+            ext: .exe
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            archive: zip
+            ext: .exe
+
+    env:
+      # Ubuntu names the wrapper `musl-gcc` on both architectures, but `cc` probes only
+      # `aarch64-linux-musl-gcc` for the arm64 target and falls back to the plain glibc `cc`
+      # when it misses, compiling StringZilla's C half against the wrong libc while rustc
+      # links musl. Naming the compiler explicitly is what prevents that.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      # Unset, the C objects inherit the runner SDK's floor while rustc uses its own, and the
+      # result refuses to load on older macOS. Empty on every non-Apple target, where it is
+      # ignored.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
+      RELEASE_DIR: target/${{ matrix.target }}/release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Every other image ships Rust; this one does not, so `dtolnay/rust-toolchain` would
+      # fail on a missing `rustup`.
+      - name: Bootstrap rustup (Windows arm64)
+        if: matrix.runner == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
+          ./rustup-init.exe -y --default-toolchain none --profile minimal
+          "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      # No `--features`: `sz-outline` and `sz-fuzzy-find` carry `required-features`, so a
+      # default build skips them and `stringzilla/cpus` never reaches a release artifact.
+      # The count assertion in `Stage archive` is what enforces that in both directions.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Must precede the smoke test: `strip = true` in `[profile.release]` runs after the
+      # linker has ad-hoc-signed the arm64 Mach-O, invalidating the signature, and macOS then
+      # kills the unsigned result with "code has been modified" rather than running it.
+      - name: Re-sign stripped macOS binaries
+        if: endsWith(matrix.target, '-apple-darwin')
+        run: |
+          find "$RELEASE_DIR" -maxdepth 1 -type f -name 'sz-*' ! -name '*.d' -exec codesign --force --sign - {} +
+          codesign --verify "$RELEASE_DIR/sz-find"
+
+      # Every runner is native, so executing the binary proves its architecture more directly
+      # than inspecting it — which is the whole verification story on Windows, where `file` is
+      # not on PATH.
+      - name: Smoke test
+        shell: bash
+        run: printf 'hello world\n' | "$RELEASE_DIR/sz-find${{ matrix.ext }}" world
+
+      - name: Verify architecture
+        if: matrix.expect
+        run: file "$RELEASE_DIR/sz-find" | tee /dev/stderr | grep -q '${{ matrix.expect }}'
+
+      - name: Verify static linking
+        if: endsWith(matrix.target, '-linux-musl')
+        run: file "$RELEASE_DIR/sz-find" | grep -q 'statically linked\|static-pie linked'
+
+      # Catches what `file` cannot: a toolchain that emitted the right architecture but could
+      # not build the widest SIMD tier, which the C build reports only as a silently dropped
+      # `SZ_USE_*` define. The capability strings are no help — LTO removes them — so the
+      # instructions themselves are the only evidence.
+      - name: Verify SIMD tier survived
+        if: matrix.simd
+        run: objdump -d "$RELEASE_DIR/sz-find" | grep -qE '${{ matrix.simd }}'
+
+      - name: Stage archive
+        id: stage
+        shell: bash
+        run: |
+          NAME="stringzilla-cli-v${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "staging/$NAME"
+          find "$RELEASE_DIR" -maxdepth 1 -type f -name 'sz-*' ! -name '*.d' ! -name '*.pdb' -exec cp {} "staging/$NAME/" \;
+          cp README.md LICENSE "staging/$NAME/"
+          test "$(find "staging/$NAME" -name 'sz-*' | wc -l)" -eq 9
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      # `COPYFILE_DISABLE` stops bsdtar on macOS from writing an `._` AppleDouble sibling for
+      # every extended attribute.
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: COPYFILE_DISABLE=1 tar -czf "${{ steps.stage.outputs.name }}.tar.gz" -C staging "${{ steps.stage.outputs.name }}"
+
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path "staging/${{ steps.stage.outputs.name }}" -DestinationPath "${{ steps.stage.outputs.name }}.zip"
+
+      # Nothing reaches the release from here. A single `publish` job attaches everything at
+      # once, so a release never carries a partial asset set.
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: binaries-${{ matrix.target }}
+          path: ${{ steps.stage.outputs.name }}.${{ matrix.archive }}
+          retention-days: 7
+          if-no-files-found: error
+
+  package_deb:
+    name: Package .deb (${{ matrix.debarch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            debarch: amd64
+          - target: aarch64-unknown-linux-musl
+            debarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Get version
+        id: version
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Download binaries
+        uses: actions/download-artifact@v6
+        with:
+          name: binaries-${{ matrix.target }}
+
+      # `/usr/bin`, not `/usr/local/bin`: Debian policy 9.1.2 reserves `/usr/local` for the
+      # local administrator. `-Zxz` because dpkg only learned zstd in 1.21.18, so the zstd
+      # default on this runner would refuse to install on bookworm and older.
+      - name: Build package
+        id: deb
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.debarch }}
+          MAINTAINER: Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>
+        run: |
+          sudo apt-get update && sudo apt-get install -y gettext-base
+          SRC="stringzilla-cli-v${VERSION}-${{ matrix.target }}"
+          ROOT="stringzilla-cli_${VERSION}_${ARCH}"
+          DOC="$ROOT/usr/share/doc/stringzilla-cli"
+          tar -xzf "${SRC}.tar.gz"
+          find "$SRC" -maxdepth 1 -type f -name 'sz-*' -exec install -Dm0755 -t "$ROOT/usr/bin" {} +
+          install -d "$DOC" "$ROOT/DEBIAN"
+          printf 'stringzilla-cli (%s) unstable; urgency=medium\n\n  * Release %s.\n\n -- %s  %s\n' \
+            "$VERSION" "$VERSION" "$MAINTAINER" "$(date -R)" | gzip -9n > "$DOC/changelog.gz"
+          printf 'Upstream-Name: stringzilla-cli\nSource: https://github.com/ashvardanian/StringZilla-CLI\n\nFiles: *\nCopyright: 2024-2026 Ash Vardanian\nLicense: Apache-2.0\n On Debian systems the full text of the Apache 2.0 licence can be found in\n /usr/share/common-licenses/Apache-2.0.\n' > "$DOC/copyright"
+          chmod 0644 "$DOC"/*
+          INSTALLED_SIZE=$(du -ks "$ROOT/usr" | cut -f1) envsubst < .github/deb-control.template > "$ROOT/DEBIAN/control"
+          (cd "$ROOT" && find usr -type f -exec md5sum {} + > DEBIAN/md5sums)
+          dpkg-deb -Zxz --build --root-owner-group "$ROOT"
+          echo "file=${ROOT}.deb" >> "$GITHUB_OUTPUT"
+
+      - name: Verify package
+        run: |
+          dpkg-deb --info "${{ steps.deb.outputs.file }}"
+          dpkg-deb --field "${{ steps.deb.outputs.file }}" Architecture | grep -qx "${{ matrix.debarch }}"
+          test "$(dpkg-deb --contents "${{ steps.deb.outputs.file }}" | grep -c './usr/bin/sz-')" -eq 9
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: deb-${{ matrix.debarch }}
+          path: ${{ steps.deb.outputs.file }}
+          retention-days: 7
+          if-no-files-found: error
+
+  # One serialized job owns the release. Attaching from each matrix leg instead would race
+  # eight concurrent writers against one release, and would leave a published release holding
+  # a partial asset set whenever a leg failed under `fail-fast: false`.
+  publish:
+    name: Publish Release Assets
+    if: inputs.upload
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [build, package_deb]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Two spaces between hash and name and no directory component, which is what
+      # `sha256sum -c` expects beside a downloaded archive. Sorted, so the file is diffable
+      # between releases. Asserting the expected names rather than a count means a renamed or
+      # missing artifact fails loudly instead of shipping quietly.
+      - name: Compute SHA256SUMS
+        working-directory: dist
+        run: |
+          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' \) -printf '%f\n' |
+            sort | xargs sha256sum | tee SHA256SUMS
+          grep -c '\.tar\.gz$' SHA256SUMS | grep -qx 4
+          grep -c '\.zip$' SHA256SUMS | grep -qx 2
+          grep -c '\.deb$' SHA256SUMS | grep -qx 2
+
+      # TinySemVer is a no-op when no commit since the last tag is releasable, so `main` may
+      # carry a version whose release already exists and is already populated. Uploading then
+      # would overwrite a published release's assets with a rebuild.
+      - name: Upload to the release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v$(cat ../VERSION)"
+          if ! gh release view "$TAG" --json isDraft >/dev/null 2>&1; then
+            echo "::error::No release $TAG exists; TinySemVer cut nothing for this push."
+            exit 1
+          fi
+          gh release upload "$TAG" ./* --clobber

@@ -57,9 +57,25 @@ jobs:
             Cargo.toml:^version = "(\d+\.\d+\.\d+)"
             Cargo.lock:name = "stringzilla-cli"\nversion = "(\d+\.\d+\.\d+)"
             README.md:--tag v(\d+\.\d+\.\d+)
+            README.md:stringzilla-cli-v(\d+\.\d+\.\d+)-
+            README.md:stringzilla-cli_(\d+\.\d+\.\d+)_amd64
+            README.md:releases/download/v(\d+\.\d+\.\d+)/
             .claude-plugin/marketplace.json:"version": "(\d+\.\d+\.\d+)"
             .codex-plugin/plugin.json:"version": "(\d+\.\d+\.\d+)"
           dry-run: "false"
           push: "true"
           create-release: "true"
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # `ref: main` is load-bearing: `versioning` has pushed the bumped VERSION and the tag,
+  # while this workflow's own SHA still points at the pre-bump commit, so building the
+  # trigger SHA would name every archive after the previous release.
+  build_binaries:
+    name: Build Binaries
+    needs: [versioning]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      ref: "main"
+      upload: true

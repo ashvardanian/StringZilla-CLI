@@ -34,6 +34,28 @@ It provides the following subcommands:
 - [`sz-split`](#sz-split-split-file-into-smaller-ones): splits by lines, bytes, or a delimiter line, 5x faster than `csplit`
 - [`sz-outline`](#sz-outline-file-outliner-for-llms): experimental tool for sampling file sections for LLM contexts
 
+Every release also carries prebuilt binaries for Linux, macOS and Windows on both x86-64 and arm64, so nothing has to be compiled.
+One binary per operating system and architecture covers every CPU of that architecture: StringZilla picks its SIMD tier at load time, so the same `sz-find` reaches for AVX-512 on Ice Lake, NEON on Apple silicon and SVE on Graviton.
+The Linux builds are statically linked against musl, needing no glibc and running on Alpine or inside a `scratch` container as readily as on Ubuntu:
+
+```bash
+# Swap the triple for aarch64-unknown-linux-musl, or {aarch64,x86_64}-apple-darwin
+$ curl -L https://github.com/ashvardanian/StringZilla-CLI/releases/download/v0.1.0/stringzilla-cli-v0.1.0-x86_64-unknown-linux-musl.tar.gz | tar -xz
+$ sudo install -m 0755 stringzilla-cli-v0.1.0-x86_64-unknown-linux-musl/sz-* /usr/local/bin/
+
+# Or on Debian and Ubuntu, amd64 or arm64 — static, so it pulls in nothing
+$ curl -LO https://github.com/ashvardanian/StringZilla-CLI/releases/download/v0.1.0/stringzilla-cli_0.1.0_amd64.deb
+$ sudo dpkg -i stringzilla-cli_0.1.0_amd64.deb
+
+# Every release ships a SHA256SUMS, so an archive can be checked before it is unpacked
+$ curl -LO https://github.com/ashvardanian/StringZilla-CLI/releases/download/v0.1.0/SHA256SUMS
+$ sha256sum -c SHA256SUMS --ignore-missing
+```
+
+The macOS binaries are ad-hoc signed but not notarized, so an archive fetched through a browser carries a quarantine flag — clear it with `xattr -dr com.apple.quarantine <directory>`.
+One fetched with `curl` never gets that flag.
+Windows archives hold the same nine `.exe` files; unzip them anywhere on `PATH`.
+
 <details>
 <summary>In the examples below it's compared to the following tools on macOS</summary>
 

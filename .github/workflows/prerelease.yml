@@ -34,6 +34,9 @@ jobs:
             Cargo.toml:^version = "(\d+\.\d+\.\d+)"
             Cargo.lock:name = "stringzilla-cli"\nversion = "(\d+\.\d+\.\d+)"
             README.md:--tag v(\d+\.\d+\.\d+)
+            README.md:stringzilla-cli-v(\d+\.\d+\.\d+)-
+            README.md:stringzilla-cli_(\d+\.\d+\.\d+)_amd64
+            README.md:releases/download/v(\d+\.\d+\.\d+)/
             .claude-plugin/marketplace.json:"version": "(\d+\.\d+\.\d+)"
             .codex-plugin/plugin.json:"version": "(\d+\.\d+\.\d+)"
           dry-run: "true"
@@ -96,3 +99,14 @@ jobs:
         run: |
           cargo test --release --features outline
           cargo test --release --features fuzzy-find
+
+  # The same matrix the release runs, minus the uploads, so a broken runner label or a
+  # narrowed SIMD tier is caught on the pull request. The top-level `contents: read` above
+  # caps what this can do regardless of `upload`, since a called workflow cannot escalate
+  # past its caller's grant.
+  build_binaries:
+    name: Build Binaries
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+      upload: false
