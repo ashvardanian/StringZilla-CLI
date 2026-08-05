@@ -189,7 +189,7 @@ fn phonetic_scheme() -> Scheme {
         set(a, b, 4);
     }
     // Vowels are highly interchangeable.
-    let vowels = [b'a', b'e', b'i', b'o', b'u', b'y'];
+    let vowels = *b"aeiouy";
     for i in 0..vowels.len() {
         for j in (i + 1)..vowels.len() {
             set(vowels[i], vowels[j], 2);

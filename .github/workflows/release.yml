@@ -24,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
       - name: Build
         run: cargo build --release
       - name: Test

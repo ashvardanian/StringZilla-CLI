@@ -1,15 +1,14 @@
 name: Pre-Release
 
 on:
-  push:
-    branches: ["main-dev"]
   pull_request:
     branches: ["main*"]
 
-# Folds a branch and its open PRs into one group; only PR runs are cancelled.
+# One run per PR branch, superseded by the next push. A `push` trigger here would schedule a
+# second run of the same commit, which this group would then cancel and report as a failure.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -60,7 +59,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
       - name: Check formatting
@@ -85,7 +84,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
       - name: Build
         run: cargo build --release
       - name: Test

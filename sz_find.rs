@@ -2683,7 +2683,7 @@ mod tests {
             br#"{"type":"count","data":{"path":{"text":"log.txt"},"count":3}}"#
                 .iter()
                 .copied()
-                .chain([b'\n'])
+                .chain(*b"\n")
                 .collect::<Vec<u8>>()
         );
     }

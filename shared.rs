@@ -1779,6 +1779,7 @@ mod tests {
         assert_eq!(leftovers, ["lines.txt"]);
     }
     #[test]
+    #[cfg(unix)]
     fn swaps_by_rename_but_keeps_a_hardlinked_inode() {
         use std::os::unix::fs::MetadataExt;
 

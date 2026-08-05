@@ -22,7 +22,10 @@ while IFS= read -r -d '' file; do
     case "$file" in
         *.png|*.jpg|*.jpeg|*.gif|*.ico|Cargo.lock) continue ;;
     esac
-    if hits=$(grep -nEH "$pattern" -- "$file" 2>/dev/null); then
+    # A Markdown table rule (`| --- | ---: |`) opens with `-` runs that the `--` lead-in
+    # matches, and the header above says those are not comments. Dropped by shape rather
+    # than by file type, so a real banner inside a fenced code block still fires.
+    if hits=$(grep -nEH "$pattern" -- "$file" 2>/dev/null | grep -vE '^[^:]*:[0-9]+:[[:space:]]*\|'); then
         violations+="$hits"$'\n'
     fi
 done < <(git diff --cached --name-only --diff-filter=ACM -z)

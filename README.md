@@ -582,7 +582,7 @@ Every core is used unless `--threads` says otherwise. The GPU path requires a CU
 
 ```bash
 # On systems with gcc > 14 + CUDA 12.x, point nvcc at a supported host compiler:
-$ CUDAHOSTCXX=g++-14 cargo install --git https://github.com/ashvardanian/StringZilla-CLI --features cuda
+$ CUDAHOSTCXX=g++-14 cargo install --git https://github.com/ashvardanian/StringZilla-CLI --features cuda --locked
 ```
 
 ## Workflows
