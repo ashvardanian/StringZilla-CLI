@@ -1,0 +1,39 @@
+{
+    "name": "stringzilla",
+    "description": "SIMD string tools for agents, with full Unicode case folding and content-addressed file editing.",
+    "owner": {
+        "name": "Ash Vardanian",
+        "url": "https://github.com/ashvardanian"
+    },
+    "plugins": [
+        {
+            "name": "stringzilla-cli",
+            "source": "./",
+            "description": "Search text with full Unicode case folding via sz-find, and edit files by content hash with sz-replace so a stale write refuses instead of clobbering. Plus faster drop-ins for sort, wc, cut, split and UAX-29 segmentation.",
+            "version": "0.1.0",
+            "author": {
+                "name": "Ash Vardanian"
+            },
+            "skills": [
+                "./.agents/skills/find-and-replace-text-with-content-hash-guarded-edits",
+                "./.agents/skills/segment-tokenize-and-case-fold-unicode-text"
+            ],
+            "homepage": "https://github.com/ashvardanian/StringZilla-CLI",
+            "repository": "https://github.com/ashvardanian/StringZilla-CLI",
+            "license": "Apache-2.0",
+            "category": "productivity",
+            "tags": [
+                "search",
+                "editing",
+                "text-processing",
+                "unicode",
+                "case-folding",
+                "utf8",
+                "simd",
+                "grep",
+                "sed"
+            ],
+            "strict": false
+        }
+    ]
+}

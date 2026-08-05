@@ -5,6 +5,8 @@
     "license": "Apache-2.0",
     "devDependencies": {
         "remark-cli": "^12.0.1",
-        "remark-gfm": "^4.0.1"
+        "remark-frontmatter": "^5.0.0",
+        "remark-gfm": "^4.0.1",
+        "unist-util-visit": "^5.1.0"
     }
 }

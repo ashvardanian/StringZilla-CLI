@@ -1,6 +1,6 @@
 # StringZilla 🦖 Command-Line Interface
 
-![StringZilla CLI banner](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/StringZilla-CLI.png?raw=true)
+![StringZilla CLI banner](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/StringZilla-CLI-v1.jpg?raw=true)
 
 Most text processing command-line utilities have obscure syntax, limited portability across operating systems, can't deal with larger-than-memory datasets, and are not actively leveraging modern SIMD capabilities, such as AVX-512 on x86 and SVE on ARM.
 This utility is written in Rust, leveraging StringZilla for both pipe and file-based text processing across Linux, macOS, and Windows.
@@ -11,6 +11,15 @@ cargo install --git https://github.com/ashvardanian/StringZilla-CLI --tag v0.1.0
 cargo install --git https://github.com/ashvardanian/StringZilla-CLI --locked              # or the tip of main
 cargo install --path . --force --locked                                                   # or a local clone
 ```
+
+Coding agents can pull the bundled skills from the same repository, which teach them the [multi-pass editing workflow](#multi-pass-agentic-file-editing) and where Unicode folding changes an answer:
+
+```bash
+/plugin marketplace add ashvardanian/StringZilla-CLI       # Claude Code, then /plugin install stringzilla-cli@stringzilla
+codex plugin marketplace add ashvardanian/StringZilla-CLI  # Codex, then /plugins
+```
+
+Codex and Pi also read `.agents/skills/` up to the repository root, so a clone needs neither command.
 
 It provides the following subcommands:
 
@@ -174,7 +183,7 @@ $ sz-replace --occurrences one "old" "new" file.txt    # exactly one, or exit 3 
 ```
 
 `--occurrences all` is the default and is what the tool has always done.
-Note `first` means the first match in the *file*, where `sed 's/old/new/'` means the first on every *line*.
+Note `first` means the first match in the _file_, where `sed 's/old/new/'` means the first on every _line_.
 `one` turns "I expect this to be unique" from an assumption into an assertion, which is what makes it safe to hand a pattern to something that cannot look at the file first.
 
 Substituting one literal for another over the same 5 GB, every tool below writes byte-identical output:
@@ -592,6 +601,27 @@ $ CUDAHOSTCXX=g++-14 cargo install --git https://github.com/ashvardanian/StringZ
 A program that reads a file, decides what to change, and writes it back some time later has no way to know the file is still what it read — a formatter on save, a second process, or a person in an editor invalidates the plan and the edit lands anyway.
 Line numbers have the same problem one level down: change line 10 and every number below it moves, so a plan made before the first edit is wrong by the second.
 
+The three ways a script rewrites one line it has already read — the first is what a language model writes when asked to edit a file, the second what it writes when asked for a one-liner:
+
+```bash
+$ python3 -c "p = Path('parser.c'); p.write_text(p.read_text().replace(old, new))"
+$ sed -i 's|// TODO: handle EOF|if (at_eof(s)) return 1;|' parser.c
+$ sz-replace --in-place --expect-hash ak5pq35xy89tr \
+             --match line-hash --occurrences one bbcvyaqk '    if (at_eof(s)) return 1;' parser.c
+```
+
+They differ only once the file stops being what the read said it was:
+
+| Situation                                    | `python -c`          | `sed -i`             | `sz-replace`              |
+| -------------------------------------------- | -------------------- | -------------------- | ------------------------- |
+| The line is where the read left it           | rewrites it, exit 0  | rewrites it, exit 0  | rewrites it, exit 0       |
+| Something else wrote the file after the read | __overwrites it__, 0 | __overwrites it__, 0 | __refuses__, exit 3       |
+| The named text occurs twice                  | __rewrites both__, 0 | __rewrites both__, 0 | __refuses__, exit 3       |
+| The line is no longer there                  | silent no-op, exit 0 | silent no-op, exit 0 | __refuses__, exit 3       |
+| The next edit to the same file               | needs a fresh read   | needs a fresh read   | reuses the returned token |
+
+Three of the four answer by writing and exiting 0, which is why a plan of edits built from one read lands whether or not it is still true.
+
 Two names solve the two halves, and both come out of the same read.
 Everything below runs against one small file:
 
@@ -686,7 +716,7 @@ $ sz-replace --match line-hash bbcvyaqk $'\n' parser.c             # blank, keep
 ```
 
 The cost of covering the terminator is that adding a final newline renames the last line of a file.
-The two newline sets still disagree about where a line *begins* at VT, FF, NEL, LS and PS, which no naming scheme can reconcile: pass `--utf8` to both the read and the edit, or to neither, or a name issued under one will refuse under the other.
+The two newline sets still disagree about where a line _begins_ at VT, FF, NEL, LS and PS, which no naming scheme can reconcile: pass `--utf8` to both the read and the edit, or to neither, or a name issued under one will refuse under the other.
 
 The hash is StringZilla's 64-bit AES hash under seed zero, identical across platforms.
 It answers "did this file change", not "did somebody change it" — it is fast, not cryptographic.

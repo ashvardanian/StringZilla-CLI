@@ -34,6 +34,8 @@ jobs:
             Cargo.toml:^version = "(\d+\.\d+\.\d+)"
             Cargo.lock:name = "stringzilla-cli"\nversion = "(\d+\.\d+\.\d+)"
             README.md:--tag v(\d+\.\d+\.\d+)
+            .claude-plugin/marketplace.json:"version": "(\d+\.\d+\.\d+)"
+            .codex-plugin/plugin.json:"version": "(\d+\.\d+\.\d+)"
           dry-run: "true"
 
   lint_workflows:
