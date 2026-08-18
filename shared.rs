@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, Write};
 use std::num::{NonZeroUsize, ParseIntError};
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::OnceLock;
 
@@ -1516,6 +1516,72 @@ pub fn walker(root: &Path, options: &TraversalOptions<'_>, tool: &str) -> ignore
         }
     }
     builder.build()
+}
+
+/// Compile each glob once, so a malformed one is reported here rather than silently matching
+/// nothing on every file of a walk. `tool` names the reporter, as [`walker`] does.
+pub fn compile_globs(patterns: &[String], tool: &str) -> Vec<glob::Pattern> {
+    patterns
+        .iter()
+        .filter_map(|pattern| match glob::Pattern::new(pattern) {
+            Ok(compiled) => Some(compiled),
+            Err(error) => {
+                eprintln!("{tool}: invalid glob '{}': {}", pattern, error);
+                None
+            }
+        })
+        .collect()
+}
+
+/// Whether a walked entry passes a glob filter, which matches either the whole path or the file
+/// name. No filter accepts everything.
+///
+/// Takes the entry rather than its path because [`ignore::DirEntry::file_name`] falls back to the
+/// whole path where there is no final component, which `Path::file_name` reports as nothing at
+/// all — so a walk rooted at `.` or `/` filters on the name the user typed.
+pub fn glob_selects(globs: Option<&[glob::Pattern]>, entry: &ignore::DirEntry) -> bool {
+    let Some(globs) = globs else {
+        return true;
+    };
+    let path_text = entry.path().to_string_lossy();
+    let name_text = entry.file_name().to_string_lossy();
+    globs
+        .iter()
+        .any(|pattern| pattern.matches(&path_text) || pattern.matches(&name_text))
+}
+
+/// The files a directory holds with their sizes, sorted, every walk failure warned about.
+///
+/// The size comes back because the walk already asked the filesystem for it — a caller that
+/// re-measured would `stat` every file a second time, and on a run of many small files that
+/// second pass costs more syscalls than the reading does. A file whose size cannot be read is
+/// reported as zero rather than dropped.
+///
+/// Eager and sorted, which suits a tool that schedules a batch or prints a stable table. A tool
+/// that streams entries and stops early wants [`walker`] directly instead.
+pub fn walk_files(
+    root: &Path,
+    options: &TraversalOptions<'_>,
+    globs: Option<&[glob::Pattern]>,
+    tool: &str,
+    failures: &mut usize,
+) -> Vec<(PathBuf, u64)> {
+    let mut found = Vec::new();
+    for result in walker(root, options, tool) {
+        match result {
+            Ok(entry) if is_readable_entry(&entry) && glob_selects(globs, &entry) => {
+                let size = entry.metadata().map(|data| data.len()).unwrap_or(0);
+                found.push((entry.path().to_path_buf(), size))
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("{tool}: {}", error);
+                *failures += 1;
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 // endregion: Directory Traversal

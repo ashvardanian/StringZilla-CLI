@@ -578,30 +578,13 @@ fn segment_input(
     Ok(records)
 }
 
-/// Compile each `--glob` once, so a malformed one is reported here rather than silently
-/// matching nothing on every file of the walk.
-fn compile_globs(globs: Option<&[String]>) -> Option<Vec<glob::Pattern>> {
-    globs.map(|globs| {
-        globs
-            .iter()
-            .filter_map(|glob| match glob::Pattern::new(glob) {
-                Ok(pattern) => Some(pattern),
-                Err(error) => {
-                    eprintln!("sz-segment-utf8: invalid glob '{}': {}", glob, error);
-                    None
-                }
-            })
-            .collect()
-    })
-}
-
 /// Collect the files named by the inputs, walking directories with ignore support.
 fn resolve_inputs(
     inputs: &[String],
     globs: Option<&[String]>,
     traversal: &TraversalOptions<'_>,
 ) -> Vec<String> {
-    let globs = compile_globs(globs);
+    let globs = globs.map(|patterns| compile_globs(patterns, "sz-segment-utf8"));
     let mut resolved = Vec::new();
     for input in inputs {
         let path = Path::new(input);
@@ -621,15 +604,8 @@ fn resolve_inputs(
                 continue;
             }
             // The walker has no glob filter of its own, so `--glob` is applied here.
-            if let Some(globs) = &globs {
-                let path_text = entry.path().to_string_lossy();
-                let name_text = entry.file_name().to_string_lossy();
-                if !globs
-                    .iter()
-                    .any(|pattern| pattern.matches(&path_text) || pattern.matches(&name_text))
-                {
-                    continue;
-                }
+            if !glob_selects(globs.as_deref(), &entry) {
+                continue;
             }
             resolved.push(entry.path().display().to_string());
         }

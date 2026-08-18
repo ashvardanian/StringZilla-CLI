@@ -874,58 +874,6 @@ fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io:
 
 // region: Input Processing
 
-/// Compile each `--glob` once, so a malformed one is reported here rather than
-/// silently matching nothing on every file of the walk.
-fn compile_globs(patterns: &[String]) -> Vec<glob::Pattern> {
-    patterns
-        .iter()
-        .filter_map(|pattern| match glob::Pattern::new(pattern) {
-            Ok(compiled) => Some(compiled),
-            Err(error) => {
-                eprintln!("sz-count: invalid glob '{}': {}", pattern, error);
-                None
-            }
-        })
-        .collect()
-}
-
-/// Whether a walked file passes the `--glob` filter, which matches either the whole
-/// path or the file name, as `sz-find` does.
-fn glob_selects(globs: &Option<Vec<glob::Pattern>>, path: &Path) -> bool {
-    let Some(globs) = globs else {
-        return true;
-    };
-    let path_text = path.to_string_lossy();
-    let name_text = path.file_name().unwrap_or_default().to_string_lossy();
-    globs
-        .iter()
-        .any(|pattern| pattern.matches(&path_text) || pattern.matches(&name_text))
-}
-
-/// The files a directory holds, sorted, with every walk failure warned about.
-fn walk_files(
-    path: &Path,
-    traversal: &TraversalOptions<'_>,
-    globs: &Option<Vec<glob::Pattern>>,
-    failures: &mut usize,
-) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for result in walker(path, traversal, "sz-count") {
-        match result {
-            Ok(entry) if is_readable_entry(&entry) && glob_selects(globs, entry.path()) => {
-                paths.push(entry.path().to_path_buf())
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("sz-count: {}", error);
-                *failures += 1;
-            }
-        }
-    }
-    paths.sort();
-    paths
-}
-
 /// What one command-line input turned out to name.
 enum Resolved {
     Stdin,
@@ -989,7 +937,7 @@ fn gather(
     counter: Counter,
     failures: &mut usize,
 ) -> Report {
-    let globs = globs.map(compile_globs);
+    let globs = globs.map(|patterns| compile_globs(patterns, "sz-count"));
     let resolved = resolve_inputs(inputs, failures);
     let mut report = Report {
         rows: Vec::new(),
@@ -1005,7 +953,7 @@ fn gather(
         } else {
             format!("{}/", text)
         });
-        for path in walk_files(directory, traversal, &globs, failures) {
+        for (path, _) in walk_files(directory, traversal, globs.as_deref(), "sz-count", failures) {
             let name = path
                 .strip_prefix(directory)
                 .unwrap_or(&path)
@@ -1037,7 +985,9 @@ fn gather(
                 push_row(&mut report, counter, path, name, failures);
             }
             Resolved::Directory(directory) => {
-                for path in walk_files(directory, traversal, &globs, failures) {
+                for (path, _) in
+                    walk_files(directory, traversal, globs.as_deref(), "sz-count", failures)
+                {
                     let name = path.display().to_string();
                     push_row(&mut report, counter, &path, name, failures);
                 }

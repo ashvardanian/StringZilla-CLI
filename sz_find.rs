@@ -2057,15 +2057,8 @@ fn search_tree(
         }
 
         // The walker has no glob filter of its own, so `--glob` is applied here.
-        if let Some(globs) = globs {
-            let path_text = entry.path().to_string_lossy();
-            let name_text = entry.file_name().to_string_lossy();
-            let selected = globs
-                .iter()
-                .any(|pattern| pattern.matches(&path_text) || pattern.matches(&name_text));
-            if !selected {
-                continue;
-            }
+        if !glob_selects(globs, &entry) {
+            continue;
         }
 
         let source = match open_input(entry.path()) {
@@ -2208,18 +2201,10 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
 
     // Compile each `--glob` once, so a malformed one is reported here rather than
     // silently matching nothing on every file of the walk.
-    let globs = args.glob.as_ref().map(|globs| {
-        globs
-            .iter()
-            .filter_map(|glob| match glob::Pattern::new(glob) {
-                Ok(pattern) => Some(pattern),
-                Err(error) => {
-                    eprintln!("sz-find: warning: invalid glob '{}': {}", glob, error);
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-    });
+    let globs = args
+        .glob
+        .as_deref()
+        .map(|patterns| compile_globs(patterns, "sz-find"));
 
     let traversal = TraversalOptions {
         hidden: args.hidden,
