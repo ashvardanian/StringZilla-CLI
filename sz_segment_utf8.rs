@@ -374,7 +374,13 @@ fn write_record(
             output.write_all(&[config.terminator.as_byte()])
         }
         Render::Offsets => {
-            write!(output, "{}\t{}\t", start, end)?;
+            // Formatted into a stack buffer and handed over whole: a `write!` straight to the
+            // sink dispatches dynamically once per fragment, and a segment is a record.
+            let mut prefix = [0u8; 48];
+            let mut cursor = io::Cursor::new(&mut prefix[..]);
+            write!(cursor, "{start}\t{end}\t")?;
+            let written = cursor.position() as usize;
+            output.write_all(&prefix[..written])?;
             output.write_all(segment)?;
             output.write_all(&[config.terminator.as_byte()])
         }
@@ -383,7 +389,11 @@ fn write_record(
             output.write_all(path_json)?;
             output.write_all(br#","text":"#)?;
             json_text_field_to(output, segment)?;
-            write!(output, r#","start":{},"end":{}}}}}"#, start, end)?;
+            let mut tail = [0u8; 64];
+            let mut cursor = io::Cursor::new(&mut tail[..]);
+            write!(cursor, r#","start":{start},"end":{end}}}}}"#)?;
+            let written = cursor.position() as usize;
+            output.write_all(&tail[..written])?;
             output.write_all(b"\n")
         }
     }
@@ -513,11 +523,9 @@ fn segment_input(
         }
         Input::File(entry) => open_input(entry.path())?,
     };
-    let name = input.display_name();
-
     path_json.clear();
     if config.render == Render::Json {
-        json_text_field_to(path_json, name.as_bytes())?;
+        json_text_field_to(path_json, input.display_name().as_bytes())?;
     }
     let path_json = &path_json[..];
 

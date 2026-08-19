@@ -187,12 +187,20 @@ fn write_sorted(
     Ok(emitted)
 }
 
-/// Check whether `lines` are already in sorted order. Returns the 1-based index
-/// of the first line that breaks the order, or `None` if fully sorted.
-fn check_sorted(lines: &BytesCowsAuto<'_>, order: SortOrder) -> Option<usize> {
-    (1..lines.len())
-        .find(|&index| !order.holds(line_at(lines, index - 1), line_at(lines, index)))
-        .map(|index| index + 1)
+/// The 1-based number of the first line that breaks the order, or `None` if fully sorted.
+/// The number names the later line of the offending pair.
+///
+/// Streamed rather than indexed: the question only compares neighbours, so building a tape
+/// first would size peak memory to the input for an answer that needs two lines at a time.
+fn first_disorder(data: &[u8], newlines: Newlines, order: SortOrder) -> Option<usize> {
+    let mut previous: Option<&[u8]> = None;
+    for (index, line) in LineIter::new(data, newlines).enumerate() {
+        if previous.is_some_and(|kept| !order.holds(kept, line)) {
+            return Some(index + 1);
+        }
+        previous = Some(line);
+    }
+    None
 }
 
 // endregion: Sorting
@@ -313,12 +321,8 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     };
     // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
     let newlines = Newlines::from_utf8(args.utf8 || args.ignore_case);
-    let lines = collect_lines(data, newlines)
-        .map_err(|error| io::Error::other(format!("indexing lines: {:?}", error)))
-        .at(path)?;
-
     if args.is_sorted {
-        return Ok(match check_sorted(&lines, order) {
+        return Ok(match first_disorder(data, newlines, order) {
             None => Status::Success,
             Some(line_number) => {
                 if !args.quiet {
@@ -328,6 +332,10 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
             }
         });
     }
+
+    let lines = collect_lines(data, newlines)
+        .map_err(|error| io::Error::other(format!("indexing lines: {:?}", error)))
+        .at(path)?;
 
     let permutation = sorted_order(&lines, order)
         .map_err(|status| io::Error::other(format!("sorting: {:?}", status)))
@@ -456,69 +464,39 @@ mod tests {
 
     #[test]
     fn reports_first_unsorted_line() {
-        let sorted = lines_of(b"a\nb\nc\n");
+        let ascending = SortOrder {
+            ignore_case: false,
+            reverse: false,
+        };
+        assert_eq!(first_disorder(b"a\nb\nc\n", Newlines::Lf, ascending), None);
         assert_eq!(
-            check_sorted(
-                &sorted,
-                SortOrder {
-                    ignore_case: false,
-                    reverse: false
-                }
-            ),
-            None
-        );
-
-        let unsorted = lines_of(b"a\nc\nb\n");
-        assert_eq!(
-            check_sorted(
-                &unsorted,
-                SortOrder {
-                    ignore_case: false,
-                    reverse: false
-                }
-            ),
+            first_disorder(b"a\nc\nb\n", Newlines::Lf, ascending),
             Some(3)
         );
     }
 
     #[test]
     fn accepts_descending_order_in_check() {
-        let desc = lines_of(b"c\nb\na\n");
-        assert_eq!(
-            check_sorted(
-                &desc,
-                SortOrder {
-                    ignore_case: false,
-                    reverse: true
-                }
-            ),
-            None
-        );
+        let descending = SortOrder {
+            ignore_case: false,
+            reverse: true,
+        };
+        assert_eq!(first_disorder(b"c\nb\na\n", Newlines::Lf, descending), None);
     }
 
     #[test]
     fn checks_sorted_order_ignoring_case() {
         // "Apple" < "BANANA" < "cherry" under folding, regardless of input casing.
-        let folded = lines_of(b"Apple\nBANANA\ncherry\n");
+        let folding = SortOrder {
+            ignore_case: true,
+            reverse: false,
+        };
         assert_eq!(
-            check_sorted(
-                &folded,
-                SortOrder {
-                    ignore_case: true,
-                    reverse: false
-                }
-            ),
+            first_disorder(b"Apple\nBANANA\ncherry\n", Newlines::Lf, folding),
             None
         );
-        let not_folded = lines_of(b"BANANA\nApple\n");
         assert_eq!(
-            check_sorted(
-                &not_folded,
-                SortOrder {
-                    ignore_case: true,
-                    reverse: false
-                }
-            ),
+            first_disorder(b"BANANA\nApple\n", Newlines::Lf, folding),
             Some(2)
         );
     }

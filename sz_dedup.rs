@@ -55,12 +55,27 @@ impl LineEntry {
     fn is_empty(&self) -> bool {
         self.offset == u64::MAX
     }
+
+    /// The line this entry points at, back in the input it was taken from.
+    #[inline]
+    fn bytes_in<'a>(&self, data: &'a [u8]) -> &'a [u8] {
+        let start = self.offset as usize;
+        &data[start..start + self.length as usize]
+    }
 }
 
 impl Default for LineEntry {
     fn default() -> Self {
         Self::EMPTY
     }
+}
+
+/// Where a line sits in the table, or where it would go.
+enum Slot {
+    /// An equal line is already recorded.
+    Occupied,
+    /// The line is absent, and this empty slot is the one it takes.
+    Vacant(usize),
 }
 
 /// Open-addressed hash set with linear probing.
@@ -86,48 +101,66 @@ impl AppendOnlyFlatHashSet {
         self.slots.len() - 1
     }
 
-    /// Entries carrying the given hash, probing forward from its home slot until an
-    /// empty one. The load factor stays under 60%, so an empty slot always ends it.
+    /// The slots to consult for `hash`, from its home slot onward. The load factor stays
+    /// under 60%, so an empty slot always ends the walk before this runs out.
     #[inline]
-    fn find(&self, hash: u64) -> impl Iterator<Item = &LineEntry> {
+    fn probe(&self, hash: u64) -> impl Iterator<Item = usize> + '_ {
         let mask = self.mask();
         let home = (hash as usize) & mask;
-        (0..self.slots.len())
-            .map(move |step| &self.slots[(home + step) & mask])
-            .take_while(|entry| !entry.is_empty())
-            .filter(move |entry| entry.hash == hash)
+        (0..self.slots.len()).map(move |step| (home + step) & mask)
     }
 
-    /// Whether `line` was already recorded, comparing it against the bytes each
-    /// same-hash entry points at in `data`.
+    /// Where an equal line already sits, or the empty slot it would take — one walk of the
+    /// chain, which is what a `contains` then `insert` pair walks twice.
     #[inline]
-    fn contains(&self, hash: u64, line: &[u8], data: &[u8], ignore_case: bool) -> bool {
-        self.find(hash).any(|entry| {
-            let start = entry.offset as usize;
-            let existing = &data[start..start + entry.length as usize];
-            lines_equal(existing, line, ignore_case)
-        })
+    fn slot_for(&self, hash: u64, line: &[u8], data: &[u8], ignore_case: bool) -> Slot {
+        self.probe(hash)
+            .find_map(|slot| {
+                let entry = self.slots[slot];
+                if entry.is_empty() {
+                    Some(Slot::Vacant(slot))
+                } else if entry.hash == hash && lines_equal(entry.bytes_in(data), line, ignore_case)
+                {
+                    Some(Slot::Occupied)
+                } else {
+                    None
+                }
+            })
+            .expect("the load factor leaves an empty slot on every probe path")
     }
 
-    /// Insert a new entry. Grows the table if load factor > 60%.
+    /// Record `line` unless an equal one is already here, answering whether it was new.
     #[inline]
-    fn insert(&mut self, hash: u64, offset: u64, length: u64) {
-        // Grow if load factor > 60%
+    fn insert_if_absent(
+        &mut self,
+        hash: u64,
+        line: &[u8],
+        data: &[u8],
+        ignore_case: bool,
+        offset: u64,
+    ) -> bool {
         if self.populated_count * 100 > self.slots.len() * 60 {
             self.grow();
         }
-
-        self.insert_no_grow(hash, offset, length);
+        match self.slot_for(hash, line, data, ignore_case) {
+            Slot::Occupied => false,
+            Slot::Vacant(slot) => {
+                self.slots[slot] = LineEntry {
+                    hash,
+                    offset,
+                    length: line.len() as u64,
+                };
+                self.populated_count += 1;
+                true
+            }
+        }
     }
 
-    /// Insert without checking load factor (used during rehash)
-    #[inline]
     fn insert_no_grow(&mut self, hash: u64, offset: u64, length: u64) {
-        let mask = self.mask();
-        let mut slot = (hash as usize) & mask;
-        while !self.slots[slot].is_empty() {
-            slot = (slot + 1) & mask;
-        }
+        let slot = self
+            .probe(hash)
+            .find(|&slot| self.slots[slot].is_empty())
+            .expect("the load factor leaves an empty slot on every probe path");
         self.slots[slot] = LineEntry {
             hash,
             offset,
@@ -294,10 +327,7 @@ fn dedup_to_writer(
         let line_offset = offset_within(data, line);
         let hash = compute_hash(line, ignore_case, &mut scratch);
 
-        let is_duplicate = seen.contains(hash, line, data, ignore_case);
-
-        if !is_duplicate {
-            seen.insert(hash, line_offset as u64, line.len() as u64);
+        if seen.insert_if_absent(hash, line, data, ignore_case, line_offset as u64) {
             write_line(output, config, line, span, counts.unique)?;
             counts.unique += 1;
         }
@@ -478,31 +508,38 @@ mod tests {
 
     #[test]
     fn inserts_and_finds_entries_by_hash() {
-        let mut set = AppendOnlyFlatHashSet::new();
-        set.insert(123, 0, 10);
-        set.insert(456, 20, 5);
-        set.insert(123, 50, 8); // Same hash, different entry
+        let mut data = vec![b'a'; 10];
+        data.resize(50, b'.');
+        data.extend_from_slice(b"bbbbbbbb");
 
+        let mut set = AppendOnlyFlatHashSet::new();
+        assert!(set.insert_if_absent(123, &data[0..10], &data, false, 0));
+        assert!(set.insert_if_absent(456, &data[20..25], &data, false, 20));
+        // Same hash, different bytes: a collision keeps both.
+        assert!(set.insert_if_absent(123, &data[50..58], &data, false, 50));
         assert_eq!(set.populated_count, 3);
-        assert_eq!(set.find(123).count(), 2);
-        assert_eq!(set.find(456).count(), 1);
-        assert_eq!(set.find(789).count(), 0);
+
+        // An exact repeat of either is refused without adding a slot.
+        assert!(!set.insert_if_absent(123, &data[0..10], &data, false, 0));
+        assert!(!set.insert_if_absent(123, &data[50..58], &data, false, 50));
+        assert_eq!(set.populated_count, 3);
     }
 
     #[test]
     fn grows_and_rehashes_beyond_capacity() {
+        let data: &[u8] = b"";
         let mut set = AppendOnlyFlatHashSet::new();
-        // Insert more than 60% of initial capacity to trigger growth
-        for i in 1..=700 {
-            set.insert(i, i * 10, i);
+        for hash in 1..=700u64 {
+            assert!(set.insert_if_absent(hash, data, data, false, 0));
         }
         assert!(set.slots.len() > 1024);
         assert_eq!(set.populated_count, 700);
 
-        // Verify all entries are still findable
-        for i in 1..=700 {
-            assert_eq!(set.find(i).count(), 1);
+        // Every entry survives the rehash, which a second insert proves by being refused.
+        for hash in 1..=700u64 {
+            assert!(!set.insert_if_absent(hash, data, data, false, 0));
         }
+        assert_eq!(set.populated_count, 700);
     }
 
     #[test]

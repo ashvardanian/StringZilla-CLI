@@ -1008,7 +1008,7 @@ pub const DEFAULT_WINDOW_BYTES: usize = 256 << 10;
 /// and get one.
 pub struct Refill<R> {
     reader: R,
-    buffer: Box<[u8]>,
+    buffer: Vec<u8>,
     valid: usize,
     reached_eof: bool,
     /// Hashes the stream as it arrives, when a caller asked for a whole-input hash. Boxed
@@ -1023,7 +1023,7 @@ impl<R: Read> Refill<R> {
     pub fn new(reader: R, capacity: usize) -> Self {
         Refill {
             reader,
-            buffer: vec![0u8; capacity.max(1)].into_boxed_slice(),
+            buffer: vec![0u8; capacity.max(1)],
             valid: 0,
             reached_eof: false,
             hasher: None,
@@ -1102,9 +1102,7 @@ impl<R: Read> Refill<R> {
     pub fn grow(&mut self) -> io::Result<()> {
         debug_assert!(!self.reached_eof, "growing past end of input reads nothing");
         let capacity = self.buffer.len().saturating_mul(2);
-        let mut grown = vec![0u8; capacity].into_boxed_slice();
-        grown[..self.valid].copy_from_slice(&self.buffer[..self.valid]);
-        self.buffer = grown;
+        self.buffer.resize(capacity, 0);
         self.fill()
     }
 
@@ -2453,8 +2451,8 @@ mod tests {
         let globs = vec![glob::Pattern::new("*.txt").unwrap()];
 
         let by_name = vec![named.display().to_string()];
-        let taken: Vec<_> = inputs(&by_name, &traversal, Some(&globs), "sz-test").collect();
-        assert_eq!(taken.len(), 1, "a named file is not filtered by --glob");
+        let taken = inputs(&by_name, &traversal, Some(&globs), "sz-test").count();
+        assert_eq!(taken, 1, "a named file is not filtered by --glob");
 
         let by_walk = vec![directory.path().display().to_string()];
         let found: Vec<String> = inputs(&by_walk, &traversal, Some(&globs), "sz-test")
@@ -2523,14 +2521,10 @@ mod tests {
     fn walks_a_stream_in_windows_that_report_their_offsets() {
         // Every window cuts on a line, and the bases tile the input without a gap or an
         // overlap — which is what lets a caller report absolute positions without counting.
-        let data: Vec<u8> = (0..4000)
-            .flat_map(|n| format!("line {n}\n").into_bytes())
-            .collect();
+        let lines = || (0..4000).flat_map(|number| format!("line {number}\n").into_bytes());
+        let data: Vec<u8> = lines().collect();
         let mut windows = Windows(Walk::Stream {
-            refill: Refill::new(
-                Box::new(io::Cursor::new(data.clone())) as Box<dyn Read>,
-                1024,
-            ),
+            refill: Refill::new(Box::new(io::Cursor::new(data)) as Box<dyn Read>, 1024),
             base: 0,
         });
 
@@ -2542,7 +2536,10 @@ mod tests {
             seen.extend_from_slice(window);
             consumed = window.len();
         }
-        assert_eq!(seen, data);
+        assert!(
+            seen.into_iter().eq(lines()),
+            "the windows must reproduce the input"
+        );
     }
 
     #[test]
@@ -2551,13 +2548,10 @@ mod tests {
         // unconsumed tail has to reappear at the head of the next window, or a match
         // straddling the seam is lost.
         let data: Vec<u8> = (0..2000)
-            .flat_map(|n| format!("line {n}\n").into_bytes())
+            .flat_map(|number| format!("line {number}\n").into_bytes())
             .collect();
         let mut windows = Windows(Walk::Stream {
-            refill: Refill::new(
-                Box::new(io::Cursor::new(data.clone())) as Box<dyn Read>,
-                512,
-            ),
+            refill: Refill::new(Box::new(io::Cursor::new(data)) as Box<dyn Read>, 512),
             base: 0,
         });
 
