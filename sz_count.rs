@@ -684,22 +684,48 @@ fn column_widths<'a>(
 
 /// What a row prints: relative to the tree's root where there is one, whole otherwise.
 fn displayed<'a>(row: &'a Row, root: Option<&str>) -> &'a Path {
-    root.and_then(|root| row.path.strip_prefix(root.trim_end_matches('/')).ok())
+    root.and_then(|root| row.path.strip_prefix(root).ok())
         .unwrap_or(&row.path)
 }
 
-/// Width of the name column: the widest name any row prints, its tree glyphs included and
-/// [`NAME_WIDTH`] the bound past which [`truncate_path`] takes over. Padding every table to
-/// that bound instead strands one short name a screen away from its own counts.
-fn name_width<'a>(names: impl Iterator<Item = (&'a Path, usize)>) -> usize {
+/// The name a row prints. A root closes with the separator its children hang off.
+#[derive(Clone, Copy)]
+enum RowName<'a> {
+    Leaf(&'a Path),
+    Root(&'a Path),
+}
+
+impl<'a> RowName<'a> {
+    /// The path itself, whichever kind of row it names.
+    fn path(self) -> &'a Path {
+        match self {
+            RowName::Leaf(path) | RowName::Root(path) => path,
+        }
+    }
+
+    /// What follows the name inside the name column.
+    fn trailer(self) -> &'static str {
+        match self {
+            RowName::Leaf(_) => "",
+            RowName::Root(_) => "/",
+        }
+    }
+}
+
+/// Width of the name column: the widest name any row prints, its tree glyphs and trailer
+/// included and [`NAME_WIDTH`] the bound past which [`truncate_path`] takes over. Padding
+/// every table to that bound instead strands one short name a screen away from its counts.
+fn name_width<'a>(names: impl Iterator<Item = (RowName<'a>, usize)>) -> usize {
     names
-        .map(|(name, prefix)| {
-            prefix
+        .map(|(name, glyphs)| {
+            let reserved = glyphs + name.trailer().chars().count();
+            reserved
                 + name
+                    .path()
                     .to_string_lossy()
                     .chars()
                     .count()
-                    .min(NAME_WIDTH - prefix)
+                    .min(NAME_WIDTH - reserved)
         })
         .max()
         .unwrap_or(0)
@@ -721,26 +747,34 @@ fn print_header(
     output.write_all(b"\n")
 }
 
-/// Write one row of measurements against a left-aligned name, itself prefixed by
-/// any tree glyphs. Writing the two parts separately keeps the row allocation-free.
+/// Write one row of measurements against a left-aligned name, itself prefixed by any tree
+/// glyphs and closed by whatever its kind trails. Writing the parts separately keeps the
+/// row allocation-free.
 fn print_row(
     output: &mut dyn Write,
     prefix: &str,
-    name: &Path,
+    name: RowName,
     counts: &Counts,
     config: &OutputConfig,
     widths: &TableWidths,
 ) -> io::Result<()> {
+    let trailer = name.trailer();
     let prefix_width = prefix.chars().count();
-    let name = name.to_string_lossy();
-    let (elision, name) = truncate_path(&name, NAME_WIDTH.saturating_sub(prefix_width));
+    let whole = name.path().to_string_lossy();
+    let (elision, trimmed) = truncate_path(
+        &whole,
+        NAME_WIDTH.saturating_sub(prefix_width + trailer.chars().count()),
+    );
     output.write_all(prefix.as_bytes())?;
     output.write_all(elision.as_bytes())?;
+    output.write_all(trimmed.as_bytes())?;
     write!(
         output,
         "{:width$}",
-        name,
-        width = widths.name.saturating_sub(prefix_width + elision.len())
+        trailer,
+        width = widths
+            .name
+            .saturating_sub(prefix_width + elision.len() + trimmed.chars().count())
     )?;
     let mut buffer = [0u8; 26];
     for ((_, value), width) in counts.columns(config.fields).zip(&widths.columns) {
@@ -826,18 +860,59 @@ struct Row {
     counts: Counts,
 }
 
+/// The rows a run keeps, which a run that renders nothing only has to count.
+enum Rows {
+    Kept(Vec<Row>),
+    Counted(usize),
+}
+
+impl Rows {
+    /// What a run of these arguments has room for: a quiet run consults nothing but whether
+    /// anything was counted, so it keeps nothing.
+    fn for_run(args: &Args) -> Self {
+        if args.quiet {
+            Rows::Counted(0)
+        } else {
+            Rows::Kept(Vec::new())
+        }
+    }
+
+    /// How many inputs were counted, kept or not.
+    fn len(&self) -> usize {
+        match self {
+            Rows::Kept(rows) => rows.len(),
+            Rows::Counted(counted) => *counted,
+        }
+    }
+
+    /// Whether anything was counted at all.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The rows there are to render, which is none where they were not kept.
+    fn kept(&self) -> &[Row] {
+        match self {
+            Rows::Kept(rows) => rows,
+            Rows::Counted(_) => &[],
+        }
+    }
+}
+
 /// Everything one run has to print.
-struct Report {
-    rows: Vec<Row>,
+struct Report<'a> {
+    rows: Rows,
     total: Counts,
-    /// The directory the rows hang off, when a lone directory was named.
-    root: Option<String>,
+    /// The directory the rows hang off, when a lone directory was named. Borrowed from the
+    /// names the run was given, and without the separator the tree view prints after it.
+    root: Option<&'a str>,
 }
 
 /// Write the whole report.
 fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io::Result<()> {
+    let rows = report.rows.kept();
     if config.format == Format::Json {
-        for row in &report.rows {
+        for row in rows {
             write_counts_json(
                 output,
                 &row.path.to_string_lossy(),
@@ -845,27 +920,27 @@ fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io:
                 config.fields,
             )?;
         }
-        if report.rows.len() > 1 || report.root.is_some() {
-            write_total_json(output, report.rows.len(), &report.total, config.fields)?;
+        if rows.len() > 1 || report.root.is_some() {
+            write_total_json(output, rows.len(), &report.total, config.fields)?;
         }
         return Ok(());
     }
 
-    if let ([row], None) = (report.rows.as_slice(), &report.root) {
+    if let ([row], None) = (rows, &report.root) {
         let mut columns = row.counts.columns(config.fields);
         if let (Some((_, value)), None) = (columns.next(), columns.next()) {
             // Exactly one selector and exactly one input: a bare integer, for `n=$(...)`.
             return writeln!(output, "{}", value);
         }
         let widths = TableWidths {
-            name: name_width(std::iter::once((displayed(row, None), 0))),
+            name: name_width(std::iter::once((RowName::Leaf(displayed(row, None)), 0))),
             columns: column_widths(std::iter::once(&row.counts), config),
         };
         print_header(output, config, &widths)?;
         return print_row(
             output,
             "",
-            displayed(row, None),
+            RowName::Leaf(displayed(row, None)),
             &row.counts,
             config,
             &widths,
@@ -882,37 +957,31 @@ fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io:
             report
                 .root
                 .iter()
-                .map(|root| (Path::new(root.as_str()), 0))
+                .map(|root| (RowName::Root(Path::new(*root)), 0))
                 .chain(
-                    report
-                        .rows
-                        .iter()
-                        .map(|row| (displayed(row, report.root.as_deref()), prefix)),
+                    rows.iter()
+                        .map(|row| (RowName::Leaf(displayed(row, report.root)), prefix)),
                 ),
         ),
         columns: column_widths(
-            report
-                .rows
-                .iter()
-                .map(|row| &row.counts)
-                .chain([&report.total]),
+            rows.iter().map(|row| &row.counts).chain([&report.total]),
             config,
         ),
     };
 
     print_header(output, config, &widths)?;
-    if let Some(root) = &report.root {
+    if let Some(root) = report.root {
         print_row(
             output,
             "",
-            Path::new(root.as_str()),
+            RowName::Root(Path::new(root)),
             &report.total,
             config,
             &widths,
         )?;
     }
-    for (index, row) in report.rows.iter().enumerate() {
-        let branch = match (&report.root, index + 1 == report.rows.len()) {
+    for (index, row) in rows.iter().enumerate() {
+        let branch = match (report.root, index + 1 == rows.len()) {
             (None, _) => "",
             (Some(_), true) => "└─ ",
             (Some(_), false) => "├─ ",
@@ -920,7 +989,7 @@ fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io:
         print_row(
             output,
             branch,
-            displayed(row, report.root.as_deref()),
+            RowName::Leaf(displayed(row, report.root)),
             &row.counts,
             config,
             &widths,
@@ -939,10 +1008,13 @@ fn push_row(report: &mut Report, counter: Counter, input: &Input, tally: &mut Ta
     match counter.count(input) {
         Ok(counts) => {
             report.total.add(&counts);
-            report.rows.push(Row {
-                path: input.path().to_path_buf(),
-                counts,
-            });
+            match &mut report.rows {
+                Rows::Kept(rows) => rows.push(Row {
+                    path: input.path().to_path_buf(),
+                    counts,
+                }),
+                Rows::Counted(counted) => *counted += 1,
+            }
         }
         Err(error) => {
             eprintln!("sz-count: {}: {}", input.display_name(), error);
@@ -951,23 +1023,21 @@ fn push_row(report: &mut Report, counter: Counter, input: &Input, tally: &mut Ta
     }
 }
 
-/// Count every input, in the order they were named.
-fn gather(
-    names: &[String],
+/// Count every input, in the order they were named, keeping the rows `rows` has room for.
+fn gather<'a>(
+    names: &'a [String],
     globs: Option<&[glob::Pattern]>,
     traversal: &TraversalOptions<'_>,
     counter: Counter,
+    rows: Rows,
     tally: &mut Tally,
-) -> Report {
+) -> Report<'a> {
     let mut report = Report {
-        rows: Vec::new(),
+        rows,
         total: Counts::default(),
         // A lone directory gets the tree view, with per-file rows hanging off its name.
         root: match names {
-            [only] if Path::new(only).is_dir() => Some(match only.strip_suffix('/') {
-                Some(trimmed) => format!("{}/", trimmed),
-                None => format!("{}/", only),
-            }),
+            [only] if Path::new(only).is_dir() => Some(only.strip_suffix('/').unwrap_or(only)),
             _ => None,
         },
     };
@@ -1013,6 +1083,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         globs.as_deref(),
         &traversal,
         counter,
+        Rows::for_run(args),
         &mut tally,
     );
     if !counted.rows.is_empty() {
@@ -1382,6 +1453,7 @@ mod tests {
                 None,
                 &TraversalOptions::default(),
                 Counter::new(Mode::Ascii, fields),
+                Rows::for_run(&args),
                 &mut tally,
             );
             if !report.rows.is_empty() {
@@ -1530,21 +1602,42 @@ mod tests {
     #[test]
     fn sizes_the_name_column_to_the_names() {
         // Short names sit beside their counts rather than a column away from them.
-        assert_eq!(name_width(std::iter::once((Path::new("tiny.txt"), 0))), 8);
+        assert_eq!(
+            name_width(std::iter::once((RowName::Leaf(Path::new("tiny.txt")), 0))),
+            8
+        );
         // A tree entry's branch glyphs count toward the width its row occupies.
         assert_eq!(
-            name_width(std::iter::once((Path::new("tiny.txt"), TREE_GLYPH_WIDTH))),
+            name_width(std::iter::once((
+                RowName::Leaf(Path::new("tiny.txt")),
+                TREE_GLYPH_WIDTH
+            ))),
             11
+        );
+        // And a root's trailing separator does the same.
+        assert_eq!(
+            name_width(std::iter::once((RowName::Root(Path::new("tiny.txt")), 0))),
+            9
         );
         // The widest row sets the column, and truncation bounds it at `NAME_WIDTH`.
         let names = [
-            (Path::new("trex.txt"), 0),
-            (Path::new("nested/directory/dodo.txt"), 0),
+            (RowName::Leaf(Path::new("trex.txt")), 0),
+            (RowName::Leaf(Path::new("nested/directory/dodo.txt")), 0),
         ];
         assert_eq!(name_width(names.into_iter()), 25);
         let long = "é".repeat(60);
         assert_eq!(
-            name_width(std::iter::once((Path::new(long.as_str()), 0))),
+            name_width(std::iter::once((
+                RowName::Leaf(Path::new(long.as_str())),
+                0
+            ))),
+            NAME_WIDTH
+        );
+        assert_eq!(
+            name_width(std::iter::once((
+                RowName::Root(Path::new(long.as_str())),
+                0
+            ))),
             NAME_WIDTH
         );
         // Empty input renders a header alone, so the column collapses rather than pads.

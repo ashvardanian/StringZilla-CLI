@@ -60,6 +60,17 @@ enum Occurrences {
     One,
 }
 
+impl Occurrences {
+    /// How many candidates the scan has to keep. The scan runs to the end regardless, for
+    /// the terminator.
+    fn candidates(self) -> usize {
+        match self {
+            Occurrences::First => 1,
+            Occurrences::All | Occurrences::One => usize::MAX,
+        }
+    }
+}
+
 /// Replace substrings in files
 #[derive(Parser)]
 #[command(name = "sz-replace")]
@@ -246,10 +257,19 @@ impl<'a> Literal<'a> {
         let (folded, longest_match) = match casing {
             Casing::Cased => (None, pattern.len()),
             Casing::Uncased => {
-                // Folding expands by at most three, which is the bound `sz-dedup` sizes its
-                // own scratch by.
-                let mut scratch = vec![0u8; pattern.len().saturating_mul(3).max(64)];
-                let folded_len = utf8_uncased_fold(pattern, &mut scratch[..]);
+                // Folding expands by at most three, and only the folded length escapes, so
+                // a pattern short enough to fold on the stack never reaches the heap.
+                let needed = pattern.len().saturating_mul(3).max(64);
+                let mut stack = [0u8; 256];
+                let mut heap;
+                let scratch = match stack.get_mut(..needed) {
+                    Some(scratch) => scratch,
+                    None => {
+                        heap = vec![0u8; needed];
+                        &mut heap[..]
+                    }
+                };
+                let folded_len = utf8_uncased_fold(pattern, scratch);
                 (
                     Some(Utf8UncasedNeedle::new(pattern)),
                     folded_len.saturating_mul(4),
@@ -345,32 +365,87 @@ fn replace_to(
     Ok(count)
 }
 
-/// One replacement of a byte range, resolved against the input before anything is written.
-///
-/// An insertion is a zero-width span. Splices come out of resolution already in order and
-/// disjoint, which is the shape a batch of edits would need too.
-struct Splice {
-    start: usize,
-    end: usize,
-    text: Vec<u8>,
-}
-
 /// What a run writes, however its target was addressed.
 enum Edit<'a> {
-    /// Every match of a literal pattern, up to the limit.
+    /// Every match of a literal pattern, up to the limit, over a source read whole or
+    /// through a window.
     Substring {
+        source: InputWindow,
         literal: Literal<'a>,
         replacement: &'a [u8],
         limit: usize,
     },
-    /// Named lines, already resolved.
-    Lines(Vec<Splice>),
+    /// The lines a name resolved to, written where the placement puts them.
+    Lines(LineEdit<'a>),
+}
+
+/// The lines a name resolved to, rendered where they are written. Their spans come out in
+/// order and disjoint under every placement, so one pass over `data` serves.
+///
+/// `prevailing` is the terminator an unterminated last line borrows: the file's last, or a
+/// newline where the file holds none at all.
+struct LineEdit<'a> {
+    data: &'a [u8],
+    lines: Vec<NamedLine<'a>>,
+    placement: Placement,
+    replacement: &'a str,
+    prevailing: &'a [u8],
+}
+
+impl LineEdit<'_> {
+    /// The span `line` gives up to the replacement: the line itself under `Over`, the empty
+    /// span an insertion opens otherwise.
+    fn span(&self, line: &NamedLine) -> (usize, usize) {
+        match self.placement {
+            Placement::Over => (line.offset, line.end()),
+            // Past the line's terminator, so the new line follows it whole.
+            Placement::After => (line.end(), line.end()),
+            Placement::Before => (line.offset, line.offset),
+        }
+    }
+
+    /// Write the replacement standing in for `line`, ended the way `line` was.
+    ///
+    /// A rewrite ends the way the line it replaces ended, so the last line of a file without
+    /// a final newline still has none afterwards. An insertion needs a terminator of its own
+    /// to stand as a line, and borrows one when its anchor has none to lend.
+    fn write_line(&self, out: &mut dyn Write, line: &NamedLine) -> io::Result<()> {
+        let borrowed = match line.terminator() {
+            [] => self.prevailing,
+            terminator => terminator,
+        };
+        match (self.placement, line.terminator()) {
+            // The breaks *inside* the text are rendered with the terminator the file uses;
+            // only the trailing one follows the line being replaced, which the last line of
+            // a file may not have.
+            (Placement::Over, []) => joined_to(out, self.replacement, borrowed),
+            // The anchor is the file's last line and carries no terminator, so one goes in
+            // first to end it, and the new text carries none — which leaves the file ending
+            // as it did.
+            (Placement::After, []) => {
+                out.write_all(borrowed)?;
+                joined_to(out, self.replacement, borrowed)
+            }
+            _ => as_line_to(out, self.replacement, borrowed),
+        }
+    }
+
+    fn emit(&self, out: &mut dyn Write) -> io::Result<(usize, usize)> {
+        let mut cursor = 0;
+        for line in &self.lines {
+            let (start, end) = self.span(line);
+            out.write_all(&self.data[cursor..start])?;
+            self.write_line(out, line)?;
+            cursor = end;
+        }
+        out.write_all(&self.data[cursor..])?;
+        Ok((self.lines.len(), self.data.len()))
+    }
 }
 
 /// Everything the replacement needs that does not depend on where it is written, so the
 /// destinations cannot disagree about what they are producing or whether it is hashed.
 struct Substitution<'a> {
-    source: InputWindow,
     edit: Edit<'a>,
     /// Whether the produced bytes are hashed on their way out. A run that reports no hash
     /// pays for none, which is what keeps the plain pipe as fast as it was.
@@ -484,37 +559,34 @@ impl Substitution<'_> {
     }
 
     fn emit(&mut self, destination: &mut dyn Write) -> io::Result<(usize, usize)> {
-        // One pass, since the splices are already ordered and disjoint.
-        if let (InputWindow::Whole(held), Edit::Lines(splices)) = (&self.source, &self.edit) {
-            let data = held.as_bytes();
-            let mut cursor = 0;
-            for splice in splices {
-                destination.write_all(&data[cursor..splice.start])?;
-                destination.write_all(&splice.text)?;
-                cursor = splice.end;
-            }
-            destination.write_all(&data[cursor..])?;
-            return Ok((splices.len(), data.len()));
+        match &mut self.edit {
+            Edit::Lines(edit) => edit.emit(destination),
+            Edit::Substring {
+                source,
+                literal,
+                replacement,
+                limit,
+            } => match source {
+                InputWindow::Whole(held) => {
+                    let data = held.as_bytes();
+                    let count = replace_to(data, literal, replacement, *limit, destination)?;
+                    Ok((count, data.len()))
+                }
+                InputWindow::Stream(refill) => {
+                    replace_stream(refill, literal, replacement, *limit, destination)
+                }
+            },
         }
-        // A name is resolved against every candidate before anything is written, so a run
-        // that addresses lines never reaches here without the whole input.
-        let Edit::Substring {
-            literal,
-            replacement,
-            limit,
-        } = &self.edit
-        else {
-            unreachable!("line addressing holds the whole input")
-        };
-        match &mut self.source {
-            InputWindow::Whole(held) => {
-                let data = held.as_bytes();
-                let count = replace_to(data, literal, replacement, *limit, destination)?;
-                Ok((count, data.len()))
-            }
-            InputWindow::Stream(refill) => {
-                replace_stream(refill, literal, replacement, *limit, destination)
-            }
+    }
+
+    /// What a streamed input hashed to, accumulated while it was read.
+    fn stream_digest(&self) -> Option<u64> {
+        match &self.edit {
+            Edit::Substring {
+                source: InputWindow::Stream(refill),
+                ..
+            } => refill.digest(),
+            _ => None,
         }
     }
 }
@@ -526,22 +598,20 @@ impl Substitution<'_> {
 /// empty line behind, and ordinary text is terminated the way its neighbours are — including
 /// in a CRLF file, where writing the caller's bytes verbatim would leave the one line ending
 /// in a bare LF.
-fn as_line(text: &str, terminator: &[u8]) -> Vec<u8> {
+fn as_line_to(out: &mut dyn Write, text: &str, terminator: &[u8]) -> io::Result<()> {
     if text.is_empty() {
-        return Vec::new();
+        return Ok(());
     }
-    let mut written = joined(text, terminator);
-    written.extend_from_slice(terminator);
-    written
+    joined_to(out, text, terminator)?;
+    out.write_all(terminator)
 }
 
 /// `text` with its own line breaks rendered as `terminator`, and none added at the end.
 ///
-/// Separate from [`as_line`] because the two are different questions: an insertion after a
+/// Separate from [`as_line_to`] because the two are different questions: an insertion after a
 /// file's last unterminated line wants the breaks *inside* the text and none after it, and
-/// asking `as_line` for that by passing an empty terminator would erase them instead.
-fn joined(text: &str, terminator: &[u8]) -> Vec<u8> {
-    let mut written = Vec::with_capacity(text.len() + terminator.len());
+/// asking `as_line_to` for that by passing an empty terminator would erase them instead.
+fn joined_to(out: &mut dyn Write, text: &str, terminator: &[u8]) -> io::Result<()> {
     for (index, piece) in text
         .strip_suffix('\n')
         .unwrap_or(text)
@@ -549,18 +619,18 @@ fn joined(text: &str, terminator: &[u8]) -> Vec<u8> {
         .enumerate()
     {
         if index > 0 {
-            written.extend_from_slice(terminator);
+            out.write_all(terminator)?;
         }
-        written.extend_from_slice(piece.strip_suffix('\r').unwrap_or(piece).as_bytes());
+        out.write_all(piece.strip_suffix('\r').unwrap_or(piece).as_bytes())?;
     }
-    written
+    Ok(())
 }
 
-/// Resolve a line name into the splices that carry out the edit.
+/// Resolve a line name into the edit that carries it out.
 ///
 /// Every candidate is found before anything is written, so a name too short to be unique can
 /// only ever cause a refused edit, never an edit to the wrong line.
-fn resolve_lines(args: &Args, data: &[u8], path: &str) -> Result<Vec<Splice>, Failure> {
+fn resolve_lines<'a>(args: &'a Args, data: &'a [u8], path: &str) -> Result<Edit<'a>, Failure> {
     let newlines = Newlines::from_utf8(args.utf8);
     let name = parse_hash_prefix(&args.pattern).expect("validated");
     let placement = match (args.after, args.before) {
@@ -569,6 +639,7 @@ fn resolve_lines(args: &Args, data: &[u8], path: &str) -> Result<Vec<Splice>, Fa
         _ => Placement::Over,
     };
 
+    let keep = args.occurrences.candidates();
     // Only a file's final line can lack a terminator, so the one it borrows is the file's
     // last — carried out of the pass that finds the candidates rather than costing a second.
     let mut prevailing: &[u8] = b"\n";
@@ -577,7 +648,7 @@ fn resolve_lines(args: &Args, data: &[u8], path: &str) -> Result<Vec<Splice>, Fa
         if !line.terminator().is_empty() {
             prevailing = line.terminator();
         }
-        if name.matches(line.hash()) {
+        if matched.len() < keep && name.matches(line.hash()) {
             matched.push(line);
         }
     }
@@ -595,83 +666,34 @@ fn resolve_lines(args: &Args, data: &[u8], path: &str) -> Result<Vec<Splice>, Fa
         });
     }
 
-    let limit = match args.occurrences {
-        Occurrences::All => usize::MAX,
-        Occurrences::First => 1,
-        Occurrences::One if matched.len() == 1 => 1,
-        Occurrences::One => {
-            // Widening only helps when distinct lines happen to share a prefix. Lines that
-            // are byte-identical hash identically at every width, so sending the caller to
-            // `--hash-width` there is advice that cannot work.
-            let identical = matched
-                .windows(2)
-                .all(|pair| pair[0].body() == pair[1].body());
-            return Err(Failure::Ambiguous {
-                path: path.to_string(),
-                subject: args.pattern.clone(),
-                matches: matched.len(),
-                note: if identical {
-                    "these lines are byte-identical, so no width separates them; \
-                     name a neighbouring line, or make the lines differ"
-                } else {
-                    "ask sz-find for a longer name with --hash-width, \
-                     or name a neighbouring line"
-                },
-            });
-        }
-    };
-
-    Ok(matched
-        .into_iter()
-        .take(limit)
-        .map(|line| {
-            // A rewrite ends the way the line it replaces ended, so the last line of a file
-            // without a final newline still has none afterwards. An insertion needs a
-            // terminator of its own to stand as a line, and borrows one when the line it is
-            // anchored to has none to lend.
-            let borrowed = if line.terminator().is_empty() {
-                prevailing
+    if args.occurrences == Occurrences::One && matched.len() > 1 {
+        // Widening only helps when distinct lines happen to share a prefix. Lines that are
+        // byte-identical hash identically at every width, so sending the caller to
+        // `--hash-width` there is advice that cannot work.
+        let identical = matched
+            .windows(2)
+            .all(|pair| pair[0].body() == pair[1].body());
+        return Err(Failure::Ambiguous {
+            path: path.to_string(),
+            subject: args.pattern.clone(),
+            matches: matched.len(),
+            note: if identical {
+                "these lines are byte-identical, so no width separates them; \
+                 name a neighbouring line, or make the lines differ"
             } else {
-                line.terminator()
-            };
-            match placement {
-                // The breaks *inside* the text are rendered with the terminator the file
-                // uses; only the trailing one follows the line being replaced, which the
-                // last line of a file may not have.
-                Placement::Over => Splice {
-                    start: line.offset,
-                    end: line.end(),
-                    text: if line.terminator().is_empty() {
-                        joined(&args.replacement, borrowed)
-                    } else {
-                        as_line(&args.replacement, line.terminator())
-                    },
-                },
-                // Past the line's terminator, so the new line follows it whole. A line that
-                // has none is the file's last, and then the terminator goes in front of the
-                // text instead of behind it, so the file still ends without one.
-                Placement::After => Splice {
-                    start: line.end(),
-                    end: line.end(),
-                    text: if line.terminator().is_empty() {
-                        // The anchor is the file's last line and carries no terminator, so
-                        // one goes in first to end it, and the new text carries none — which
-                        // leaves the file ending as it did.
-                        let mut written = borrowed.to_vec();
-                        written.extend_from_slice(&joined(&args.replacement, borrowed));
-                        written
-                    } else {
-                        as_line(&args.replacement, borrowed)
-                    },
-                },
-                Placement::Before => Splice {
-                    start: line.offset,
-                    end: line.offset,
-                    text: as_line(&args.replacement, borrowed),
-                },
-            }
-        })
-        .collect())
+                "ask sz-find for a longer name with --hash-width, \
+                 or name a neighbouring line"
+            },
+        });
+    }
+
+    Ok(Edit::Lines(LineEdit {
+        data,
+        lines: matched,
+        placement,
+        replacement: &args.replacement,
+        prevailing,
+    }))
 }
 
 /// The summary of a finished run, in whichever shape was asked for.
@@ -794,11 +816,10 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
 
     let literal = Literal::new(pattern, Casing::from_ignore_case(args.ignore_case));
     let edit = match whole {
-        Some(data) if args.match_kind == Match::LineHash => {
-            Edit::Lines(resolve_lines(args, data, path)?)
-        }
+        Some(data) if args.match_kind == Match::LineHash => resolve_lines(args, data, path)?,
         Some(data) => Edit::Substring {
             limit: substring_limit(args, &literal, data, path)?,
+            source,
             literal,
             replacement,
         },
@@ -812,6 +833,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
                 "a run that needs the whole input was handed a window"
             );
             Edit::Substring {
+                source,
                 literal,
                 replacement,
                 limit: match args.occurrences {
@@ -823,7 +845,6 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     };
 
     let mut substitution = Substitution {
-        source,
         edit,
         hashed: reports_hashes,
     };
@@ -842,10 +863,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         destination.write("sz-replace", output, |output| substitution.write_to(output))?;
 
     // A mapped run hashed its input up front; a streamed one accumulated it while reading.
-    let hash_before = mapped_hash.or_else(|| match &substitution.source {
-        InputWindow::Stream(refill) => refill.digest(),
-        InputWindow::Whole(_) => None,
-    });
+    let hash_before = mapped_hash.or_else(|| substitution.stream_digest());
     let summary = Summary {
         path,
         replacements: produced.replacements,
