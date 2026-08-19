@@ -16,7 +16,7 @@
 use std::io::{self, Read, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringzilla::sz::{find, utf8_uncased_fold, utf8_uncased_search};
+use stringzilla::sz::{find, utf8_uncased_fold, utf8_uncased_search, Utf8UncasedNeedle};
 
 use shared::*;
 
@@ -209,32 +209,103 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     Ok(())
 }
 
-/// The next match in `rest`, as an offset and the length the match occupies — which case
-/// folding can make differ from the pattern's own length (ß ↔ ss, İ ↔ i).
+/// Whether a pattern is matched byte-for-byte or under full Unicode case folding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Casing {
+    Cased,
+    Uncased,
+}
+
+impl Casing {
+    /// The casing `--ignore-case` selects.
+    fn from_ignore_case(ignore_case: bool) -> Self {
+        if ignore_case {
+            Casing::Uncased
+        } else {
+            Casing::Cased
+        }
+    }
+}
+
+/// The pattern in the form its search kernel wants, analyzed once rather than per call.
 ///
-/// Case-insensitive matching uses StringZilla's full-Unicode `utf8_uncased_search`, with no
-/// whole-file `to_ascii_lowercase` copy.
-#[inline]
-fn next_match(rest: &[u8], pattern: &[u8], ignore_case: bool) -> Option<(usize, usize)> {
-    if ignore_case {
-        utf8_uncased_search(rest, pattern)
-    } else {
-        find(rest, pattern).map(|offset| (offset, pattern.len()))
+/// Under folding a match is not the pattern's length: the kernel compares folded text, so
+/// "strasse" matches "Straße" and the span covers the source bytes, not the pattern's.
+struct Literal<'a> {
+    pattern: &'a [u8],
+    /// The analysis every search shares, present only under [`Casing::Uncased`]. Held here
+    /// rather than rebuilt per call: the kernel fills it on first search and caches it in
+    /// place, so handing the raw pattern over instead re-analyzes it on every match.
+    folded: Option<Utf8UncasedNeedle<'a>>,
+    longest_match: usize,
+}
+
+impl<'a> Literal<'a> {
+    /// Analyze `pattern` once.
+    fn new(pattern: &'a [u8], casing: Casing) -> Self {
+        let (folded, longest_match) = match casing {
+            Casing::Cased => (None, pattern.len()),
+            Casing::Uncased => {
+                // Folding expands by at most three, which is the bound `sz-dedup` sizes its
+                // own scratch by.
+                let mut scratch = vec![0u8; pattern.len().saturating_mul(3).max(64)];
+                let folded_len = utf8_uncased_fold(pattern, &mut scratch[..]);
+                (
+                    Some(Utf8UncasedNeedle::new(pattern)),
+                    folded_len.saturating_mul(4),
+                )
+            }
+        };
+        Literal {
+            pattern,
+            folded,
+            longest_match,
+        }
+    }
+
+    /// The next match at or after the start of `rest`, as an offset and the length the match
+    /// occupies — which case folding can make differ from the pattern's own length.
+    #[inline]
+    fn find_in(&self, rest: &[u8]) -> Option<(usize, usize)> {
+        match &self.folded {
+            Some(folded) => utf8_uncased_search(rest, folded),
+            None => find(rest, self.pattern).map(|offset| (offset, self.pattern.len())),
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.pattern.is_empty()
+    }
+
+    /// The most bytes one match can occupy, which is how far a window has to see past what
+    /// it emits.
+    ///
+    /// Folding makes this larger than the pattern — `ss` matches `ẞ`, three bytes — but not
+    /// unboundedly so. A matching span folds to exactly what the pattern folds to, every
+    /// character occupies at most four UTF-8 bytes, and every character folds to at least
+    /// one: so no match can run past four times the folded length.
+    #[inline]
+    fn longest_match(&self) -> usize {
+        self.longest_match
     }
 }
 
 /// How many times `pattern` occurs, counting the same leftmost, non-overlapping matches
 /// [`replace_to`] would rewrite. Its own pass, because `--occurrences one` has to settle
 /// whether the target is unique before any destination is opened.
-fn count_matches(data: &[u8], pattern: &[u8], ignore_case: bool) -> usize {
-    if pattern.is_empty() {
+fn count_matches(data: &[u8], literal: &Literal, cap: usize) -> usize {
+    if literal.is_empty() {
         return 0;
     }
     let mut rest = data;
     let mut count = 0;
-    while let Some((offset, matched_len)) = next_match(rest, pattern, ignore_case) {
+    while count < cap {
+        let Some((offset, matched)) = literal.find_in(rest) else {
+            break;
+        };
         count += 1;
-        rest = &rest[offset + matched_len..];
+        rest = &rest[offset + matched..];
     }
     count
 }
@@ -247,15 +318,14 @@ fn count_matches(data: &[u8], pattern: &[u8], ignore_case: bool) -> usize {
 /// cursor in step.
 fn replace_to(
     data: &[u8],
-    pattern: &[u8],
+    literal: &Literal,
     replacement: &[u8],
-    ignore_case: bool,
     limit: usize,
     out: &mut dyn Write,
 ) -> io::Result<usize> {
     // An empty pattern matches at every position without consuming anything, so it
     // has no replacement to make.
-    if pattern.is_empty() || limit == 0 {
+    if literal.is_empty() || limit == 0 {
         out.write_all(data)?;
         return Ok(0);
     }
@@ -263,13 +333,13 @@ fn replace_to(
     let mut rest = data;
     let mut count = 0;
     while count < limit {
-        let Some((offset, matched_len)) = next_match(rest, pattern, ignore_case) else {
+        let Some((offset, matched)) = literal.find_in(rest) else {
             break;
         };
         out.write_all(&rest[..offset])?;
         out.write_all(replacement)?;
         count += 1;
-        rest = &rest[offset + matched_len..];
+        rest = &rest[offset + matched..];
     }
     out.write_all(rest)?;
     Ok(count)
@@ -289,9 +359,8 @@ struct Splice {
 enum Edit<'a> {
     /// Every match of a literal pattern, up to the limit.
     Substring {
-        pattern: &'a [u8],
+        literal: Literal<'a>,
         replacement: &'a [u8],
-        ignore_case: bool,
         limit: usize,
     },
     /// Named lines, already resolved.
@@ -308,22 +377,6 @@ struct Substitution<'a> {
     hashed: bool,
 }
 
-/// The most bytes one match can occupy, which is how far a window has to see past what it
-/// emits.
-///
-/// Folding makes this larger than the pattern — `ss` matches `ẞ`, three bytes — but not
-/// unboundedly so. A matching span folds to exactly what the pattern folds to, every
-/// character occupies at most four UTF-8 bytes, and every character folds to at least one:
-/// so no match can run past four times the folded length.
-fn longest_match(pattern: &[u8], ignore_case: bool) -> usize {
-    if !ignore_case {
-        return pattern.len();
-    }
-    // Folding expands by at most three, which is the bound `sz-dedup` sizes its own scratch by.
-    let mut scratch = vec![0u8; pattern.len().saturating_mul(3).max(64)];
-    utf8_uncased_fold(pattern, &mut scratch[..]).saturating_mul(4)
-}
-
 /// Replace within one window, emitting only what is settled and reporting how far that got.
 ///
 /// `carry` is how many trailing bytes could still be the opening of a match the next window
@@ -335,9 +388,8 @@ fn longest_match(pattern: &[u8], ignore_case: bool) -> usize {
 /// to settle anything, which is the caller's cue to widen it.
 fn replace_window(
     window: &[u8],
-    pattern: &[u8],
+    literal: &Literal,
     replacement: &[u8],
-    ignore_case: bool,
     limit: usize,
     carry: usize,
     out: &mut dyn Write,
@@ -345,7 +397,7 @@ fn replace_window(
     let settled = window.len().saturating_sub(carry);
     let (mut base, mut count) = (0, 0);
     while count < limit {
-        let Some((offset, matched)) = next_match(&window[base..], pattern, ignore_case) else {
+        let Some((offset, matched)) = literal.find_in(&window[base..]) else {
             break;
         };
         let start = base + offset;
@@ -372,22 +424,20 @@ fn replace_window(
 /// stop.
 fn replace_stream<R: Read>(
     refill: &mut Refill<R>,
-    pattern: &[u8],
+    literal: &Literal,
     replacement: &[u8],
-    ignore_case: bool,
     limit: usize,
     destination: &mut dyn Write,
 ) -> io::Result<(usize, usize)> {
-    let pending = longest_match(pattern, ignore_case).saturating_sub(1);
+    let pending = literal.longest_match().saturating_sub(1);
     let (mut count, mut bytes, mut consumed) = (0, 0, 0);
     while refill.advance(consumed)? {
         // Nothing is pending once the input has ended: the last window is whole.
         let carry = if refill.at_eof() { 0 } else { pending };
         let (made, took) = replace_window(
             refill.filled(),
-            pattern,
+            literal,
             replacement,
-            ignore_case,
             limit.saturating_sub(count),
             carry,
             destination,
@@ -434,60 +484,36 @@ impl Substitution<'_> {
     }
 
     fn emit(&mut self, destination: &mut dyn Write) -> io::Result<(usize, usize)> {
-        let edit = &self.edit;
+        // One pass, since the splices are already ordered and disjoint.
+        if let (InputWindow::Whole(held), Edit::Lines(splices)) = (&self.source, &self.edit) {
+            let data = held.as_bytes();
+            let mut cursor = 0;
+            for splice in splices {
+                destination.write_all(&data[cursor..splice.start])?;
+                destination.write_all(&splice.text)?;
+                cursor = splice.end;
+            }
+            destination.write_all(&data[cursor..])?;
+            return Ok((splices.len(), data.len()));
+        }
+        // A name is resolved against every candidate before anything is written, so a run
+        // that addresses lines never reaches here without the whole input.
+        let Edit::Substring {
+            literal,
+            replacement,
+            limit,
+        } = &self.edit
+        else {
+            unreachable!("line addressing holds the whole input")
+        };
         match &mut self.source {
             InputWindow::Whole(held) => {
                 let data = held.as_bytes();
-                match edit {
-                    Edit::Substring {
-                        pattern,
-                        replacement,
-                        ignore_case,
-                        limit,
-                    } => {
-                        let count = replace_to(
-                            data,
-                            pattern,
-                            replacement,
-                            *ignore_case,
-                            *limit,
-                            destination,
-                        )?;
-                        Ok((count, data.len()))
-                    }
-                    // One pass, since the splices are already ordered and disjoint.
-                    Edit::Lines(splices) => {
-                        let mut cursor = 0;
-                        for splice in splices {
-                            destination.write_all(&data[cursor..splice.start])?;
-                            destination.write_all(&splice.text)?;
-                            cursor = splice.end;
-                        }
-                        destination.write_all(&data[cursor..])?;
-                        Ok((splices.len(), data.len()))
-                    }
-                }
+                let count = replace_to(data, literal, replacement, *limit, destination)?;
+                Ok((count, data.len()))
             }
             InputWindow::Stream(refill) => {
-                // A name is resolved against every candidate before anything is written, so
-                // a run that addresses lines never reaches here without the whole input.
-                let Edit::Substring {
-                    pattern,
-                    replacement,
-                    ignore_case,
-                    limit,
-                } = edit
-                else {
-                    unreachable!("line addressing holds the whole input")
-                };
-                replace_stream(
-                    refill,
-                    pattern,
-                    replacement,
-                    *ignore_case,
-                    *limit,
-                    destination,
-                )
+                replace_stream(refill, literal, replacement, *limit, destination)
             }
         }
     }
@@ -766,15 +792,15 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         }
     }
 
+    let literal = Literal::new(pattern, Casing::from_ignore_case(args.ignore_case));
     let edit = match whole {
         Some(data) if args.match_kind == Match::LineHash => {
             Edit::Lines(resolve_lines(args, data, path)?)
         }
         Some(data) => Edit::Substring {
-            pattern,
+            limit: substring_limit(args, &literal, data, path)?,
+            literal,
             replacement,
-            ignore_case: args.ignore_case,
-            limit: substring_limit(args, data, path)?,
         },
         // A window is only ever handed over when nothing about the whole input is needed, so
         // there is nothing to count before the limit is known. If that ever stopped being
@@ -786,9 +812,8 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
                 "a run that needs the whole input was handed a window"
             );
             Edit::Substring {
-                pattern,
+                literal,
                 replacement,
-                ignore_case: args.ignore_case,
                 limit: match args.occurrences {
                     Occurrences::All => usize::MAX,
                     Occurrences::First | Occurrences::One => 1,
@@ -845,14 +870,23 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
 
 /// How many matches the substring mode acts on, refusing where `--occurrences one` asserts
 /// more than the file holds.
-fn substring_limit(args: &Args, data: &[u8], path: &str) -> Result<usize, Failure> {
+fn substring_limit(
+    args: &Args,
+    literal: &Literal,
+    data: &[u8],
+    path: &str,
+) -> Result<usize, Failure> {
     Ok(match args.occurrences {
         Occurrences::All => usize::MAX,
         Occurrences::First => 1,
         // Exactly one, in both directions. Refusing only the ambiguous side would let the
         // assertion pass on a pattern that matches nothing, which is the silent no-op the
         // mode exists to prevent, reached through the other door.
-        Occurrences::One => match count_matches(data, args.pattern.as_bytes(), args.ignore_case) {
+        //
+        // Two matches settle the question, so the deciding pass stops there rather than
+        // reading a whole file the run is about to refuse. Only the ambiguous side counts
+        // the rest, and it reports the exact total because the message names it.
+        Occurrences::One => match count_matches(data, literal, 2) {
             1 => 1,
             0 => {
                 return Err(Failure::Unresolved {
@@ -861,11 +895,11 @@ fn substring_limit(args: &Args, data: &[u8], path: &str) -> Result<usize, Failur
                     note: "matches nothing, and --occurrences one asserts exactly one",
                 })
             }
-            matches => {
+            _ => {
                 return Err(Failure::Ambiguous {
                     path: path.to_string(),
                     subject: args.pattern.clone(),
-                    matches,
+                    matches: count_matches(data, literal, usize::MAX),
                     note: "extend the pattern until it is unique, \
                            or pass --occurrences all or first",
                 })
@@ -899,7 +933,8 @@ mod tests {
         limit: usize,
     ) -> (Vec<u8>, usize) {
         let mut buf = Vec::new();
-        let count = replace_to(data, pattern, replacement, ignore_case, limit, &mut buf).unwrap();
+        let literal = Literal::new(pattern, Casing::from_ignore_case(ignore_case));
+        let count = replace_to(data, &literal, replacement, limit, &mut buf).unwrap();
         (buf, count)
     }
 
@@ -1177,7 +1212,11 @@ mod tests {
         ] {
             let (_, replaced) = replace_all(data, pattern, b".", ignore_case);
             assert_eq!(
-                count_matches(data, pattern, ignore_case),
+                count_matches(
+                    data,
+                    &Literal::new(pattern, Casing::from_ignore_case(ignore_case)),
+                    usize::MAX,
+                ),
                 replaced,
                 "counting disagreed with rewriting on {:?}",
                 String::from_utf8_lossy(data)
@@ -1413,15 +1452,9 @@ mod tests {
     ) -> (Vec<u8>, usize) {
         let mut refill = Refill::new(data, capacity);
         let mut written = Vec::new();
-        let (count, bytes) = replace_stream(
-            &mut refill,
-            pattern,
-            replacement,
-            ignore_case,
-            limit,
-            &mut written,
-        )
-        .unwrap();
+        let literal = Literal::new(pattern, Casing::from_ignore_case(ignore_case));
+        let (count, bytes) =
+            replace_stream(&mut refill, &literal, replacement, limit, &mut written).unwrap();
         assert_eq!(bytes, data.len(), "the stream read every byte");
         (written, count)
     }
@@ -1535,7 +1568,7 @@ aaa
         // A match spans at most four times the folded pattern: every character is at most
         // four UTF-8 bytes and folds to at least one. Checked against the widest real
         // expansions rather than only against the arithmetic.
-        assert_eq!(longest_match(b"abc", false), 3);
+        assert_eq!(Literal::new(b"abc", Casing::Cased).longest_match(), 3);
         for (pattern, haystack) in [
             (&b"ss"[..], "ẞ".as_bytes()),
             (&b"fi"[..], "ﬁ".as_bytes()),
@@ -1543,12 +1576,13 @@ aaa
             (&b"i"[..], "İ".as_bytes()),
             (&b"k"[..], "\u{212a}".as_bytes()),
         ] {
+            let bound = Literal::new(pattern, Casing::Uncased).longest_match();
             assert!(
-                haystack.len() <= longest_match(pattern, true),
+                haystack.len() <= bound,
                 "{:?} matched {} bytes, past the bound of {}",
                 String::from_utf8_lossy(pattern),
                 haystack.len(),
-                longest_match(pattern, true)
+                bound
             );
         }
     }
