@@ -350,8 +350,7 @@ struct RowsState {
     next_index: usize,
     /// How far into a sorted index list the walk has come.
     cursor: usize,
-    /// Rows written so far. Nothing in the run reads it; the tests do, to compare a
-    /// streamed extraction against a whole-buffer one.
+    /// Rows written so far, which the run returns as its row count.
     emitted: usize,
 }
 

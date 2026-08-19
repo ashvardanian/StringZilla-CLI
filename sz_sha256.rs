@@ -374,14 +374,14 @@ fn hash_with_fleet<'a>(
         // A full group is the best a call ever gets, so it fires without looking further.
         if ready >= LANE_COUNT {
             if let Err(error) = advance_group(fleet, states, staging, members, LANE_COUNT) {
-                abandon(fleet, report, error);
+                abandon(fleet, report, error.kind());
                 break;
             }
             // Every release queued a read against a block the group just gave back. This is what
             // hands them over, so the disk fills while the next group hashes rather than waiting
             // for a loop that may not need to sleep for thousands of chunks.
             if let Err(error) = fleet.reap(0) {
-                abandon(fleet, report, error);
+                abandon(fleet, report, error.kind());
                 break;
             }
             continue;
@@ -392,7 +392,7 @@ fn hash_with_fleet<'a>(
             // Nothing below a full group can be hashed, so one wakeup per completion would be one
             // syscall per completion. Sleeping for the whole shortfall batches them instead.
             if let Err(error) = fleet.reap(LANE_COUNT - ready) {
-                abandon(fleet, report, error);
+                abandon(fleet, report, error.kind());
                 break;
             }
             continue;
@@ -401,7 +401,7 @@ fn hash_with_fleet<'a>(
         // `advance_group` hashes one stream at a time, which beats a mostly-empty group.
         if ready > 0 {
             if let Err(error) = advance_group(fleet, states, staging, members, ready) {
-                abandon(fleet, report, error);
+                abandon(fleet, report, error.kind());
                 break;
             }
             continue;
@@ -410,7 +410,7 @@ fn hash_with_fleet<'a>(
         // ended. They must land before those slots are reusable.
         if fleet.outstanding() > 0 {
             if let Err(error) = fleet.reap(1) {
-                abandon(fleet, report, error);
+                abandon(fleet, report, error.kind());
                 break;
             }
             continue;
@@ -517,8 +517,7 @@ fn advance_group(
 
 /// A failure of the submission interface belongs to no single file, so every file still in hand is
 /// charged with it rather than whichever one happens to sit in slot zero.
-fn abandon(fleet: &mut dyn Fleet, report: &mut dyn FnMut(usize, Outcome), error: io::Error) {
-    let kind = error.kind();
+fn abandon(fleet: &mut dyn Fleet, report: &mut dyn FnMut(usize, Outcome), kind: io::ErrorKind) {
     for slot in 0..fleet.width() {
         if let Some(position) = fleet.live_position(slot) {
             report(position, Err(io::Error::from(kind)));

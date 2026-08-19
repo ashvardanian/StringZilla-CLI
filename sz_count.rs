@@ -363,7 +363,7 @@ struct Counter {
 
 /// The running tallies plus the two facts a window boundary would otherwise lose:
 /// whether the bytes so far end inside a word, and whether they end with a newline.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct CountState {
     counts: Counts,
     inside_word: bool,

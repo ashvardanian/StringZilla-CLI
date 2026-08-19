@@ -197,8 +197,7 @@ impl<'a> ColumnSelection<'a> {
 struct ColsState {
     /// Input lines seen so far, which `--format json` reports.
     line_number: usize,
-    /// Records written so far. Nothing in the run reads it; the tests do, to compare a
-    /// streamed extraction against a whole-buffer one.
+    /// Records written so far, which decides whether the run found anything.
     emitted: usize,
     /// Fields of the line being written, as offsets into it.
     fields: Vec<Span>,

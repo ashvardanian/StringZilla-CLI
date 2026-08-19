@@ -50,9 +50,11 @@ if [ -n "$staged_rust" ]; then
         exit 1
     fi
 
-    if ! cargo fmt --check >/dev/null 2>&1; then
+    # Scoped to the staged files rather than the tree: a commit is not the place to answer
+    # for formatting in a file it does not touch, which another session may still be editing.
+    if ! printf '%s\n' "$staged_rust" | xargs rustfmt --check --edition 2021 >/dev/null 2>&1; then
         echo "error: rustfmt would change staged files; run 'cargo fmt'." >&2
-        cargo fmt --check 2>&1 | head -20 >&2
+        printf '%s\n' "$staged_rust" | xargs rustfmt --check --edition 2021 2>&1 | head -20 >&2
         exit 1
     fi
 

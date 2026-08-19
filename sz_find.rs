@@ -1227,6 +1227,41 @@ impl LineCursor {
     }
 }
 
+/// The span a match prints: the line holding it, widened by the surrounding lines `context`
+/// asks for. Ends at the newline terminating the last line, which the caller carries.
+fn printed_region(
+    data: &[u8],
+    match_start: usize,
+    match_end: usize,
+    context: Context,
+) -> (usize, usize) {
+    let line_start = rfind(&data[..match_start], b"\n").map_or(0, |offset| offset + 1);
+    let line_end = find(&data[match_end..], b"\n").map_or(data.len(), |offset| match_end + offset);
+
+    let mut start = line_start;
+    for _ in 0..context.before {
+        if start == 0 {
+            break;
+        }
+        start = rfind(&data[..start - 1], b"\n").map_or(0, |offset| offset + 1);
+    }
+
+    let mut end = line_end;
+    for _ in 0..context.after {
+        if end >= data.len() {
+            break;
+        }
+        match find(&data[end + 1..], b"\n") {
+            Some(offset) => end += 1 + offset,
+            None => {
+                end = data.len();
+                break;
+            }
+        }
+    }
+    (start, end)
+}
+
 /// Search using multi-line matching (whole buffer search)
 fn search_multiline(
     data: &[u8],
@@ -1288,45 +1323,7 @@ fn search_multiline(
         // and `--format json` opens the record a `{"type":"end"}` will close.
         emitter.file_heading(&mut state.printed_heading)?;
 
-        // Find line boundaries around the match
-        let line_start = rfind(&data[..found.offset], b"\n").map_or(0, |offset| offset + 1);
-        let line_end =
-            find(&data[match_end..], b"\n").map_or(data.len(), |offset| match_end + offset);
-
-        // Expand for before context
-        let mut output_start = line_start;
-        if context.before > 0 {
-            let mut expanded = 0;
-            let mut search_start = line_start;
-            while expanded < context.before && search_start > 0 {
-                search_start = if search_start <= 1 {
-                    0
-                } else {
-                    rfind(&data[..search_start - 1], b"\n")
-                        .map(|offset| offset + 1)
-                        .unwrap_or(0)
-                };
-                expanded += 1;
-            }
-            output_start = search_start;
-        }
-
-        // Expand for after context
-        let mut output_end = line_end;
-        if context.after > 0 {
-            let mut expanded = 0;
-            let mut search_end = line_end;
-            while expanded < context.after && search_end < data.len() {
-                if let Some(next_newline) = find(&data[search_end + 1..], b"\n") {
-                    search_end = search_end + 1 + next_newline;
-                } else {
-                    search_end = data.len();
-                    break;
-                }
-                expanded += 1;
-            }
-            output_end = search_end;
-        }
+        let (output_start, output_end) = printed_region(data, found.offset, match_end, context);
 
         // Avoid printing overlapping regions
         let actual_start = output_start.max(last_printed_end.unwrap_or(0));
