@@ -654,18 +654,21 @@ $ sz-fuzzy-find --top-k 20 --fields scores color file.txt
 `--effort` names the kind of difference to tolerate, and picks the edit budget, the alphabet, the dictionary and the fold to deliver it.
 Each rung matches everything the rung below it matched.
 
-| `--effort` | Tolerates | Example |
-| :--------- | :-------- | :------ |
-| `exact` | nothing | `2024` never matches `1999` |
-| `typos` | fat-finger slips, adjacent keys only | `xolor` reaches `color` |
-| `spelling` | any single edit, plus recorded misspellings | `definately` reaches `definitely` |
-| `accents` | diacritics and compatibility forms | `resume` reaches `résumé` |
-| `sounds` | pronunciation | `Gaddafi` reaches `Qaddafi` and `Kadafi` |
-| `scripts` | writing system | `北京大穴` reaches `北京大学` through pinyin |
-| `deep` | two edits | the widest ball, GPU territory |
+| `--effort` | Tolerates                                   | Example                                                      |
+| :--------- | :------------------------------------------ | :----------------------------------------------------------- |
+| `exact`    | nothing                                     | `2024` never matches `1999`                                  |
+| `typos`    | fat-finger slips, adjacent keys only        | `xolor` reaches `color`                                      |
+| `spelling` | any single edit, plus recorded misspellings | `definately` reaches `definitely`                            |
+| `accents`  | diacritics and compatibility forms          | `resume` reaches `résumé`                                    |
+| `sounds`   | pronunciation                               | `Gaddafi` reaches `Qaddafi` and `Kadafi`                     |
+| `scripts`  | writing system                              | `beijing` reaches `北京` through pinyin, in either direction |
+| `deep`     | two edits                                   | the widest ball, GPU territory                               |
 
-The fold follows from the query's own script, so `--effort scripts` means the right thing without naming a transform:
-a Cyrillic query gets `Cyrillic-Latin`, a Han query gets `Han-Latin`, and each is then carried through the Latin chain.
+`--effort scripts` turns on every transliteration the binary carries — Kana, Han, Traditional Han, Cyrillic and Greek — rather than guessing one from the query.
+What the query is written in says nothing about what the corpus holds, so a Latin query reaches a Han corpus at this rung and a Han query reaches a Latin one.
+
+Turning all five on costs one automaton walk more than turning one on, not five: transforms that cannot read each other's output share a single walk.
+Only the ones that genuinely feed each other are kept apart, and there are exactly three such boundaries — `Kana-Latin` reads a Latin vowel before a prolonged sound mark, `Latin-ASCII` strips the tone marks transliteration emits, and `Latin-Phonetic` has nothing to act on until a Latin syllable exists.
 
 `--max-distance`, `--cost`, `--dictionary` and `--fold` remain as overrides, and each means the same thing at any `--effort`.
 

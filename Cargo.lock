@@ -13,12 +13,6 @@ dependencies = [
 
 [[package]]
 name = "allocator-api2"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
-
-[[package]]
-name = "allocator-api2"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
@@ -426,7 +420,7 @@ version = "2.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c2ad8ddd435760c2439d6548e52bca5097890f3af26b3c417af3a87ed28e0fa"
 dependencies = [
- "allocator-api2 0.4.0",
+ "allocator-api2",
 ]
 
 [[package]]
@@ -435,7 +429,7 @@ version = "5.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbcaa1f7662e1c6b2e6ff64450655cb8830763ebf8bd02038795c2689dd3cc68"
 dependencies = [
- "allocator-api2 0.4.0",
+ "allocator-api2",
  "cc",
  "forkunion",
  "stringtape",
@@ -445,7 +439,7 @@ dependencies = [
 name = "stringzilla-cli"
 version = "0.1.0"
 dependencies = [
- "allocator-api2 0.2.21",
+ "allocator-api2",
  "clap",
  "forkunion",
  "glob",

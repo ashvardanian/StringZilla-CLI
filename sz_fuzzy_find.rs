@@ -15,13 +15,16 @@
 //!
 //! Exit: 0 matched something, 1 matched nothing, 2 could not run.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
+use stringtape::{BytesTape, BytesTapeView};
 use stringzilla::szs::{
     AnyBytesTape, Bm25Params, CaseSensitivity, DeviceScope, OverlapPolicy, Substrings,
-    SubstringsMatch,
+    SubstringsMatch, UnifiedAlloc, UnifiedVec,
 };
 
 use shared::folds::Fold;
@@ -206,19 +209,23 @@ impl Script {
         }
     }
 
-    /// The transform that carries this script to Latin, and `None` where it already is.
-    fn transliteration(self) -> Option<&'static str> {
-        match self {
-            Script::Latin => None,
-            Script::Cyrillic => Some("Cyrillic-Latin"),
-            Script::Greek => Some("Greek-Latin"),
-            Script::Han => Some("Han-Latin"),
-            // No table ships for these yet, so naming one would fail the run rather than widen it.
-            Script::Armenian | Script::Hebrew | Script::Arabic | Script::Hangul | Script::Kana => {
-                None
-            }
-        }
-    }
+    /// Every script-to-Latin transform the table carries, in the order they feed each other.
+    ///
+    /// All of them, rather than the one the query happens to be written in: it is the corpus that
+    /// decides what is worth folding, and `beijing` should reach 北京 without being typed in Han.
+    /// Fusing them is what makes that affordable - the five cost one walk more than the one did.
+    ///
+    /// `Kana-Latin` leads because six of its rules read a Latin vowel before U+30FC, so it is the
+    /// one transform another's output can reach. `Hant-Latin` precedes `Han-Latin` because it is
+    /// the specialisation: the 101 characters both spell get the traditional reading, and placing
+    /// it second would spend every one of its rules and leave it empty.
+    const TRANSLITERATIONS: [&'static str; 5] = [
+        "Kana-Latin",
+        "Hant-Latin",
+        "Han-Latin",
+        "Cyrillic-Latin",
+        "Greek-Latin",
+    ];
 }
 
 /// What a rung asks a fold to achieve, before the query's script says which transform delivers it.
@@ -242,10 +249,10 @@ impl Folding {
     ///
     /// Transliteration leads: `Latin-Phonetic` has nothing to act on until the script transform has
     /// produced a Latin syllable for it.
-    fn transforms(self, script: Script) -> Vec<&'static str> {
+    fn transforms(self) -> Vec<&'static str> {
         let mut chain = Vec::new();
         if self == Folding::Scripts {
-            chain.extend(script.transliteration());
+            chain.extend(Script::TRANSLITERATIONS);
         }
         if self >= Folding::Accents {
             chain.push("Latin-ASCII");
@@ -261,26 +268,24 @@ impl Folding {
 ///
 /// An empty result is the zero-cost case, and it is what every effort below `Folding::Accents`
 /// produces without `--fold` naming anything.
-fn resolve_folds(named: &[String], folding: Folding, script: Script) -> Result<Vec<Fold>, Failure> {
+fn resolve_folds(named: &[String], folding: Folding) -> Result<Vec<Fold>, Failure> {
     let wanted: Vec<String> = match named.is_empty() {
         false => named.to_vec(),
         true => folding
-            .transforms(script)
+            .transforms()
             .into_iter()
             .map(str::to_string)
             .collect(),
     };
-    let mut folds = Vec::with_capacity(wanted.len());
-    for name in wanted {
-        let fold = Fold::load(&name);
+    let folds = Fold::load_all(&wanted);
+    for (fold, name) in folds.iter().zip(&wanted) {
         if fold.is_empty() {
             return Err(Failure::Unresolved {
-                path: name,
+                path: name.clone(),
                 subject: "CLDR transform".to_string(),
                 note: "pass --fold with an embedded transform, such as Han-Latin or Latin-ASCII",
             });
         }
-        folds.push(fold);
     }
     Ok(folds)
 }
@@ -485,6 +490,257 @@ fn edits_of(
 
 // region: Searching
 
+/// The corpus in the one shape every kernel here wants: a contiguous byte run plus the offset each
+/// line starts at, which is what a tape already is.
+///
+/// An entry runs to the start of the next one and so carries its own terminator - the offsets are
+/// a partition, and a partition cannot leave gaps. Nothing matches into one, since no needle holds
+/// a newline, and [`trimmed`] takes it off again for the handful of lines that reach an output mode.
+enum Corpus<'a> {
+    /// The bytes where the host can already read them: the mapping itself, or a rewrite's product.
+    Host {
+        data: Cow<'a, [u8]>,
+        offsets: Vec<u64>,
+    },
+    /// One staged copy in unified memory, because a CUDA scope cannot follow a host pointer.
+    ///
+    /// Staged once for a whole run rather than once per walk: the same corpus serves scoring,
+    /// locating, and every fold stage between them.
+    Staged(BytesTape<u64, UnifiedAlloc>),
+    /// A rewrite's product, left where the kernel that produced it wrote it.
+    ///
+    /// The slot is a run-owned buffer that outlives any one rewrite, so `lines` says how much of
+    /// it this corpus is - the rest is capacity a previous, larger input left behind.
+    Rewritten { slot: Rewrite, lines: usize },
+}
+
+/// The two buffers `replace_into` fills, which are the two buffers a tape is made of.
+///
+/// Where they are allocated is the whole point: unified memory lets a CUDA scope read the product
+/// back without a copy, and costs a host scope dearly - managed pages are not ordinary memory - so
+/// the choice follows the device rather than being made once for both.
+enum Rewrite {
+    Host {
+        data: Vec<u8>,
+        offsets: Vec<usize>,
+    },
+    Unified {
+        data: UnifiedVec<u8>,
+        offsets: UnifiedVec<usize>,
+    },
+}
+
+impl Rewrite {
+    fn allocate(device: &DeviceScope, bytes: usize, entries: usize) -> Self {
+        match device.is_gpu() {
+            false => Self::Host {
+                data: vec![0u8; bytes],
+                offsets: vec![0usize; entries],
+            },
+            true => {
+                let mut data: UnifiedVec<u8> = UnifiedVec::new_in(UnifiedAlloc);
+                let mut offsets: UnifiedVec<usize> = UnifiedVec::new_in(UnifiedAlloc);
+                data.resize(bytes, 0);
+                offsets.resize(entries, 0);
+                Self::Unified { data, offsets }
+            }
+        }
+    }
+
+    /// This slot, made large enough for one more rewrite.
+    ///
+    /// Grows and never shrinks, so a run over many files of similar shape allocates for the first
+    /// of them and for none of the rest.
+    fn grown_to(&mut self, bytes: usize, entries: usize) {
+        match self {
+            Self::Host { data, offsets } => {
+                if data.len() < bytes {
+                    data.resize(bytes, 0);
+                }
+                if offsets.len() < entries {
+                    offsets.resize(entries, 0);
+                }
+            }
+            Self::Unified { data, offsets } => {
+                if data.len() < bytes {
+                    data.resize(bytes, 0);
+                }
+                if offsets.len() < entries {
+                    offsets.resize(entries, 0);
+                }
+            }
+        }
+    }
+
+    /// How many bytes this slot can take, which is what a rewrite is offered before it asks for more.
+    fn written_capacity(&self) -> usize {
+        self.parts().0.len()
+    }
+
+    /// The prefix a rewrite of this shape writes into, since the slot itself may be larger.
+    fn parts_upto(&mut self, bytes: usize, entries: usize) -> (&mut [u8], &mut [usize]) {
+        match self {
+            Self::Host { data, offsets } => (&mut data[..bytes], &mut offsets[..entries]),
+            Self::Unified { data, offsets } => (&mut data[..bytes], &mut offsets[..entries]),
+        }
+    }
+
+    fn parts(&self) -> (&[u8], &[usize]) {
+        match self {
+            Self::Host { data, offsets } => (data, offsets),
+            Self::Unified { data, offsets } => (data, offsets),
+        }
+    }
+}
+
+impl<'a> Corpus<'a> {
+    /// Cut an input into lines, copying the bytes only where the device cannot read them in place.
+    fn lines_of(device: &DeviceScope, data: &'a [u8], newlines: Newlines) -> Result<Self, Failure> {
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut end = 0usize;
+        for line in named_lines(data, newlines) {
+            offsets.push(line.offset as u64);
+            end = line.offset + line.whole.len();
+        }
+        offsets.push(end as u64);
+        Self::Host {
+            data: Cow::Borrowed(&data[..end]),
+            offsets,
+        }
+        .on(device)
+    }
+
+    /// Gather already-selected lines into a corpus of their own.
+    ///
+    /// Unlike [`Corpus::lines_of`] this always copies, and answers for the few hundred lines an
+    /// output mode asks about rather than for a whole input.
+    fn gathered<'b>(
+        device: &DeviceScope,
+        lines: impl Iterator<Item = &'b [u8]> + Clone,
+    ) -> Result<Self, Failure> {
+        // Cloned rather than collected: the first pass sizes the buffer and the second fills it,
+        // so a caller with the lines already in hand never builds a vector of slices to be read
+        // twice and dropped.
+        let mut data = Vec::with_capacity(lines.clone().map(|line| line.len()).sum());
+        let mut offsets = Vec::with_capacity(lines.clone().count() + 1);
+        for line in lines {
+            offsets.push(data.len() as u64);
+            data.extend_from_slice(line);
+        }
+        offsets.push(data.len() as u64);
+        Self::Host {
+            data: Cow::Owned(data),
+            offsets,
+        }
+        .on(device)
+    }
+
+    /// This corpus where the device can reach it, which for a host scope is where it already is.
+    ///
+    /// The one place the staging decision is made, so no verb below has to ask again which memory
+    /// its haystacks live in.
+    fn on(self, device: &DeviceScope) -> Result<Self, Failure> {
+        // A rewrite's product is already unified, and a host scope reads unified memory fine, so
+        // neither device has anything left to do to it.
+        if !device.is_gpu() || matches!(self, Self::Rewritten { .. }) {
+            return Ok(self);
+        }
+        let mut tape: BytesTape<u64, UnifiedAlloc> =
+            BytesTape::with_capacity_in(self.bytes().len(), self.len() + 1, UnifiedAlloc)
+                .map_err(|error| engine_failure("corpus staging", error))?;
+        for index in 0..self.len() {
+            tape.push(self.line(index))
+                .map_err(|error| engine_failure("corpus staging", error))?;
+        }
+        Ok(Self::Staged(tape))
+    }
+
+    /// What the engines are handed: three words, and no copy at the call site.
+    fn haystacks(&self) -> AnyBytesTape<'_> {
+        match self {
+            // Safety: the offsets ascend, start at zero and end at `data.len()`, since every
+            // constructor above builds them as a partition of exactly these bytes.
+            Self::Host { data, offsets } => {
+                AnyBytesTape::View64(unsafe { BytesTapeView::from_raw_parts(data, offsets) })
+            }
+            Self::Staged(tape) => AnyBytesTape::View64(tape.view()),
+            Self::Rewritten { slot, lines } => {
+                let (data, offsets) = slot.parts();
+                AnyBytesTape::View64(unsafe {
+                    BytesTapeView::from_raw_parts(data, as_u64(&offsets[..lines + 1]))
+                })
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Host { offsets, .. } => offsets.len() - 1,
+            Self::Staged(tape) => tape.len(),
+            Self::Rewritten { lines, .. } => *lines,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every byte the corpus spans, which is what a length-normalized BM25 needs.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Host { data, .. } => data,
+            Self::Staged(tape) => tape.data_slice(),
+            Self::Rewritten { slot, lines } => {
+                let (data, offsets) = slot.parts();
+                &data[..offsets[*lines]]
+            }
+        }
+    }
+
+    /// One entry, terminator and all.
+    fn line(&self, index: usize) -> &[u8] {
+        match self {
+            Self::Host { data, offsets } => {
+                &data[offsets[index] as usize..offsets[index + 1] as usize]
+            }
+            Self::Staged(tape) => &tape[index],
+            Self::Rewritten { slot, .. } => {
+                let (data, offsets) = slot.parts();
+                &data[offsets[index]..offsets[index + 1]]
+            }
+        }
+    }
+}
+
+/// The same offsets seen as the width a tape addresses them with.
+///
+/// `replace_into` writes `usize` and a tape view reads `u64`; on every target this suite builds for
+/// those are one type, and the assertion below is what says so.
+fn as_u64(offsets: &[usize]) -> &[u64] {
+    const _: () = assert!(std::mem::size_of::<usize>() == std::mem::size_of::<u64>());
+    unsafe { std::slice::from_raw_parts(offsets.as_ptr().cast::<u64>(), offsets.len()) }
+}
+
+impl Corpus<'_> {
+    /// The buffer this corpus was written into, given up so the next rewrite can use it again.
+    ///
+    /// Only a rewrite's product has one; a mapping and a staged tape own nothing a run can pass on.
+    fn reclaimed(self) -> Option<Rewrite> {
+        match self {
+            Self::Rewritten { slot, .. } => Some(slot),
+            _ => None,
+        }
+    }
+}
+
+/// An entry without whatever separated it from the next one.
+///
+/// The offsets partition the input, so a terminator rides along with the line it ends; the split
+/// kernel that found it in the first place is what takes it back off.
+fn trimmed(entry: &[u8], newlines: Newlines) -> &[u8] {
+    LineIter::new(entry, newlines).next().unwrap_or(entry)
+}
+
 /// What the vocabulary is built from, resolved once from `Args`.
 struct SearchConfig {
     max_distance: usize,
@@ -513,6 +769,44 @@ impl SearchConfig {
             top: args.top_k,
         }
     }
+}
+
+/// Every match in `corpus`, under the leftmost-longest cover.
+///
+/// Two walks rather than one: sizing the match buffer needs a count, and the engine will not
+/// answer both from a single pass. Both callers pay it, so both call this.
+fn cover(
+    automaton: &Substrings,
+    device: &DeviceScope,
+    corpus: &Corpus,
+    counting: &'static str,
+    locating: &'static str,
+) -> Result<Vec<SubstringsMatch>, Failure> {
+    if corpus.is_empty() {
+        return Ok(Vec::new());
+    }
+    let haystacks = corpus.haystacks();
+    let mut counts = vec![0usize; corpus.len()];
+    let total = automaton
+        .count_into(
+            device,
+            &haystacks,
+            OverlapPolicy::LeftmostLongest,
+            &mut counts,
+        )
+        .map_err(|error| engine_failure(counting, error))?;
+
+    let mut matches = vec![SubstringsMatch::default(); total];
+    let written = automaton
+        .find_into(
+            device,
+            &haystacks,
+            OverlapPolicy::LeftmostLongest,
+            &mut matches,
+        )
+        .map_err(|error| engine_failure(locating, error))?;
+    matches.truncate(written);
+    Ok(matches)
 }
 
 /// The pooled dictionary, the automaton compiled from it, and the device that walks it.
@@ -546,11 +840,10 @@ impl Engine {
         };
         let patterns: Vec<String> = match &folder {
             Some(folder) => {
-                let raw: Vec<&[u8]> = patterns.iter().map(|one| one.as_bytes()).collect();
-                folder
-                    .apply(&device, &raw)?
-                    .into_iter()
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                let sources = patterns.iter().map(|one| one.as_bytes());
+                let folded = folder.apply(&device, &Corpus::gathered(&device, sources)?)?;
+                (0..folded.len())
+                    .map(|index| String::from_utf8_lossy(folded.line(index)).into_owned())
                     .collect()
             }
             None => patterns.to_vec(),
@@ -583,40 +876,24 @@ impl Engine {
     ///
     /// Weights are strictly positive, so a positive score is exactly "at least one variant of at
     /// least one query occurs in this line" - no separate counting walk is needed to decide it.
-    fn score(&self, lines: &[&[u8]]) -> Result<Vec<f32>, Failure> {
-        let mut scores = vec![0.0f32; lines.len()];
-        if lines.is_empty() {
+    fn score(&self, corpus: &Corpus) -> Result<Vec<f32>, Failure> {
+        let mut scores = vec![0.0f32; corpus.len()];
+        if corpus.is_empty() {
             return Ok(scores);
         }
 
         // Under a fold the corpus is rewritten once and matched in the folded domain; the caller
         // still holds the original lines, which is what gets printed.
         let folded = match &self.folder {
-            Some(folder) => Some(folder.apply(&self.device, lines)?),
+            Some(folder) => Some(folder.apply(&self.device, corpus)?),
             None => None,
         };
-        let borrowed: Vec<&[u8]>;
-        let lines: &[&[u8]] = match &folded {
-            Some(owned) => {
-                borrowed = owned.iter().map(Vec::as_slice).collect();
-                &borrowed
-            }
-            None => lines,
-        };
-
-        // A GPU scope reads its inputs from unified memory and refuses borrowed slices, so the
-        // corpus is copied only where it has to be.
-        let haystacks = if self.device.is_gpu() {
-            AnyBytesTape::from_sequences(lines)
-                .map_err(|error| engine_failure("corpus staging", error))?
-        } else {
-            AnyBytesTape::from_slices(lines)
-        };
+        let corpus: &Corpus = folded.as_ref().unwrap_or(corpus);
+        let haystacks = corpus.haystacks();
 
         // Length normalization divides by the corpus mean, and BM25 refuses a mean that is not
         // positive rather than quietly ignoring it, so an all-empty corpus scores unnormalized.
-        let total: usize = lines.iter().map(|line| line.len()).sum();
-        let mean = total as f32 / lines.len() as f32;
+        let mean = corpus.bytes().len() as f32 / corpus.len() as f32;
         let parameters = if mean > 0.0 {
             Bm25Params::normalized(mean)
         } else {
@@ -633,6 +910,12 @@ impl Engine {
                 &mut scores,
             )
             .map_err(|error| engine_failure("BM25 scoring", error))?;
+        drop(haystacks);
+
+        // Nothing reads the folded bytes past this point, so the buffer goes back for the next file.
+        if let (Some(folder), Some(folded)) = (&self.folder, folded) {
+            folder.reclaim(folded);
+        }
         Ok(scores)
     }
 
@@ -641,48 +924,21 @@ impl Engine {
     /// Deliberately a second, much smaller walk than scoring: sizing a match buffer needs a prior
     /// count, and paying for both over the whole corpus would triple the work to answer a question
     /// only a few hundred lines ever ask.
-    fn find(&self, haystacks_bytes: &[&[u8]]) -> Result<Vec<SubstringsMatch>, Failure> {
-        let survivors = haystacks_bytes;
-        if survivors.is_empty() {
-            return Ok(Vec::new());
-        }
-        let haystacks = if self.device.is_gpu() {
-            AnyBytesTape::from_sequences(survivors)
-                .map_err(|error| engine_failure("corpus staging", error))?
-        } else {
-            AnyBytesTape::from_slices(survivors)
-        };
-
-        let mut counts = vec![0usize; survivors.len()];
-        let total = self
-            .automaton
-            .count_into(
-                &self.device,
-                &haystacks,
-                OverlapPolicy::LeftmostLongest,
-                &mut counts,
-            )
-            .map_err(|error| engine_failure("match counting", error))?;
-
-        let mut matches = vec![SubstringsMatch::default(); total];
-        let found = self
-            .automaton
-            .find_into(
-                &self.device,
-                &haystacks,
-                OverlapPolicy::LeftmostLongest,
-                &mut matches,
-            )
-            .map_err(|error| engine_failure("match location", error))?;
-        matches.truncate(found);
-        Ok(matches)
+    fn find(&self, corpus: &Corpus) -> Result<Vec<SubstringsMatch>, Failure> {
+        cover(
+            &self.automaton,
+            &self.device,
+            corpus,
+            "match counting",
+            "match location",
+        )
     }
 
     /// Locate the variants inside lines that already scored, always in the caller's own bytes.
     ///
     /// The domain the automaton walked is this method's business alone: an output mode receives
     /// spans it can slice directly and never learns whether a fold ran.
-    fn locate(&self, survivors: &[&[u8]]) -> Result<Vec<Located>, Failure> {
+    fn locate(&self, survivors: &Corpus) -> Result<Vec<Located>, Failure> {
         match &self.folder {
             // Matched domain and printed domain agree, so the automaton's own offsets already
             // answer and no map exists to consult.
@@ -694,14 +950,14 @@ impl Engine {
             // The automaton was compiled from folded needles, so it has to be shown folded bytes.
             // Handing it the originals is what made `--show matches` under a fold report a subset.
             Some(folder) => {
-                let folded = folder.apply(&self.device, survivors)?;
-                let borrowed: Vec<&[u8]> = folded.iter().map(Vec::as_slice).collect();
-                let rewrites = folder.rewrites(&self.device, survivors)?;
-                Ok(self
-                    .find(&borrowed)?
+                let (rewrites, folded) = folder.rewrites(&self.device, survivors)?;
+                let located: Vec<Located> = self
+                    .find(&folded)?
                     .into_iter()
                     .map(|found| rewrites.located(found))
-                    .collect())
+                    .collect();
+                folder.reclaim(folded);
+                Ok(located)
             }
         }
     }
@@ -735,19 +991,83 @@ enum Dictionary {
     Known,
 }
 
-/// One transform compiled into a rewrite.
-struct Stage {
+/// One or more transforms compiled into a single rewrite.
+struct Layer {
     automaton: Substrings,
     targets: Vec<String>,
 }
 
-/// The transforms a run folds through, in order, applied to corpus and query alike.
+/// The transforms a run folds through, applied to corpus and query alike.
 ///
-/// A sequence rather than one merged dictionary, because the transforms feed each other:
-/// `Latin-Phonetic` has nothing to act on until `Han-Latin` has produced a Latin syllable for it,
-/// and a merged automaton would let only one of them fire at each position.
+/// Folds that can see each other's output must run in turn - `Latin-Phonetic` has nothing to act
+/// on until a script transform has produced a Latin syllable for it - but folds that cannot are
+/// one automaton, since running them in sequence would let only one of them fire at each position
+/// anyway. So the chain is partitioned into layers, and a layer is one walk.
 struct Folder {
-    stages: Vec<Stage>,
+    layers: Vec<Layer>,
+    /// Buffers the chain hands out and takes back.
+    ///
+    /// A fold's product is a whole rewritten corpus, and a chain over many inputs would otherwise
+    /// allocate one per layer per file. Two slots serve a chain of any length, and they are grown
+    /// by the largest input seen rather than sized by the current one.
+    spare: RefCell<Vec<Rewrite>>,
+}
+
+/// Whether `later` can share `earlier`'s automaton.
+///
+/// Three ways it cannot: they begin matches at the same character, so a single leftmost-longest
+/// walk would have a choice the sequence never offered it; `later` reads what `earlier` writes;
+/// or `earlier` reads what `later` writes. Failing the test opens a new layer, which is what the
+/// sequence did for every fold regardless, so a false negative costs a pass and never a result.
+fn fusable(earlier: &Fold, later: &Fold) -> bool {
+    let (before, after) = (&earlier.alphabets, &later.alphabets);
+    before.source_heads.is_disjoint(&after.source_heads)
+        && after.source_heads.is_disjoint(&before.targets)
+        && before.source_heads.is_disjoint(&after.targets)
+}
+
+/// The chain with every source claimed by the first fold that carries it.
+///
+/// A sequence already behaves this way - the earlier fold rewrites the character and the later one
+/// never sees it - so spending sources up front is what lets two folds share a walk without
+/// changing what either produces. Keyed on the exact bytes: `А` and `а` are different rules with
+/// different replacements, and a case-folded key would drop one of every such pair.
+fn spend_sources(folds: &[Fold]) -> Vec<Fold> {
+    let mut spent: HashSet<&str> = HashSet::new();
+    let mut chain = Vec::with_capacity(folds.len());
+    for fold in folds {
+        // Spending can empty a fold outright, and an empty needle list is not something to
+        // compile. An emptied fold is spent, not unresolved.
+        let kept = fold.retaining(|source| spent.insert(source));
+        if !kept.is_empty() {
+            chain.push(kept);
+        }
+    }
+    chain
+}
+
+impl Layer {
+    /// One automaton over every source of every fold in the layer.
+    ///
+    /// Concatenated in chain order, because `Substrings` numbers its needles in the order it is
+    /// given them and [`Layer::sites`] reads `targets[needle_index]` back out.
+    fn compile(
+        device: &DeviceScope,
+        folds: &[&Fold],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<Self, Failure> {
+        let mut sources = Vec::new();
+        let mut targets = Vec::new();
+        for fold in folds {
+            sources.extend(fold.sources.iter().cloned());
+            targets.extend(fold.targets.iter().cloned());
+        }
+        Ok(Self {
+            automaton: Substrings::new(device, &sources, case_sensitivity)
+                .map_err(|error| engine_failure("fold", error))?,
+            targets,
+        })
+    }
 }
 
 impl Folder {
@@ -760,110 +1080,206 @@ impl Folder {
         folds: &[Fold],
         case_sensitivity: CaseSensitivity,
     ) -> Result<Self, Failure> {
-        let mut stages = Vec::with_capacity(folds.len());
-        for fold in folds {
-            stages.push(Stage {
-                automaton: Substrings::new(device, &fold.sources, case_sensitivity)
-                    .map_err(|error| engine_failure("fold", error))?,
-                targets: fold.targets.clone(),
-            });
+        let chain = spend_sources(folds);
+        let mut layers = Vec::new();
+        let mut open: Vec<&Fold> = Vec::new();
+        for fold in &chain {
+            if !open.is_empty() && !open.iter().all(|held| fusable(held, fold)) {
+                layers.push(Layer::compile(device, &open, case_sensitivity)?);
+                open.clear();
+            }
+            open.push(fold);
         }
-        Ok(Self { stages })
+        if !open.is_empty() {
+            layers.push(Layer::compile(device, &open, case_sensitivity)?);
+        }
+        Ok(Self {
+            layers,
+            spare: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// One layer per fold and no sources spent, which is what a chain of rewrites has always been.
+    ///
+    /// Kept as the oracle [`Folder::new`] is differenced against, since fusing folds that can see
+    /// each other's output goes wrong quietly - the spans come back mapped to the wrong bytes
+    /// rather than the run failing.
+    #[cfg(test)]
+    fn sequential(
+        device: &DeviceScope,
+        folds: &[Fold],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<Self, Failure> {
+        let mut layers = Vec::with_capacity(folds.len());
+        for fold in folds {
+            layers.push(Layer::compile(device, &[fold], case_sensitivity)?);
+        }
+        Ok(Self {
+            layers,
+            spare: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// A slot to write into, if the run has one to spare.
+    fn lend(&self) -> Option<Rewrite> {
+        self.spare.borrow_mut().pop()
+    }
+
+    /// Take a corpus back once nothing reads it, so its buffer serves the next fold or the next file.
+    fn reclaim(&self, corpus: Corpus<'_>) {
+        if let Some(slot) = corpus.reclaimed() {
+            self.spare.borrow_mut().push(slot);
+        }
+    }
+
+    /// The bytes each idle slot can hold, so a test can see that a second input reuses them.
+    #[cfg(test)]
+    fn spare_capacity(&self) -> Vec<usize> {
+        let mut sizes: Vec<usize> = self
+            .spare
+            .borrow()
+            .iter()
+            .map(|slot| slot.parts().0.len())
+            .collect();
+        sizes.sort_unstable();
+        sizes
     }
 
     /// Rewrite every haystack through every stage in turn, returning owned bytes since the product
     /// of a rewrite is a new tape.
-    fn apply(&self, device: &DeviceScope, lines: &[&[u8]]) -> Result<Vec<Vec<u8>>, Failure> {
-        let mut carried: Vec<Vec<u8>> = lines.iter().map(|line| line.to_vec()).collect();
-        for stage in &self.stages {
-            let borrowed: Vec<&[u8]> = carried.iter().map(Vec::as_slice).collect();
-            carried = stage.rewrite(device, &borrowed)?;
+    fn apply(&self, device: &DeviceScope, corpus: &Corpus) -> Result<Corpus<'static>, Failure> {
+        // A folder is only built from a non-empty chain, so a first stage always exists to produce
+        // the owned tape the rest of the chain then rewrites in turn.
+        let (first, rest) = self
+            .layers
+            .split_first()
+            .expect("a fold chain is never empty");
+        let mut carried = first.rewrite(device, corpus, self.lend())?;
+        for layer in rest {
+            let next = layer.rewrite(device, &carried, self.lend())?;
+            // The corpus just consumed is the buffer the layer after next will write into.
+            self.reclaim(carried);
+            carried = next;
         }
         Ok(carried)
     }
 
     /// Where every stage rewrote these lines, as the map from the folded bytes back to the caller's.
     ///
+    /// Returned with the folded corpus the last stage produced, so locating never re-runs the chain.
+    ///
     /// Built only when an output mode asks for spans, and only over the lines that already scored -
     /// a corpus-wide map of `Han-Latin` would run several times the size of the corpus itself.
-    fn rewrites(&self, device: &DeviceScope, lines: &[&[u8]]) -> Result<Rewrites, Failure> {
-        let mut stages = Vec::with_capacity(self.stages.len());
-        let mut carried: Vec<Vec<u8>> = lines.iter().map(|line| line.to_vec()).collect();
-        for stage in &self.stages {
-            let borrowed: Vec<&[u8]> = carried.iter().map(Vec::as_slice).collect();
-            stages.push(stage.sites(device, &borrowed)?);
-            carried = stage.rewrite(device, &borrowed)?;
+    fn rewrites<'a>(
+        &self,
+        device: &DeviceScope,
+        corpus: &Corpus,
+    ) -> Result<(Rewrites, Corpus<'a>), Failure> {
+        let mut layers = Vec::with_capacity(self.layers.len());
+        let (first, rest) = self
+            .layers
+            .split_first()
+            .expect("a fold chain is never empty");
+        layers.push(first.sites(device, corpus)?);
+        let mut carried = first.rewrite(device, corpus, self.lend())?;
+        for layer in rest {
+            layers.push(layer.sites(device, &carried)?);
+            let next = layer.rewrite(device, &carried, self.lend())?;
+            self.reclaim(carried);
+            carried = next;
         }
-        Ok(Rewrites { stages })
+        // The last stage's own output is the folded corpus, so the caller takes it from here rather
+        // than running the whole chain a second time to arrive at the same bytes.
+        Ok((Rewrites { layers }, carried))
     }
 }
 
-impl Stage {
-    /// This stage's rewrite of every haystack.
-    fn rewrite(&self, device: &DeviceScope, lines: &[&[u8]]) -> Result<Vec<Vec<u8>>, Failure> {
-        if lines.is_empty() {
-            return Ok(Vec::new());
+impl Layer {
+    /// This layer's rewrite of every haystack.
+    fn rewrite(
+        &self,
+        device: &DeviceScope,
+        corpus: &Corpus,
+        spare: Option<Rewrite>,
+    ) -> Result<Corpus<'static>, Failure> {
+        if corpus.is_empty() {
+            return Corpus::gathered(device, std::iter::empty());
         }
-        let haystacks = AnyBytesTape::from_sequences(lines)
-            .map_err(|error| engine_failure("fold staging", error))?;
-        let input_bytes: usize = lines.iter().map(|line| line.len()).sum();
+        let haystacks = corpus.haystacks();
         let bound = self
             .automaton
-            .replace_bound(&self.targets, input_bytes)
+            .replace_bound(&self.targets, corpus.bytes().len())
             .map_err(|error| engine_failure("fold sizing", error))?;
 
-        let mut data = vec![0u8; bound];
-        let mut offsets = vec![0usize; lines.len() + 1];
-        self.automaton
-            .replace_into(
-                device,
-                &haystacks,
-                OverlapPolicy::LeftmostLongest,
-                &self.targets,
-                &mut data,
-                &mut offsets,
-            )
-            .map_err(|error| engine_failure("fold", error))?;
+        // `replace_into` writes a contiguous run and the boundary of every entry in it, which is
+        // the next corpus already, so the slot is handed on rather than split back into one
+        // allocation per line.
+        //
+        // Sized by what the last rewrite needed rather than by `replace_bound`, which is the
+        // widest-expanding needle applied to every input byte and on a Han corpus several times
+        // what a rewrite actually produces. A slot that turns out too small is grown once and the
+        // rewrite runs again - a refusal leaves the true boundaries behind, so the second attempt
+        // asks for the exact size rather than guessing at it.
+        let lines = corpus.len();
+        let mut slot = spare.unwrap_or_else(|| Rewrite::allocate(device, corpus.bytes().len(), 0));
+        slot.grown_to(corpus.bytes().len(), lines + 1);
 
-        Ok((0..lines.len())
-            .map(|index| data[offsets[index]..offsets[index + 1]].to_vec())
-            .collect())
+        let mut capacity = slot.written_capacity();
+        if self
+            .fill(device, &haystacks, &mut slot, capacity, lines)
+            .is_err()
+        {
+            let needed = slot.parts().1[lines];
+            // The bound is the fallback for a backend that refuses before writing any boundary.
+            capacity = match needed > capacity && needed <= bound {
+                true => needed,
+                false => bound,
+            };
+            slot.grown_to(capacity, lines + 1);
+            self.fill(device, &haystacks, &mut slot, capacity, lines)
+                .map_err(|error| engine_failure("fold", error))?;
+        }
+        Ok(Corpus::Rewritten { slot, lines })
     }
 
-    /// Where this stage fires, in the coordinates of the bytes handed to it.
+    /// One rewrite into the first `capacity` bytes of `slot`, reporting only whether it fit.
+    fn fill(
+        &self,
+        device: &DeviceScope,
+        haystacks: &AnyBytesTape<'_>,
+        slot: &mut Rewrite,
+        capacity: usize,
+        lines: usize,
+    ) -> Result<usize, stringzilla::szs::Error> {
+        let (data, offsets) = slot.parts_upto(capacity, lines + 1);
+        self.automaton.replace_into(
+            device,
+            haystacks,
+            OverlapPolicy::LeftmostLongest,
+            &self.targets,
+            data,
+            offsets,
+        )
+    }
+
+    /// Where this layer fires, in the coordinates of the bytes handed to it.
     ///
     /// The same `LeftmostLongest` cover the rewrite uses, so the sites found here are exactly the
     /// substitutions that happened.
-    fn sites(&self, device: &DeviceScope, lines: &[&[u8]]) -> Result<StageMap, Failure> {
+    fn sites(&self, device: &DeviceScope, corpus: &Corpus) -> Result<LayerMap, Failure> {
         let mut sites = Vec::new();
-        let mut starts = vec![0usize; lines.len() + 1];
-        if lines.is_empty() {
-            return Ok(StageMap { sites, starts });
+        let mut starts = vec![0usize; corpus.len() + 1];
+        if corpus.is_empty() {
+            return Ok(LayerMap { sites, starts });
         }
 
-        let haystacks = AnyBytesTape::from_sequences(lines)
-            .map_err(|error| engine_failure("fold staging", error))?;
-        let mut counts = vec![0usize; lines.len()];
-        let total = self
-            .automaton
-            .count_into(
-                device,
-                &haystacks,
-                OverlapPolicy::LeftmostLongest,
-                &mut counts,
-            )
-            .map_err(|error| engine_failure("fold counting", error))?;
-        let mut found = vec![SubstringsMatch::default(); total];
-        let written = self
-            .automaton
-            .find_into(
-                device,
-                &haystacks,
-                OverlapPolicy::LeftmostLongest,
-                &mut found,
-            )
-            .map_err(|error| engine_failure("fold locating", error))?;
-        found.truncate(written);
+        let mut found = cover(
+            &self.automaton,
+            device,
+            corpus,
+            "fold counting",
+            "fold locating",
+        )?;
         // The walk emits in order of match ends and interleaves haystacks, so the ascending order
         // the drift arithmetic needs has to be asked for.
         found.sort_unstable_by_key(|one| (one.haystack_index, one.byte_offset));
@@ -888,10 +1304,10 @@ impl Stage {
             });
             drift += produced as i64 - one.byte_length as i64;
         }
-        for tail in line..lines.len() {
+        for tail in line..corpus.len() {
             starts[tail + 1] = sites.len();
         }
-        Ok(StageMap { sites, starts })
+        Ok(LayerMap { sites, starts })
     }
 }
 
@@ -912,13 +1328,13 @@ enum Edge {
 }
 
 /// One stage's sites, grouped by line.
-struct StageMap {
+struct LayerMap {
     sites: Vec<Site>,
     /// `sites[starts[line]..starts[line + 1]]` are one line's, in ascending offset order.
     starts: Vec<usize>,
 }
 
-impl StageMap {
+impl LayerMap {
     /// Where an offset in this stage's output sits in its input.
     ///
     /// Between rewrites the two domains advance in lockstep and the drift alone answers. Strictly
@@ -955,16 +1371,16 @@ impl StageMap {
 
 /// The whole chain's map, from the bytes the automaton walked back to the caller's own.
 struct Rewrites {
-    stages: Vec<StageMap>,
+    layers: Vec<LayerMap>,
 }
 
 impl Rewrites {
-    /// Carry one offset back through every stage, last applied first.
+    /// Carry one offset back through every layer, last applied first.
     fn backward(&self, line: usize, folded: usize, edge: Edge) -> usize {
-        self.stages
+        self.layers
             .iter()
             .rev()
-            .fold(folded, |offset, stage| stage.backward(line, offset, edge))
+            .fold(folded, |offset, layer| layer.backward(line, offset, edge))
     }
 
     /// Carry a whole match back, so the caller receives a span it can slice directly.
@@ -995,15 +1411,44 @@ struct OutputConfig {
 
 /// One input's lines and the score each earned.
 struct Searched<'a> {
-    lines: Vec<&'a [u8]>,
+    corpus: Corpus<'a>,
     scores: Vec<f32>,
 }
 
-impl<'a> Searched<'a> {
+impl Searched<'_> {
     /// A line matched when it clears the floor, which defaults to any positive score - and a
     /// positive score means "matched" only because every weight is strictly positive.
     fn matched(&self, index: usize, floor: f32) -> bool {
         self.scores[index] > 0.0 && self.scores[index] >= floor
+    }
+
+    /// How many lines matched, without gathering them.
+    ///
+    /// `--show count`, `files` and `files-without` print a tally or a path and never look at a
+    /// line, so on a corpus that mostly matches they would otherwise build a list per input only
+    /// to ask for its length.
+    fn matched_count(&self, floor: f32, top: Option<usize>) -> usize {
+        let matched = (0..self.corpus.len())
+            .filter(|index| self.matched(*index, floor))
+            .count();
+        top.map_or(matched, |top| matched.min(top))
+    }
+
+    /// Every line that matched, trimmed of its terminator and paired with the score it earned.
+    ///
+    /// The scored pass already said which lines these are, so they are gathered once here and
+    /// every output mode reads from the list rather than re-testing the corpus.
+    fn survivors(&self, floor: f32, newlines: Newlines) -> Vec<(usize, &[u8], f32)> {
+        (0..self.corpus.len())
+            .filter(|index| self.matched(*index, floor))
+            .map(|index| {
+                (
+                    index,
+                    trimmed(self.corpus.line(index), newlines),
+                    self.scores[index],
+                )
+            })
+            .collect()
     }
 }
 
@@ -1013,9 +1458,9 @@ fn search_lines<'a>(
     engine: &Engine,
     config: &SearchConfig,
 ) -> Result<Searched<'a>, Failure> {
-    let lines: Vec<&[u8]> = LineIter::new(data, Newlines::from_utf8(config.utf8)).collect();
-    let scores = engine.score(&lines)?;
-    Ok(Searched { lines, scores })
+    let corpus = Corpus::lines_of(&engine.device, data, Newlines::from_utf8(config.utf8))?;
+    let scores = engine.score(&corpus)?;
+    Ok(Searched { corpus, scores })
 }
 
 // endregion: Searching
@@ -1295,7 +1740,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     )
     .map_err(|message| reject(&message))?;
 
-    let folds = resolve_folds(&args.fold, effort.folding(), script)?;
+    let folds = resolve_folds(&args.fold, effort.folding())?;
 
     let config = SearchConfig::resolve(args, effort);
     let engine = Engine::build(&patterns, &config, &keyboard, &folds, device)?;
@@ -1385,13 +1830,12 @@ fn search_inputs<'a>(
 
         // The scored pass already said which lines matched, so the survivors are gathered once and
         // every output mode reads from them rather than re-testing.
-        let mut survivors: Vec<(usize, &[u8], f32)> = found
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| found.matched(*index, config.floor))
-            .map(|(index, line)| (index, *line, found.scores[index]))
-            .collect();
+        // A tally needs no lines behind it, so the modes that print one never gather them.
+        let tallied = matches!(out_cfg.show, Show::Count | Show::Files | Show::FilesWithout);
+        let mut survivors = match tallied {
+            true => Vec::new(),
+            false => found.survivors(config.floor, Newlines::from_utf8(config.utf8)),
+        };
 
         // Ranking is the only place order stops being the file's own, so it is applied once here
         // and every mode below reads the same list.
@@ -1405,7 +1849,10 @@ fn search_inputs<'a>(
             });
             survivors.truncate(top);
         }
-        let count = survivors.len();
+        let count = match tallied {
+            true => found.matched_count(config.floor, config.top),
+            false => survivors.len(),
+        };
 
         match out_cfg.show {
             Show::Count => write_count(output, out_cfg, path, count).at(path)?,
@@ -1427,8 +1874,9 @@ fn search_inputs<'a>(
             // Spans cost a second walk, so they are located only here, and only over the handful of
             // lines that already scored rather than over the whole corpus.
             Show::Matches => {
-                let lines: Vec<&[u8]> = survivors.iter().map(|(_, line, _)| *line).collect();
-                for located in engine.locate(&lines)? {
+                let lines = survivors.iter().map(|(_, line, _)| *line);
+                let selected = Corpus::gathered(&engine.device, lines)?;
+                for located in engine.locate(&selected)? {
                     let (index, line, score) = survivors[located.line_index];
                     let span =
                         &line[located.byte_offset..located.byte_offset + located.byte_length];
@@ -1836,11 +2284,9 @@ mod tests {
         let engine = Engine::build(&patterns, config, &us(), &[], cpu()).expect("engine builds");
         let found = search_lines(data, &engine, config).expect("search runs");
         found
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| found.matched(*index, 0.0))
-            .map(|(_, line)| String::from_utf8_lossy(line).into_owned())
+            .survivors(0.0, Newlines::from_utf8(config.utf8))
+            .into_iter()
+            .map(|(_, line, _)| String::from_utf8_lossy(line).into_owned())
             .collect()
     }
 
@@ -1885,13 +2331,12 @@ mod tests {
         let engine = Engine::build(&patterns, &config, &us(), &[], cpu()).unwrap();
         let found = search_lines(data, &engine, &config).unwrap();
         let survivors: Vec<&[u8]> = found
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| found.matched(*index, 0.0))
-            .map(|(_, line)| *line)
+            .survivors(0.0, Newlines::from_utf8(config.utf8))
+            .into_iter()
+            .map(|(_, line, _)| line)
             .collect();
-        let located = engine.locate(&survivors).unwrap();
+        let selected = Corpus::gathered(&engine.device, survivors.iter().copied()).unwrap();
+        let located = engine.locate(&selected).unwrap();
         assert_eq!(located.len(), 1);
         assert_eq!(located[0].line_index, 0);
         assert_eq!(located[0].byte_offset, 4);
@@ -1948,6 +2393,8 @@ mod tests {
             Effort::Spelling,
             Effort::Accents,
             Effort::Sounds,
+            Effort::Scripts,
+            Effort::Deep,
         ];
         let mut previous: Vec<String> = Vec::new();
         for effort in ladder {
@@ -1968,13 +2415,21 @@ mod tests {
         // The executable form of the zero-cost claim: no fold is resolved, so no automaton is
         // compiled, no rewrite runs and no offset map can exist.
         for effort in [Effort::Exact, Effort::Typos, Effort::Spelling] {
-            let folds = resolve_folds(&[], effort.folding(), Script::Latin).unwrap();
+            let folds = resolve_folds(&[], effort.folding()).unwrap();
             assert!(folds.is_empty(), "{effort:?} resolved a fold");
         }
         for effort in [Effort::Accents, Effort::Sounds] {
-            let folds = resolve_folds(&[], effort.folding(), Script::Latin).unwrap();
+            let folds = resolve_folds(&[], effort.folding()).unwrap();
             assert!(!folds.is_empty(), "{effort:?} resolved no fold");
         }
+        // And the claim is about what gets built, not only about what gets named.
+        let patterns = vec!["color".to_string()];
+        let config = config(1);
+        let engine = Engine::build(&patterns, &config, &us(), &[], cpu()).expect("engine builds");
+        assert!(
+            engine.folder.is_none(),
+            "an empty chain compiled an automaton"
+        );
     }
 
     #[test]
@@ -2017,7 +2472,7 @@ mod tests {
             original_offset: 4,
             original_length: 2,
         };
-        let map = StageMap {
+        let map = LayerMap {
             sites: vec![site],
             starts: vec![0, 1],
         };
@@ -2032,7 +2487,7 @@ mod tests {
     fn maps_a_deleting_rule_to_the_bytes_it_removed() {
         // An empty replacement leaves a zero-width mark: the offset is both on the site and after
         // it, and only the edge says which original boundary it names.
-        let map = StageMap {
+        let map = LayerMap {
             sites: vec![Site {
                 folded_offset: 2,
                 folded_length: 0,
@@ -2046,34 +2501,227 @@ mod tests {
     }
 
     #[test]
+    /// Two folds share a walk only when neither can pick up where the other leaves off.
+    #[test]
+    fn fuses_only_folds_that_cannot_see_each_other() {
+        // The predicate reads a chain whose sources are already spent, since that is the only
+        // state it is ever applied to - `Hant-Latin` and `Han-Latin` share 101 characters until
+        // the first of them claims them.
+        let pair = |first: &str, second: &str| {
+            let loaded = Fold::load_all(&[first, second]);
+            let chain = spend_sources(&loaded);
+            fusable(&chain[0], &chain[1])
+        };
+        let named = |name: &str| Fold::load(name);
+        assert!(pair("Hant-Latin", "Han-Latin"));
+        assert!(pair("Cyrillic-Latin", "Greek-Latin"));
+        // Six `Kana-Latin` rules are sourced on a Latin vowel before U+30FC, so anything that
+        // emits a Latin vowel feeds it.
+        assert!(!fusable(&named("Han-Latin"), &named("Kana-Latin")));
+        // `Latin-ASCII` strips exactly the tone marks `Han-Latin` emits.
+        assert!(!fusable(&named("Han-Latin"), &named("Latin-ASCII")));
+        // And phonetics read the Latin that de-accenting produces.
+        assert!(!fusable(&named("Latin-ASCII"), &named("Latin-Phonetic")));
+    }
+
+    /// Spending a source is what lets folds share a walk, and it is keyed on exact bytes: `А` and
+    /// `а` are different rules with different replacements.
+    #[test]
+    fn spends_a_source_on_the_fold_that_claims_it_first() {
+        let folds = Fold::load_all(&["Hant-Latin", "Han-Latin"]);
+        let chain = spend_sources(&folds);
+        assert_eq!(
+            chain[0].sources.len(),
+            101,
+            "the specialisation keeps all of its rules"
+        );
+        assert_eq!(
+            chain[1].sources.len(),
+            folds[1].sources.len() - 101,
+            "and the general table loses exactly the ones already spent"
+        );
+
+        // Case is not a source of identity here: every rule that differs only by case survives.
+        let cyrillic = Fold::load("Cyrillic-Latin");
+        let alone = spend_sources(std::slice::from_ref(&cyrillic));
+        assert_eq!(alone[0].sources.len(), cyrillic.sources.len());
+    }
+
+    /// The buffers a fold writes into outlive the file that sized them.
+    #[test]
+    fn folds_a_second_file_without_allocating_again() {
+        let (engine, config) = engine_at(Effort::Sounds, "phonetic");
+        let folder = engine.folder.as_ref().expect("Sounds folds");
+
+        // A wide file first, so the slots are grown to fit it.
+        let wide =
+            "phonetic analysis of a fairly long line, repeated to give the fold work\n".repeat(64);
+        search_lines(wide.as_bytes(), &engine, &config).expect("wide file scores");
+        let after_wide = folder.spare_capacity();
+        assert!(
+            after_wide.iter().all(|bytes| *bytes > 0),
+            "no slot came back from the first file: {after_wide:?}"
+        );
+
+        // Then a narrow one, which must fit in what the wide one left behind.
+        search_lines(b"phonetic\n", &engine, &config).expect("narrow file scores");
+        assert_eq!(
+            folder.spare_capacity(),
+            after_wide,
+            "the second file grew a buffer it should have reused"
+        );
+    }
+
+    /// The partition the shipped tables produce, so a table edit that changes it has to say so.
+    #[test]
+    fn partitions_the_transliterations_into_one_layer() {
+        let device = cpu();
+        let named: Vec<String> = [
+            "Kana-Latin",
+            "Hant-Latin",
+            "Han-Latin",
+            "Cyrillic-Latin",
+            "Greek-Latin",
+            "Latin-ASCII",
+            "Latin-Phonetic",
+        ]
+        .iter()
+        .map(|one| one.to_string())
+        .collect();
+        let folds = resolve_folds(&named, Folding::Untouched).expect("folds resolve");
+        let folder =
+            Folder::new(&device, &folds, CaseSensitivity::Uncased).expect("layers compile");
+
+        // Kana leads alone - six of its rules read a Latin vowel, so anything emitting one feeds
+        // it. The four script transforms then share a walk. `Latin-ASCII` strips the tone marks
+        // they emit, and phonetics read what it leaves.
+        let sizes: Vec<usize> = folder.layers.iter().map(|one| one.targets.len()).collect();
+        assert_eq!(sizes.len(), 4, "seven folds, four walks: {sizes:?}");
+        assert_eq!(sizes[0], 292, "Kana-Latin, less its 143 duplicated sources");
+        assert_eq!(
+            sizes[1], 44_774,
+            "Hant 101 + Han 44,568 + Cyrillic 52 + Greek 53 - the count that catches a dedupe \
+             keyed on case, which would silently drop one rule of every cased pair"
+        );
+        assert_eq!(sizes[2], 1_223, "Latin-ASCII");
+        assert_eq!(sizes[3], 47, "Latin-Phonetic");
+    }
+
+    /// The property the whole partition rests on: fusing changes how many walks run, and nothing
+    /// else. Checked on the bytes and on the map, because a wrongly fused pair reports spans
+    /// against the wrong original rather than failing.
+    #[test]
+    fn fusing_reproduces_the_sequence_it_replaced() {
+        let device = cpu();
+        // Named rather than taken from a rung, so the chain holds several transliterations and the
+        // partition has something to fuse.
+        let named: Vec<String> = [
+            "Kana-Latin",
+            "Hant-Latin",
+            "Han-Latin",
+            "Cyrillic-Latin",
+            "Greek-Latin",
+            "Latin-ASCII",
+            "Latin-Phonetic",
+        ]
+        .iter()
+        .map(|one| one.to_string())
+        .collect();
+        let folds = resolve_folds(&named, Folding::Untouched).expect("folds resolve");
+
+        // Every needle of the small folds and a stride through the large one, then every needle
+        // glued to the next - the boundaries a merged automaton could straddle that a sequence
+        // never crossed. Sampling keeps all 101 `Hant-Latin` rules, which is where the conflicts
+        // that matter live.
+        let mut probes: Vec<String> = folds
+            .iter()
+            .flat_map(|fold| {
+                let stride = 1 + fold.sources.len() / 500;
+                fold.sources.iter().step_by(stride).cloned()
+            })
+            .collect();
+        let glued: Vec<String> = probes.windows(2).map(|pair| pair.concat()).collect();
+        probes.extend(glued);
+        let lines: Vec<&[u8]> = probes.iter().map(|one| one.as_bytes()).collect();
+
+        for case_sensitivity in [CaseSensitivity::Cased, CaseSensitivity::Uncased] {
+            let fused = Folder::new(&device, &folds, case_sensitivity).expect("layers compile");
+            let serial =
+                Folder::sequential(&device, &folds, case_sensitivity).expect("stages compile");
+            assert!(
+                fused.layers.len() < serial.layers.len(),
+                "seven folds should not need seven walks, got {}",
+                fused.layers.len()
+            );
+
+            let corpus = Corpus::gathered(&device, lines.iter().copied()).expect("corpus gathers");
+            let by_layer = fused.apply(&device, &corpus).expect("fused folds");
+            let by_stage = serial.apply(&device, &corpus).expect("sequential folds");
+            assert_eq!(by_layer.len(), by_stage.len());
+            for index in 0..by_layer.len() {
+                assert_eq!(
+                    by_layer.line(index),
+                    by_stage.line(index),
+                    "line {index} folded differently under fusion"
+                );
+            }
+
+            // The maps too: an offset carried back must land on the same original byte.
+            let (fused_map, _) = fused.rewrites(&device, &corpus).expect("fused map");
+            let (serial_map, _) = serial.rewrites(&device, &corpus).expect("sequential map");
+            for index in 0..by_layer.len() {
+                let folded_length = by_layer.line(index).len();
+                for offset in 0..=folded_length {
+                    // A start edge answers at any offset; an end edge only ever answers at the far
+                    // side of a match, so offset zero is not a question `located` can ask.
+                    let edges: &[Edge] = match offset {
+                        0 => &[Edge::Start],
+                        _ => &[Edge::Start, Edge::End],
+                    };
+                    for edge in edges {
+                        assert_eq!(
+                            fused_map.backward(index, offset, *edge),
+                            serial_map.backward(index, offset, *edge),
+                            "line {index} {:?} offset {offset} maps back differently",
+                            String::from_utf8_lossy(by_layer.line(index))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn chains_transliteration_before_phonetics() {
-        // `Latin-Phonetic` has nothing to act on until the script transform has produced a Latin
-        // syllable, so the order is a property of the level rather than of the caller.
-        assert_eq!(
-            Folding::Scripts.transforms(Script::Han),
-            ["Han-Latin", "Latin-ASCII", "Latin-Phonetic"]
-        );
-        assert_eq!(
-            Folding::Untouched.transforms(Script::Han),
-            Vec::<&str>::new()
-        );
-        // A Latin query has nothing to transliterate, so the chain is shorter by one.
-        assert_eq!(
-            Folding::Scripts.transforms(Script::Latin),
-            ["Latin-ASCII", "Latin-Phonetic"]
-        );
+        let chain = Folding::Scripts.transforms();
+        let at = |name: &str| chain.iter().position(|one| *one == name).expect(name);
+
+        // Every embedded transliteration is reached, not just the one the query is written in.
+        for name in Script::TRANSLITERATIONS {
+            assert!(chain.contains(&name), "{name} is not on the widest rung");
+        }
+        // `Latin-ASCII` strips the tone marks the transliterations emit, and `Latin-Phonetic` has
+        // nothing to act on until a Latin syllable exists, so both follow all of them.
+        let accents = at("Latin-ASCII");
+        for name in Script::TRANSLITERATIONS {
+            assert!(at(name) < accents, "{name} must precede Latin-ASCII");
+        }
+        assert!(accents < at("Latin-Phonetic"));
+        // Kana leads, since anything that emits a Latin vowel feeds it; Hant precedes Han, or
+        // spending would leave it with no rules of its own.
+        assert_eq!(at("Kana-Latin"), 0);
+        assert!(at("Hant-Latin") < at("Han-Latin"));
+
+        assert_eq!(Folding::Untouched.transforms(), Vec::<&str>::new());
     }
 
     #[test]
     fn embeds_every_transform_the_ladder_names() {
-        for script in Script::ALL {
-            for folding in [Folding::Accents, Folding::Sounds, Folding::Scripts] {
-                let resolved = resolve_folds(&[], folding, script);
-                assert!(
-                    resolved.is_ok(),
-                    "{script:?} at {folding:?} names a transform that is not embedded"
-                );
-            }
+        for folding in [Folding::Accents, Folding::Sounds, Folding::Scripts] {
+            let resolved = resolve_folds(&[], folding);
+            assert!(
+                resolved.is_ok(),
+                "{folding:?} names a transform that is not embedded"
+            );
         }
     }
 
@@ -2082,11 +2730,9 @@ mod tests {
         let (engine, config) = engine_at(effort, pattern);
         let found = search_lines(data, &engine, &config).expect("search runs");
         found
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| found.matched(*index, 0.0))
-            .map(|(_, line)| String::from_utf8_lossy(line).into_owned())
+            .survivors(0.0, Newlines::from_utf8(config.utf8))
+            .into_iter()
+            .map(|(_, line, _)| String::from_utf8_lossy(line).into_owned())
             .collect()
     }
 
@@ -2095,14 +2741,14 @@ mod tests {
         let (engine, config) = engine_at(effort, pattern);
         let found = search_lines(data, &engine, &config).expect("search runs");
         let survivors: Vec<&[u8]> = found
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| found.matched(*index, 0.0))
-            .map(|(_, line)| *line)
+            .survivors(0.0, Newlines::from_utf8(config.utf8))
+            .into_iter()
+            .map(|(_, line, _)| line)
             .collect();
+        let selected =
+            Corpus::gathered(&engine.device, survivors.iter().copied()).expect("corpus gathers");
         engine
-            .locate(&survivors)
+            .locate(&selected)
             .expect("locate runs")
             .into_iter()
             .map(|one| {
@@ -2123,7 +2769,7 @@ mod tests {
             floor: 0.0,
             top: None,
         };
-        let folds = resolve_folds(&[], effort.folding(), Script::Latin).expect("folds resolve");
+        let folds = resolve_folds(&[], effort.folding()).expect("folds resolve");
         let patterns = vec![pattern.to_string()];
         let engine =
             Engine::build(&patterns, &config, &us(), &folds, cpu()).expect("engine builds");
