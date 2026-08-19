@@ -9,8 +9,9 @@
 //! wider or narrower than the pattern — `ß` folds to `ss`, `İ` to `i` — and the cursor advances by
 //! the matched length rather than the pattern's.
 //!
-//! Exit: 0 replaced something, 1 ran and matched nothing, 2 could not run, 3 the file or the name
-//! moved and the caller should read again.
+//! Exit: 0 produced a stream, 1 produced none, 2 could not run, 3 the file or the name
+//! moved and the caller should read again. `--quiet` changes what is printed, never what is
+//! reported.
 
 use std::io::{self, Read, Write};
 
@@ -128,8 +129,8 @@ struct Args {
     #[arg(long, help_heading = "Output Formats")]
     summary: bool,
 
-    /// Suppress all output; exit 0 if anything was replaced, 1 otherwise
-    #[arg(long, conflicts_with = "summary", help_heading = "Output Formats")]
+    /// Suppress all output; exit 0 if a stream was produced, 1 otherwise
+    #[arg(long, help_heading = "Output Formats")]
     quiet: bool,
 }
 
@@ -737,7 +738,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     validate(args)?;
 
     let path = args.input.as_deref().unwrap_or("-");
-    let counting_only = args.dry_run || args.quiet;
+    let counting_only = args.dry_run;
     let reports_hashes = args.summary || args.dry_run || args.format == Format::Json;
 
     // A run reads an unbounded input into memory only when it must know something about the
@@ -1118,12 +1119,15 @@ mod tests {
             vec!["--dry-run", "--output", "o"],
             vec!["--dry-run", "--in-place"],
             vec!["--in-place", "--output", "o"],
-            vec!["--quiet", "--summary"],
             vec!["--quiet", "--in-place"],
             vec!["--dry-run", "--summary"],
         ] {
             assert!(!accepts(&flags), "expected {:?} to be rejected", flags);
         }
+        assert!(
+            accepts(&["--quiet", "--summary"]),
+            "--quiet governs stdout, and a summary is written to stderr"
+        );
     }
 
     #[test]

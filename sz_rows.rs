@@ -643,7 +643,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     // place in a stream of per-row records a whole-file value belongs.
     if let Some(hash) = file_hash.filter(|_| config.json && !args.quiet) {
         let mut buffer = [0u8; HASH_CHARS];
-        write!(output, r#"{{"type":"end","data":{{"path":"#).at("-")?;
+        write!(output, r#"{{"type":"summary","data":{{"path":"#).at("-")?;
         json_text_field_to(output, path.as_bytes()).at("-")?;
         writeln!(
             output,
@@ -868,6 +868,14 @@ mod tests {
                 arguments
             );
         }
+    }
+
+    #[test]
+    fn declares_no_short_flags() {
+        assert!(Args::command()
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
     }
 
     #[test]

@@ -8,7 +8,8 @@
 //! Counting measures rather than searches, so an empty input is a successful answer: a row of
 //! zeros and exit 0, where the tools that search exit 1 on finding nothing.
 //!
-//! Exit: 0 counted, 1 only under `--quiet` with nothing to report, 2 could not run.
+//! Exit: 0 counted a row, 1 ran and counted none, 2 could not run, which includes any named
+//! input that could not be read. `--quiet` changes what is printed, never what is reported.
 
 use std::borrow::Cow;
 use std::fs::{self, File};
@@ -59,7 +60,7 @@ struct Args {
     )]
     format: Format,
 
-    /// Suppress all output; exit 0 if anything was counted, 1 otherwise
+    /// Suppress all output; exit 0 if any row was produced, 1 otherwise
     #[arg(long, conflicts_with_all = ["format", "fields"], help_heading = "Output Formats")]
     quiet: bool,
 
@@ -97,7 +98,7 @@ enum Field {
     Words,
     /// Bytes, terminators included.
     Bytes,
-    /// Unicode code points, which needs `--utf8`.
+    /// Unicode code points.
     Chars,
     /// The longest line's width, terminator excluded.
     MaxLineLength,
@@ -109,11 +110,18 @@ enum Format {
     /// Aligned columns with comma-grouped digits.
     Table,
     /// Aligned columns with plain digits.
+    #[value(alias = "text")]
     Plain,
     /// Aligned columns with K/M/G/T suffixes.
     Human,
     /// JSON Lines with untruncated paths and bare integers.
     Json,
+}
+
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
 }
 
 /// The one constraint clap cannot express: `conflicts_with` fires on a flag's
@@ -781,7 +789,7 @@ fn write_total_json(
     counts: &Counts,
     fields: Fields,
 ) -> io::Result<()> {
-    write!(output, r#"{{"type":"total","data":{{"files":{}"#, files)?;
+    write!(output, r#"{{"type":"summary","data":{{"files":{}"#, files)?;
     for (header, value) in counts.columns(fields) {
         write!(output, r#","{}":{}"#, header, value)?;
     }
@@ -932,12 +940,11 @@ fn push_row(
 /// Count every input, in the order they were named.
 fn gather(
     inputs: &[String],
-    globs: Option<&[String]>,
+    globs: Option<&[glob::Pattern]>,
     traversal: &TraversalOptions<'_>,
     counter: Counter,
     failures: &mut usize,
 ) -> Report {
-    let globs = globs.map(|patterns| compile_globs(patterns, "sz-count"));
     let resolved = resolve_inputs(inputs, failures);
     let mut report = Report {
         rows: Vec::new(),
@@ -953,7 +960,7 @@ fn gather(
         } else {
             format!("{}/", text)
         });
-        for (path, _) in walk_files(directory, traversal, globs.as_deref(), "sz-count", failures) {
+        for (path, _) in walk_files(directory, traversal, globs, "sz-count", failures) {
             let name = path
                 .strip_prefix(directory)
                 .unwrap_or(&path)
@@ -985,9 +992,7 @@ fn gather(
                 push_row(&mut report, counter, path, name, failures);
             }
             Resolved::Directory(directory) => {
-                for (path, _) in
-                    walk_files(directory, traversal, globs.as_deref(), "sz-count", failures)
-                {
+                for (path, _) in walk_files(directory, traversal, globs, "sz-count", failures) {
                     let name = path.display().to_string();
                     push_row(&mut report, counter, &path, name, failures);
                 }
@@ -997,27 +1002,10 @@ fn gather(
     report
 }
 
-/// Whether every selected measurement came out zero, which is what `--quiet` reports as
-/// "nothing was counted". A row exists for every readable input, so its presence alone only
-/// says the file opened.
-fn report_is_empty(report: &Report) -> bool {
-    report
-        .rows
-        .iter()
-        .all(|row| row.counts.values().iter().all(|value| *value == 0))
-}
-
-/// The status a finished run reports. Nothing readable did not complete; nothing
-/// counted completed and found nothing.
+/// The status a finished run reports, from the count of inputs that could not be read and
+/// whether any row survived.
 fn outcome(report: &Report, failures: usize) -> Status {
-    let emitted = !report.rows.is_empty();
-    if emitted {
-        Status::Success
-    } else if failures > 0 {
-        Status::Error
-    } else {
-        Status::NoResult
-    }
+    Status::of(failures > 0, !report.rows.is_empty())
 }
 
 // endregion: Input Processing
@@ -1038,23 +1026,20 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     };
 
     let mut failures = 0;
+    let globs = args
+        .glob
+        .as_deref()
+        .map(compile_globs)
+        .transpose()
+        .map_err(reject)?;
     let counted = gather(
         &args.inputs,
-        args.glob.as_deref(),
+        globs.as_deref(),
         &traversal,
         counter,
         &mut failures,
     );
     let status = outcome(&counted, failures);
-
-    // Under `--quiet` the status is the whole output, and "anything was counted" means a
-    // non-zero tally rather than a readable file — a run over empty files completes and
-    // finds nothing, which is what exit 1 says.
-    let status = if args.quiet && status == Status::Success && report_is_empty(&counted) {
-        Status::NoResult
-    } else {
-        status
-    };
 
     if status == Status::Success && !args.quiet {
         let config = OutputConfig {
@@ -1427,8 +1412,8 @@ mod tests {
         );
         assert!(outcome(&report, failures) == Status::Success);
 
-        // A missing input warns and still counts its neighbour, so only the run that
-        // read nothing at all is incomplete.
+        // A missing input still counts its neighbour, and still reports a run that did not
+        // complete: a caller cannot tell a partial answer from a whole one by exit code alone.
         let mut failures = 0;
         let report = counted(
             &[
@@ -1440,7 +1425,7 @@ mod tests {
             &mut failures,
         );
         assert_eq!(report.rows.len(), 1);
-        assert!(outcome(&report, failures) == Status::Success);
+        assert!(outcome(&report, failures) == Status::Error);
 
         let mut failures = 0;
         let report = counted(&["sz-count", "--quiet", "no-such-file"], &mut failures);
@@ -1477,6 +1462,14 @@ mod tests {
                 arguments
             );
         }
+    }
+
+    #[test]
+    fn declares_no_short_flags() {
+        assert!(Args::command()
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
     }
 
     #[test]

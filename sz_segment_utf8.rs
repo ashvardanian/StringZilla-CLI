@@ -10,7 +10,8 @@
 //! and is defined only over the tilers, since a packed span cannot reinsert a discarded separator.
 //! A segment larger than the budget is emitted whole.
 //!
-//! Exit: 0 emitted a record, 1 emitted none, 2 could not run.
+//! Exit: 0 emitted a record, 1 emitted none, 2 could not run, which includes any named input
+//! that could not be read, whatever its readable neighbours produced.
 
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
@@ -581,10 +582,9 @@ fn segment_input(
 /// Collect the files named by the inputs, walking directories with ignore support.
 fn resolve_inputs(
     inputs: &[String],
-    globs: Option<&[String]>,
+    globs: Option<&[glob::Pattern]>,
     traversal: &TraversalOptions<'_>,
 ) -> Vec<String> {
-    let globs = globs.map(|patterns| compile_globs(patterns, "sz-segment-utf8"));
     let mut resolved = Vec::new();
     for input in inputs {
         let path = Path::new(input);
@@ -604,7 +604,7 @@ fn resolve_inputs(
                 continue;
             }
             // The walker has no glob filter of its own, so `--glob` is applied here.
-            if !glob_selects(globs.as_deref(), &entry) {
+            if !glob_selects(globs, &entry) {
                 continue;
             }
             resolved.push(entry.path().display().to_string());
@@ -615,14 +615,10 @@ fn resolve_inputs(
 
 // endregion: Inputs
 
-/// The status a finished run reports. Named inputs that all failed to read did not
-/// complete; a filter that selected nothing completed and found nothing.
+/// The status a finished run reports, from whether any named input went unread and whether
+/// any record survived the filter.
 fn outcome(inputs: usize, readable: usize, records: usize) -> Status {
-    if inputs > 0 && readable == 0 {
-        Status::Error
-    } else {
-        Status::from_found(records > 0)
-    }
+    Status::of(readable < inputs, records > 0)
 }
 
 fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
@@ -637,7 +633,13 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         max_depth: args.max_depth,
         file_type: args.file_type.as_deref(),
     };
-    let inputs = resolve_inputs(&args.inputs, args.glob.as_deref(), &traversal);
+    let globs = args
+        .glob
+        .as_deref()
+        .map(compile_globs)
+        .transpose()
+        .map_err(reject)?;
+    let inputs = resolve_inputs(&args.inputs, globs.as_deref(), &traversal);
     let mut records = 0;
     let mut readable = 0;
 
@@ -1035,11 +1037,20 @@ mod tests {
 
     #[test]
     fn separates_an_empty_filter_from_an_unreadable_input() {
-        // A `--glob` that matched nothing used to exit 2 with no message at all.
+        // A `--glob` that matched nothing resolves to no inputs at all, which is a run that
+        // completed and found nothing — not a run that failed. That distinction is the whole
+        // point of this test: it once exited 2 with no message.
         assert!(outcome(0, 0, 0) == Status::NoResult);
+
+        // An input that could not be read is a run that did not complete, whether it was the
+        // only one or had readable neighbours that produced records.
         assert!(outcome(2, 0, 0) == Status::Error);
-        assert!(outcome(2, 1, 0) == Status::NoResult);
-        assert!(outcome(2, 1, 5) == Status::Success);
+        assert!(outcome(2, 1, 0) == Status::Error);
+        assert!(outcome(2, 1, 5) == Status::Error);
+
+        // Everything readable, so only the record count decides.
+        assert!(outcome(2, 2, 0) == Status::NoResult);
+        assert!(outcome(2, 2, 5) == Status::Success);
     }
 
     #[test]

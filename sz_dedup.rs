@@ -22,8 +22,8 @@
 //!
 //! Every line keeps the terminator it arrived with, so nothing but the duplicates changes.
 //!
-//! Exit: 0 wrote a line, or under `--in-place` actually dropped one; 1 neither happened;
-//! 2 could not run.
+//! Exit: 0 wrote a line, 1 wrote none, 2 could not run. `--quiet` changes what is printed,
+//! never what is reported.
 
 use std::cmp::Ordering;
 use std::io::{self, Write};
@@ -187,13 +187,6 @@ fn lines_equal(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
 struct DedupCounts {
     total: usize,
     unique: usize,
-}
-
-impl DedupCounts {
-    /// Whether any duplicate was dropped, which is what `--quiet` reports.
-    fn dropped_any(self) -> bool {
-        self.unique < self.total
-    }
 }
 
 /// Lines paired with the span they occupy, terminator included, so a caller that
@@ -367,8 +360,8 @@ struct Args {
     #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
-    /// Suppress all output; exit 0 if any duplicate was dropped, 1 otherwise
-    #[arg(long, conflicts_with_all = ["output", "dry_run", "null", "summary"], help_heading = "Output Formats")]
+    /// Suppress all output; exit 0 if any line was written, 1 otherwise
+    #[arg(long, conflicts_with_all = ["output", "dry_run", "null"], help_heading = "Output Formats")]
     quiet: bool,
 }
 
@@ -465,11 +458,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     }
     output.flush().at("-")?;
 
-    Ok(if args.quiet {
-        Status::from_found(counts.dropped_any())
-    } else {
-        Status::from_found(counts.unique > 0)
-    })
+    Ok(Status::from_found(counts.unique > 0))
 }
 
 // endregion: CLI
@@ -655,7 +644,6 @@ mod tests {
             vec!["--in-place", "--null"],
             vec!["--in-place", "--output", "o"],
             vec!["--in-place", "--dry-run"],
-            vec!["--quiet", "--summary"],
             vec!["--quiet", "--format", "json"],
             vec!["--null", "--format", "json"],
             vec!["--summary", "--dry-run"],
@@ -665,6 +653,10 @@ mod tests {
         assert!(
             accepts(&["--summary", "--format", "json"]),
             "--summary names the record json already emits"
+        );
+        assert!(
+            accepts(&["--quiet", "--summary"]),
+            "--quiet governs stdout, and a summary is written to stderr"
         );
     }
 

@@ -481,6 +481,14 @@ mod tests {
     }
 
     #[test]
+    fn declares_no_short_flags() {
+        assert!(Args::command()
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    #[test]
     fn declares_the_expected_flags() {
         let mut command = Args::command();
         command.build();

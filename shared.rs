@@ -1518,17 +1518,18 @@ pub fn walker(root: &Path, options: &TraversalOptions<'_>, tool: &str) -> ignore
     builder.build()
 }
 
-/// Compile each glob once, so a malformed one is reported here rather than silently matching
-/// nothing on every file of a walk. `tool` names the reporter, as [`walker`] does.
-pub fn compile_globs(patterns: &[String], tool: &str) -> Vec<glob::Pattern> {
+/// Compile each glob once, so a malformed one is refused here rather than silently matching
+/// nothing on every file of a walk — a dropped pattern and a pattern that selects nothing are
+/// different answers, and only the second is a result.
+///
+/// The message comes back rather than being printed, because only the caller can render a
+/// usage error the way clap renders a parse failure.
+pub fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, String> {
     patterns
         .iter()
-        .filter_map(|pattern| match glob::Pattern::new(pattern) {
-            Ok(compiled) => Some(compiled),
-            Err(error) => {
-                eprintln!("{tool}: invalid glob '{}': {}", pattern, error);
-                None
-            }
+        .map(|pattern| {
+glob::Pattern::new(pattern)
+                .map_err(|error| format!("invalid glob '{}': {}", pattern, error))
         })
         .collect()
 }
@@ -1603,6 +1604,20 @@ pub enum Status {
 pub const REFUSED_EXIT_CODE: u8 = 3;
 
 impl Status {
+    /// The status a finished run reports.
+    ///
+    /// An input that could not be read means the run did not complete, whatever its readable
+    /// siblings produced — the answer `grep` gives, and the only one a caller can act on
+    /// without re-reading stderr.
+    #[inline]
+    pub fn of(any_input_failed: bool, produced: bool) -> Self {
+        if any_input_failed {
+            Status::Error
+        } else {
+            Status::from_found(produced)
+        }
+    }
+
     /// Map a "found something" flag to the success/no-result pair.
     #[inline]
     pub fn from_found(found: bool) -> Self {

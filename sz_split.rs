@@ -6,7 +6,7 @@
 //!
 //! Every chunk is a verbatim byte range of the input. Nothing is re-emitted line by line, so CR,
 //! CRLF, NEL, LS and PS survive and an input that never ended in a terminator does not gain one.
-//! `--header-lines` repeats a prefix into each chunk, which is the one case where a chunk is not a
+//! `--repeat-header` repeats a prefix into each chunk, which is the one case where a chunk is not a
 //! single contiguous range.
 //!
 //! Exit: 0 wrote a chunk, 1 wrote none, 2 could not run.
@@ -88,6 +88,10 @@ struct Args {
     /// NUL-terminate each announced path instead of newline, for `xargs -0`
     #[arg(long, help_heading = "Output Formats")]
     null: bool,
+
+    /// Suppress all output; exit 0 if any chunk was written, 1 otherwise
+    #[arg(long, conflicts_with_all = ["format", "null"], help_heading = "Output Formats")]
+    quiet: bool,
 }
 
 /// How a written chunk is announced.
@@ -96,6 +100,7 @@ enum Format {
     /// Nothing, so a run that asked for no announcement writes no stdout at all.
     None,
     /// The path alone, one per record.
+    #[value(alias = "text")]
     Paths,
     /// A JSON Lines record carrying the tallies.
     Json,
@@ -838,6 +843,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let emitted = {
         let mut discarded = io::sink();
         let manifest: &mut dyn Write = match args.format {
+            _ if args.quiet => &mut discarded,
             Format::None => &mut discarded,
             _ => &mut *output,
         };
@@ -1010,6 +1016,7 @@ mod tests {
                 "suffix-length",
                 "format",
                 "null",
+                "quiet",
                 "help",
                 "version",
             ],

@@ -10,7 +10,7 @@
 //! itself. `argsort_by` reaches the lines through a callback, so neither form needs a materialized
 //! slice array.
 //!
-//! Exit: 0 wrote a line, 1 wrote none or `--check` found the input unsorted, 2 could not run.
+//! Exit: 0 wrote a line, 1 wrote none or `--is-sorted` found the input unsorted, 2 could not run.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -243,7 +243,7 @@ struct Args {
 
     /// Report through the exit code whether the input is already sorted
     #[arg(long, conflicts_with_all = ["output", "in_place", "dry_run", "unique", "null", "format", "summary"])]
-    check: bool,
+    is_sorted: bool,
 
     /// Treat the input as UTF-8 text
     #[arg(long)]
@@ -262,7 +262,7 @@ struct Args {
     null: bool,
 
     /// Suppress all output; exit 0 if any line was sorted, 1 otherwise
-    #[arg(long, conflicts_with_all = ["output", "dry_run", "null", "summary", "format"], help_heading = "Output Formats")]
+    #[arg(long, conflicts_with_all = ["output", "dry_run", "null", "format"], help_heading = "Output Formats")]
     quiet: bool,
 }
 
@@ -318,7 +318,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         .map_err(|error| io::Error::other(format!("indexing lines: {:?}", error)))
         .at(path)?;
 
-    if args.check {
+    if args.is_sorted {
         return Ok(match check_sorted(&lines, order) {
             None => Status::Success,
             Some(line_number) => {
@@ -560,7 +560,7 @@ mod tests {
                 "reverse",
                 "unique",
                 "ignore-case",
-                "check",
+                "is-sorted",
                 "utf8",
                 "format",
                 "summary",
@@ -579,16 +579,16 @@ mod tests {
     }
 
     #[test]
-    fn keeps_check_alone_and_rejects_the_flags_it_discards() {
-        assert!(accepts(&["--check"]));
+    fn keeps_is_sorted_alone_and_rejects_the_flags_it_discards() {
+        assert!(accepts(&["--is-sorted"]));
         for flags in [
-            vec!["--check", "--output", "o"],
-            vec!["--check", "--in-place"],
-            vec!["--check", "--dry-run"],
-            vec!["--check", "--unique"],
-            vec!["--check", "--null"],
-            vec!["--check", "--format", "json"],
-            vec!["--check", "--summary"],
+            vec!["--is-sorted", "--output", "o"],
+            vec!["--is-sorted", "--in-place"],
+            vec!["--is-sorted", "--dry-run"],
+            vec!["--is-sorted", "--unique"],
+            vec!["--is-sorted", "--null"],
+            vec!["--is-sorted", "--format", "json"],
+            vec!["--is-sorted", "--summary"],
         ] {
             assert!(!accepts(&flags), "expected {:?} to be rejected", flags);
         }
@@ -616,13 +616,16 @@ mod tests {
         for flags in [
             vec!["--quiet", "--format", "json"],
             vec!["--quiet", "--null"],
-            vec!["--quiet", "--summary"],
             vec!["--quiet", "--output", "o"],
             vec!["--quiet", "--dry-run"],
             vec!["--quiet", "--in-place"],
         ] {
             assert!(!accepts(&flags), "expected {:?} to be rejected", flags);
         }
+        assert!(
+            accepts(&["--quiet", "--summary"]),
+            "--quiet governs stdout, and a summary is written to stderr"
+        );
     }
 
     #[test]

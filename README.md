@@ -94,6 +94,10 @@ $ alias gnu-sha256sum=/opt/homebrew/bin/gsha256sum # GNU coreutils 9.11
 
 ## Tools
 
+Two input shapes run through the suite.
+`sz-find`, `sz-count`, `sz-segment-utf8` and `sz-sha256` take any number of files or directories and walk them, gitignore-aware, under `--glob`, `--type`, `--max-depth`, `--hidden`, `--no-ignore` and `--follow`; each emits one record per file, tagged by path.
+The rest take a single input, because they rewrite a stream rather than report on it — `--in-place` has no meaning spread over many files, and `sz-split` already spends its second argument on the output prefix.
+
 ### `sz-find`: Unicode Aware Substring Search
 
 A `grep`-like tool using literal substring matching (not regex) for maximum speed.
@@ -402,7 +406,7 @@ $ sz-sort --reverse file.txt           # descending (replaces: sort -r)
 $ sz-sort --unique file.txt            # sorted and deduplicated (replaces: sort -u)
 $ sz-sort --ignore-case file.txt       # full Unicode folding (replaces: sort -f)
 $ sz-sort file.txt --output sorted.txt # to a file (replaces: sort -o)
-$ sz-sort --check file.txt             # exit 1 unless already sorted (replaces: sort -c)
+$ sz-sort --is-sorted file.txt          # exit 1 unless already sorted (replaces: sort -c)
 ```
 
 Lines are held as packed offset and length pairs borrowing the input rather than copies of it.

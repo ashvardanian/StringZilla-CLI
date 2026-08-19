@@ -10,7 +10,8 @@
 //! `sz-replace --expect-hash` compares against. The file token is written only after the whole
 //! input has been read, so it names what was actually seen.
 //!
-//! Exit: 0 found something, 1 ran and found nothing, 2 could not run.
+//! Exit: 0 found something, 1 ran and found nothing, 2 could not run, which includes any
+//! named input that could not be read, whatever its readable neighbours produced.
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Write};
@@ -226,6 +227,12 @@ enum Match {
 }
 
 /// Everything clap cannot express, in one place: its conflicts fire on a flag's presence,
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+}
+
 /// never on its value. Every pair rejected here is inert by construction, not merely for
 /// some inputs, which is why silence would misreport what the run did.
 fn validate(args: &Args) -> Result<(), clap::Error> {
@@ -2204,7 +2211,9 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     let globs = args
         .glob
         .as_deref()
-        .map(|patterns| compile_globs(patterns, "sz-find"));
+        .map(compile_globs)
+        .transpose()
+        .map_err(reject)?;
 
     let traversal = TraversalOptions {
         hidden: args.hidden,
@@ -2248,11 +2257,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     }
     output.flush().at(STDIN_NAME)?;
 
-    // Every input failed to open, so the run did not complete.
-    if outcome.failed_any && !outcome.read_any {
-        return Ok(Status::Error);
-    }
-    Ok(Status::from_found(outcome.emitted))
+    Ok(Status::of(outcome.failed_any, outcome.emitted))
 }
 
 // region: Tests
@@ -2680,7 +2685,7 @@ mod tests {
     }
 
     #[test]
-    fn warns_past_a_missing_input_but_fails_when_none_was_readable() {
+    fn searches_past_a_missing_input_but_still_reports_the_failure() {
         let directory = tempfile::TempDir::new().unwrap();
         let present = directory.path().join("present.txt");
         std::fs::write(&present, b"error here\n").unwrap();
@@ -2694,10 +2699,16 @@ mod tests {
             present.to_str().unwrap(),
         ])
         .unwrap();
+        // The readable neighbour is still searched and its matches still printed, but an input
+        // that could not be read is a run that did not complete.
         assert!(matches!(
             run(&args, &mut output, &mut io::sink()),
-            Ok(Status::Success)
+            Ok(Status::Error)
         ));
+        assert!(
+            !output.is_empty(),
+            "the readable input must still be searched"
+        );
 
         let args = Args::try_parse_from(["sz-find", "error", missing.to_str().unwrap()]).unwrap();
         assert!(matches!(

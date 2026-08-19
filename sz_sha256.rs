@@ -36,8 +36,9 @@
 //! **memory** is `usize`, because it is bounded by an allocation this process made; and an
 //! **index** — into the input list, the slots, the lanes — is `usize`.
 //!
-//! Exit: 0 hashed a file, or under `--check` every line verified; 1 nothing to hash, or a
-//! checksum did not match; 2 could not run.
+//! Exit: 0 hashed a file, or under `--check` every line verified; 1 nothing to hash, a checksum
+//! did not match, or `--strict` met a line that is not a checksum line; 2 could not run, which
+//! under `--check` includes a manifest holding no checksum lines at all.
 
 #![deny(unsafe_code)]
 
@@ -59,6 +60,7 @@ use shared::*;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Format {
     /// `sha256sum`'s own layout, byte for byte: lowercase digest, two spaces, then the path.
+    #[value(alias = "text")]
     Coreutils,
     /// The BSD layout `sha256sum --tag` writes: `SHA256 (path) = digest`.
     Bsd,
@@ -2129,11 +2131,10 @@ impl Source {
 /// Every source the inputs name, in the order they were named.
 fn gather_sources(
     inputs: &[String],
-    globs: Option<&[String]>,
+    globs: Option<&[glob::Pattern]>,
     traversal: &TraversalOptions<'_>,
     failures: &mut usize,
 ) -> Vec<Source> {
-    let globs = globs.map(|patterns| compile_globs(patterns, "sz-sha256"));
     let mut sources = Vec::new();
     for input in inputs {
         if input == "-" {
@@ -2147,7 +2148,7 @@ fn gather_sources(
         // reads three to one.
         match fs::metadata(path) {
             Ok(metadata) if metadata.is_dir() => sources.extend(
-                walk_files(path, traversal, globs.as_deref(), "sz-sha256", failures)
+                walk_files(path, traversal, globs, "sz-sha256", failures)
                     .into_iter()
                     .map(|(found, size)| Source::File(found, size)),
             ),
@@ -2317,18 +2318,15 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     };
 
     let mut failures = 0;
-    let sources = gather_sources(
-        &args.inputs,
-        args.glob.as_deref(),
-        &traversal,
-        &mut failures,
-    );
+    let globs = args
+        .glob
+        .as_deref()
+        .map(compile_globs)
+        .transpose()
+        .map_err(reject)?;
+    let sources = gather_sources(&args.inputs, globs.as_deref(), &traversal, &mut failures);
     if sources.is_empty() {
-        return Ok(if failures > 0 {
-            Status::Error
-        } else {
-            Status::NoResult
-        });
+        return Ok(Status::of(failures > 0, false));
     }
 
     let paths: Vec<PathBuf> = sources.iter().map(Source::name).collect();
@@ -2386,13 +2384,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         write_summary_to(notes, hashed_count, total_bytes, elapsed).at("-")?;
     }
 
-    Ok(if written > 0 {
-        Status::Success
-    } else if failures > 0 {
-        Status::Error
-    } else {
-        Status::NoResult
-    })
+    Ok(Status::of(failures > 0, written > 0))
 }
 
 fn main() -> std::process::ExitCode {
