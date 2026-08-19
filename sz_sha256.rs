@@ -42,6 +42,8 @@
 
 #![deny(unsafe_code)]
 
+use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
@@ -250,7 +252,7 @@ type Outcome = Result<Hashed, io::Error>;
 /// An errno rather than an `io::Error`, because a worker may not allocate and
 /// `io::Error::new(kind, string)` does. The path is attached at report time, which is also the
 /// only place `shared::At` can turn it into a `Failure`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Stopped {
     /// The file delivered its last byte.
     Ended,
@@ -275,6 +277,9 @@ impl Stopped {
 /// The size rides along because the run already measured every file to order the queue, and a
 /// worker that re-measured would `stat` each file a second time for nothing.
 type Assignment<'a> = (usize, &'a Path, u64);
+
+/// A file the queue may claim: its path, and the size the walk already measured.
+type Measured<'a> = (&'a Path, u64);
 
 // endregion: Multistate Hashing
 
@@ -343,12 +348,8 @@ trait Fleet {
 
 // region: Scheduling
 
-/// Hash every file `queue` yields, keeping up to `open_cap` of them reading at once and advancing
-/// sixteen of them per call the instant sixteen chunks are in hand.
-///
-/// The body is a flat ladder in strict priority order: hash a full group if one exists, wait only
-/// where waiting can widen the group, otherwise finish what is in hand. Nothing here allocates —
-/// every structure is built once per worker and the loop only moves indices between them.
+/// Hash every file `queue` yields, charging every file still in hand with a kernel error that
+/// belongs to none of them.
 fn hash_with_fleet<'a>(
     fleet: &mut dyn Fleet,
     states: &mut [sz::Sha256],
@@ -358,11 +359,32 @@ fn hash_with_fleet<'a>(
     open_cap: usize,
     report: &mut dyn FnMut(usize, Outcome),
 ) {
-    let mut exhausted = false;
+    if let Err(error) = hash_until_drained(fleet, states, staging, members, queue, open_cap, report)
+    {
+        abandon(fleet, report, error.kind());
+    }
+}
+
+/// Keep up to `open_cap` files reading at once and advance sixteen of them per call the instant
+/// sixteen chunks are in hand, stopping at the first kernel error so the caller can abandon.
+///
+/// The body is a flat ladder in strict priority order: hash a full group if one exists, wait only
+/// where waiting can widen the group, otherwise finish what is in hand. Nothing here allocates —
+/// every structure is built once per worker and the loop only moves indices between them.
+fn hash_until_drained<'a>(
+    fleet: &mut dyn Fleet,
+    states: &mut [sz::Sha256],
+    staging: &mut [sz::Sha256; LANE_COUNT],
+    members: &mut [usize; LANE_COUNT],
+    queue: &mut dyn Iterator<Item = Assignment<'a>>,
+    open_cap: usize,
+    report: &mut dyn FnMut(usize, Outcome),
+) -> io::Result<()> {
+    let mut drained = false;
 
     loop {
-        if !exhausted {
-            exhausted = !fill_from(fleet, states, queue, open_cap, report);
+        if !drained {
+            drained = fill_from(fleet, states, queue, open_cap, report);
         }
         report_retired(fleet, states, report);
 
@@ -371,57 +393,35 @@ fn hash_with_fleet<'a>(
         let ready = fleet.ready();
         let awaited = fleet.open_slots() - ready;
 
-        // A full group is the best a call ever gets, so it fires without looking further.
+        // Strict priority: a full group beats anything, waiting beats a short group that could
+        // still widen, and a short group beats idling.
         if ready >= LANE_COUNT {
-            if let Err(error) = advance_group(fleet, states, staging, members, LANE_COUNT) {
-                abandon(fleet, report, error.kind());
-                break;
-            }
+            // A full group is the best a call ever gets, so it fires without looking further.
+            advance_group(fleet, states, staging, members, LANE_COUNT)?;
             // Every release queued a read against a block the group just gave back. This is what
             // hands them over, so the disk fills while the next group hashes rather than waiting
             // for a loop that may not need to sleep for thousands of chunks.
-            if let Err(error) = fleet.reap(0) {
-                abandon(fleet, report, error.kind());
-                break;
-            }
-            continue;
-        }
-        // Short group, but a landing read could still widen it. This is not the old barrier: that
-        // one waited on one named file's next block while others held data it refused to look at.
-        if awaited > 0 {
+            fleet.reap(0)?;
+        } else if awaited > 0 {
             // Nothing below a full group can be hashed, so one wakeup per completion would be one
-            // syscall per completion. Sleeping for the whole shortfall batches them instead.
-            if let Err(error) = fleet.reap(LANE_COUNT - ready) {
-                abandon(fleet, report, error.kind());
-                break;
-            }
-            continue;
-        }
-        // Short group and nothing can widen it, so this group is final. Below nine lanes
-        // `advance_group` hashes one stream at a time, which beats a mostly-empty group.
-        if ready > 0 {
-            if let Err(error) = advance_group(fleet, states, staging, members, ready) {
-                abandon(fleet, report, error.kind());
-                break;
-            }
-            continue;
-        }
-        // No open file and no chunk, but reads are still out against slots whose file already
-        // ended. They must land before those slots are reusable.
-        if fleet.outstanding() > 0 {
-            if let Err(error) = fleet.reap(1) {
-                abandon(fleet, report, error.kind());
-                break;
-            }
-            continue;
-        }
-        if exhausted {
-            break;
+            // syscall per completion. Sleeping for the whole shortfall batches them instead, and
+            // no named file is waited on while another holds data.
+            fleet.reap(LANE_COUNT - ready)?;
+        } else if ready > 0 {
+            // Nothing can widen it, so this group is final. Below nine lanes `advance_group`
+            // hashes one stream at a time, which beats a mostly-empty group.
+            advance_group(fleet, states, staging, members, ready)?;
+        } else if fleet.outstanding() > 0 {
+            // No open file and no chunk, but reads are still out against slots whose file already
+            // ended. They must land before those slots are reusable.
+            fleet.reap(1)?;
+        } else if drained {
+            return Ok(());
         }
     }
 }
 
-/// Claim files into free slots up to `open_cap`. Reports false once the shared cursor is dry.
+/// Claim files into free slots up to `open_cap`. Reports whether the shared cursor ran dry.
 fn fill_from<'a>(
     fleet: &mut dyn Fleet,
     states: &mut [sz::Sha256],
@@ -433,10 +433,10 @@ fn fill_from<'a>(
         // A slot first, a file second. Reversing the two would pull a file off the shared cursor
         // with nowhere to put it, which is a file no other worker will ever see.
         let Some(slot) = fleet.claim() else {
-            return true;
+            return false;
         };
         let Some((position, path, size)) = queue.next() else {
-            return false;
+            return true;
         };
         match fleet.open(slot, position, path, size) {
             Ok(()) => states[slot] = sz::Sha256::new(), // reset in place rather than allocate
@@ -445,7 +445,7 @@ fn fill_from<'a>(
             Err(error) => report(position, Err(error)),
         }
     }
-    true
+    false
 }
 
 /// Report and recycle every slot whose file ended or failed.
@@ -542,7 +542,8 @@ struct BlockingFleet {
     /// bookkeeping does not.
     buffers: Vec<u8>,
     slots: Vec<Slot>,
-    ready: Vec<usize>,
+    /// Slots holding a chunk, oldest first, so a wide fleet does not starve its own tail.
+    ready: VecDeque<usize>,
     retired: Vec<usize>,
     open_slots: usize,
 }
@@ -574,29 +575,12 @@ impl Slot {
     }
 }
 
+/// What a slot is doing, which is what decides whether it may be handed a file.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SlotState {
     Free,
     Open,
-    Retired(StoppedTag),
-}
-
-/// `Stopped` without its errno, so `SlotState` stays comparable; the errno rides alongside.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StoppedTag {
-    Ended,
-    Failed(i32),
-    Shrank,
-}
-
-impl StoppedTag {
-    fn widen(self) -> Stopped {
-        match self {
-            StoppedTag::Ended => Stopped::Ended,
-            StoppedTag::Failed(errno) => Stopped::Errno(errno),
-            StoppedTag::Shrank => Stopped::Shrank,
-        }
-    }
+    Retired(Stopped),
 }
 
 impl BlockingFleet {
@@ -606,13 +590,13 @@ impl BlockingFleet {
             chunk_bytes,
             buffers: vec![0; chunk_bytes * io_width],
             slots: (0..io_width).map(|_| Slot::free()).collect(),
-            ready: Vec::with_capacity(io_width),
+            ready: VecDeque::with_capacity(io_width),
             retired: Vec::with_capacity(io_width),
             open_slots: 0,
         }
     }
 
-    fn stop(&mut self, slot: usize, why: StoppedTag) {
+    fn stop(&mut self, slot: usize, why: Stopped) {
         self.slots[slot].state = SlotState::Retired(why);
         self.slots[slot].published = false;
         self.ready.retain(|held| *held != slot);
@@ -641,7 +625,7 @@ impl Fleet for BlockingFleet {
         };
         self.open_slots += 1;
         if size == 0 {
-            self.stop(slot, StoppedTag::Ended);
+            self.stop(slot, Stopped::Ended);
         }
         Ok(())
     }
@@ -671,7 +655,7 @@ impl Fleet for BlockingFleet {
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => {
                         let errno = error.raw_os_error().unwrap_or(libc::EIO);
-                        self.stop(slot, StoppedTag::Failed(errno));
+                        self.stop(slot, Stopped::Errno(errno));
                         break;
                     }
                 }
@@ -681,14 +665,13 @@ impl Fleet for BlockingFleet {
             }
             self.slots[slot].filled = filled;
             self.slots[slot].published = true;
-            self.ready.push(slot);
+            self.ready.push_back(slot);
         }
         Ok(())
     }
 
     fn take(&mut self) -> Option<usize> {
-        let slot = self.ready.first().copied()?;
-        self.ready.remove(0);
+        let slot = self.ready.pop_front()?;
         self.slots[slot].published = false;
         Some(slot)
     }
@@ -707,11 +690,11 @@ impl Fleet for BlockingFleet {
         self.slots[slot].delivered += taken;
         self.slots[slot].filled = 0;
         if taken == 0 && self.slots[slot].delivered < self.slots[slot].size {
-            self.stop(slot, StoppedTag::Shrank);
+            self.stop(slot, Stopped::Shrank);
             return Ok(());
         }
         if self.slots[slot].delivered >= self.slots[slot].size {
-            self.stop(slot, StoppedTag::Ended);
+            self.stop(slot, Stopped::Ended);
         }
         Ok(())
     }
@@ -722,7 +705,7 @@ impl Fleet for BlockingFleet {
 
     fn record(&self, slot: usize) -> (usize, u64, Stopped) {
         let why = match self.slots[slot].state {
-            SlotState::Retired(tag) => tag.widen(),
+            SlotState::Retired(why) => why,
             _ => Stopped::Ended,
         };
         (self.slots[slot].position, self.slots[slot].delivered, why)
@@ -767,7 +750,7 @@ mod direct {
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::path::Path;
 
-    use super::{Fleet, Stopped, DIRECT_IO_ALIGNMENT};
+    use super::{Fleet, SlotState, Stopped, DIRECT_IO_ALIGNMENT};
 
     /// Reads in flight per lane. One buffer feeds the hasher while the rest fill, which is the
     /// whole reason these interfaces are here: a depth of one reads at 0.6 GB/s where four reach
@@ -840,14 +823,6 @@ mod direct {
         Pinned,
         /// Each read hands the kernel an address to pin for the duration of that read.
         Unpinned,
-    }
-
-    /// What a slot is doing, which is what decides whether it may be handed a file.
-    #[derive(Clone, Copy)]
-    enum SlotState {
-        Free,
-        Open,
-        Retired(Stopped),
     }
 
     /// One file being streamed through its own ring of blocks.
@@ -1776,9 +1751,9 @@ impl HashPlan {
 /// partial group is also the cheapest, and neighbours in size order make groups whose lanes finish
 /// together — a group costs as much as its longest lane.
 struct WorkQueue<'a> {
+    /// The claim order: input positions, largest file first and dealt into one pile per worker.
     order: &'a [usize],
-    paths: &'a [&'a Path],
-    sizes: &'a [u64],
+    files: &'a [Measured<'a>],
     cursor: &'a AtomicUsize,
 }
 
@@ -1788,20 +1763,21 @@ impl<'a> Iterator for WorkQueue<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         // One atomic per file, not per block: a few nanoseconds against a file that takes
         // milliseconds to read.
-        let at = self.cursor.fetch_add(1, Ordering::Relaxed);
-        let position = *self.order.get(at)?;
-        Some((position, self.paths[position], self.sizes[position]))
+        let position = *self
+            .order
+            .get(self.cursor.fetch_add(1, Ordering::Relaxed))?;
+        let (path, size) = self.files[position];
+        Some((position, path, size))
     }
 }
 
-/// Re-lay a size-descending order so that any contiguous run of it is balanced.
+/// Deal a size-descending list into `workers` piles round-robin and concatenate them.
 ///
 /// Workers claim contiguously from one cursor, and a worker fills every slot it is allowed before
 /// coming back — so from a plainly descending list the first worker takes the largest files and
-/// the rest finish early and spin at the join. Dealing the descending list into `workers` piles
-/// round-robin and concatenating them means the first worker's run holds the 1st, 5th, 9th …
-/// largest rather than the top four, which is the classic longest-processing-time deal and evens
-/// the totals without any coordination at claim time.
+/// the rest finish early and spin at the join. Dealing means the first worker's run holds the 1st,
+/// 5th, 9th … largest rather than the top four, which is the classic longest-processing-time deal
+/// and evens the totals without any coordination at claim time.
 fn dealt_round_robin(descending: Vec<usize>, workers: usize) -> Vec<usize> {
     if workers <= 1 {
         return descending;
@@ -1814,21 +1790,31 @@ fn dealt_round_robin(descending: Vec<usize>, workers: usize) -> Vec<usize> {
 }
 
 /// Hash every path, returning outcomes in the order the caller supplied them.
-fn hash_paths(paths: &[&Path], sizes: &[u64], plan: &HashPlan) -> Vec<Option<Outcome>> {
-    let mut order: Vec<usize> = (0..paths.len()).collect();
-    order.sort_by(|left, right| sizes[*right].cmp(&sizes[*left]).then(left.cmp(right)));
+fn hash_paths(files: &[Measured], plan: &HashPlan) -> Vec<Option<Outcome>> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|left, right| {
+        let (_, left_size) = files[*left];
+        let (_, right_size) = files[*right];
+        right_size.cmp(&left_size).then(left.cmp(right))
+    });
     let order = dealt_round_robin(order, plan.threads);
 
     let cursor = AtomicUsize::new(0);
-    let collected: Mutex<Vec<(usize, Outcome)>> = Mutex::new(Vec::with_capacity(paths.len()));
+    // Input order is the only order a manifest may be written in, so every worker scatters its
+    // own records straight into their final places.
+    let outcomes: Mutex<Vec<Option<Outcome>>> =
+        Mutex::new((0..files.len()).map(|_| None).collect());
 
     // One worker body, run either on this thread or across the pool. Everything it needs is
     // built inside it, once, and reused for as many files as it manages to claim.
-    let run_worker = |local: &mut Vec<(usize, Outcome)>| {
+    let run_worker = |capacity: usize| {
+        // Sized up front, since a worker that claims more than its share would otherwise grow
+        // this vector mid-run. Growing is off the hot loop either way — once per file, never per
+        // chunk — but the capacity costs nothing to state.
+        let mut local: Vec<(usize, Outcome)> = Vec::with_capacity(capacity);
         let mut queue = WorkQueue {
             order: &order,
-            paths,
-            sizes,
+            files,
             cursor: &cursor,
         };
         let mut fleet = select_fleet(plan);
@@ -1844,6 +1830,12 @@ fn hash_paths(paths: &[&Path], sizes: &[u64], plan: &HashPlan) -> Vec<Option<Out
             plan.open_cap,
             &mut |position, outcome| local.push((position, outcome)),
         );
+        // One lock per worker, at the end of its run, rather than one per file. Each record has
+        // its own place, so a poisoned lock still hands back coherent records.
+        let mut shared = outcomes.lock().unwrap_or_else(PoisonError::into_inner);
+        for (position, outcome) in local.drain(..) {
+            shared[position] = Some(outcome);
+        }
     };
 
     // A machine that will not describe its own cores still hashes, on one of them: the pool is
@@ -1852,44 +1844,21 @@ fn hash_paths(paths: &[&Path], sizes: &[u64], plan: &HashPlan) -> Vec<Option<Out
         .then(forkunion::Topology::new)
         .and_then(Result::ok);
     match topology {
-        None => {
-            let mut local = Vec::with_capacity(paths.len());
-            run_worker(&mut local);
-            collected
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .extend(local);
-        }
+        None => run_worker(files.len()),
         // Spawned as late as possible: a `forkunion` worker spins on `PAUSE` from the moment it
         // is created, so any setup left between the spawn and the broadcast is burnt on every
         // core but this one.
         Some(topology) => {
             let mut pool = forkunion::spawn(&topology, plan.threads);
             pool.broadcast(|_thread_index, _compute_domain_index| {
-                // Sized up front, since a worker that claims more than its share would otherwise
-                // grow this vector mid-run. Growing is off the hot loop either way — once per
-                // file, never per chunk — but the capacity costs nothing to state.
-                let mut local = Vec::with_capacity(paths.len() / plan.threads + plan.io_width);
-                run_worker(&mut local);
-                // One lock per worker, at the end of its run, rather than one per file. The
-                // vector is append-only, so a poisoned lock still hands back coherent records.
-                collected
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .extend(local);
+                run_worker(files.len() / plan.threads + plan.io_width);
             });
         }
     }
 
-    // Scatter back into input order, which is the only order a manifest may be written in.
-    let mut outcomes: Vec<Option<Outcome>> = (0..paths.len()).map(|_| None).collect();
-    for (position, outcome) in collected
+    outcomes
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner)
-    {
-        outcomes[position] = Some(outcome);
-    }
-    outcomes
 }
 
 // endregion: Workers
@@ -1926,23 +1895,18 @@ fn path_bytes(path: &Path) -> &[u8] {
     }
 }
 
-/// Render every outcome, reporting how many records were written.
-fn write_digests_to(
+/// Render every record, reporting how many were written.
+fn write_digests_to<'a>(
     output: &mut dyn Write,
-    paths: &[&Path],
-    outcomes: &[Option<Outcome>],
+    records: impl Iterator<Item = (&'a Path, &'a Hashed)>,
     config: &OutputConfig,
 ) -> io::Result<usize> {
     let mut written = 0;
-    for (position, outcome) in outcomes.iter().enumerate() {
-        let Some(Ok(hashed)) = outcome else {
-            continue;
-        };
+    for (path, hashed) in records {
         // The three text formats carry the name's own bytes, so a manifest round-trips a
         // filename that is not valid UTF-8. JSON cannot: a string there has to be UTF-8, so
         // it keeps the lossy rendering.
-        let path = paths[position].to_string_lossy();
-        let path_bytes = path_bytes(paths[position]);
+        let path_bytes = path_bytes(path);
         match config.format {
             // Two spaces between digest and path is what `sha256sum` writes and what its own
             // `--check` expects back, so this stays byte-for-byte rather than merely similar.
@@ -1967,7 +1931,7 @@ fn write_digests_to(
             }
             Format::Json => {
                 output.write_all(br#"{"type":"file","data":{"path":"#)?;
-                json_text_field_to(output, path.as_bytes())?;
+                json_text_field_to(output, path.to_string_lossy().as_bytes())?;
                 output.write_all(br#","digest":""#)?;
                 write_digest_to(output, &hashed.digest)?;
                 write!(output, r#"","bytes":{}}}}}"#, hashed.bytes)?;
@@ -2019,10 +1983,11 @@ fn scaled(bytes: f64) -> String {
 
 // region: Checking
 
-/// One line of a checksum list: the digest it claims, and the file it claims it for.
-struct CheckLine {
+/// One line of a checksum list: the digest it claims, and the file it claims it for. The name
+/// borrows the manifest text, except where a platform has no byte view of a path.
+struct CheckLine<'a> {
     digest: Digest,
-    path: PathBuf,
+    path: Cow<'a, Path>,
 }
 
 /// Parse one line of a `sha256sum` list.
@@ -2030,7 +1995,7 @@ struct CheckLine {
 /// Both spacings the reference tool writes are accepted: two spaces for text mode, and a space
 /// then `*` for the binary mode `-b` produces. Anything else is not a checksum line, and the
 /// caller counts it rather than failing the run — a list may carry comments or blank lines.
-fn parse_check_line(line: &[u8]) -> Option<CheckLine> {
+fn parse_check_line(line: &[u8]) -> Option<CheckLine<'_>> {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
 
@@ -2072,18 +2037,16 @@ fn parse_check_line(line: &[u8]) -> Option<CheckLine> {
     // `from_utf8_lossy` first would substitute U+FFFD and then fail to open a file that is
     // sitting right there.
     #[cfg(unix)]
-    let path = PathBuf::from(std::ffi::OsString::from(
+    let path = Cow::Borrowed(Path::new(
         <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
     ));
     #[cfg(not(unix))]
-    let path = PathBuf::from(String::from_utf8_lossy(path).into_owned());
+    let path = Cow::Owned(PathBuf::from(String::from_utf8_lossy(path).into_owned()));
     Some(CheckLine { digest, path })
 }
 
 /// Read a checksum list, keeping only the lines that are checksum lines.
-fn read_check_list(path: &Path) -> Result<(Vec<CheckLine>, usize), Failure> {
-    let name = path.to_string_lossy().into_owned();
-    let text = fs::read(path).at(name)?;
+fn read_check_list(text: &[u8]) -> (Vec<CheckLine<'_>>, usize) {
     let mut lines = Vec::new();
     let mut unreadable = 0;
     for line in text.split(|byte| *byte == b'\n') {
@@ -2095,7 +2058,7 @@ fn read_check_list(path: &Path) -> Result<(Vec<CheckLine>, usize), Failure> {
             None => unreadable += 1,
         }
     }
-    Ok((lines, unreadable))
+    (lines, unreadable)
 }
 
 /// What verifying one line found.
@@ -2109,7 +2072,7 @@ enum Verdict {
     Skipped,
 }
 
-/// Report each line's verdict in the layout `sha256sum --check` uses, and count the failures.
+/// Report each line's verdict in the layout `sha256sum --check` uses, counting the failures.
 fn write_check_report_to(
     output: &mut dyn Write,
     lines: &[CheckLine],
@@ -2180,19 +2143,17 @@ fn hash_stdin(chunk_bytes: usize) -> Outcome {
 /// Files go to the fleet together, so one pass still fills every lane; the standard input is
 /// spliced back into its own position afterwards.
 fn hash_sources(sources: &[(Input, u64)], plan: &HashPlan) -> Vec<Option<Outcome>> {
-    let mut paths = Vec::with_capacity(sources.len());
-    let mut sizes = Vec::with_capacity(sources.len());
+    let mut files = Vec::with_capacity(sources.len());
     let mut positions = Vec::with_capacity(sources.len());
     for (position, (input, size)) in sources.iter().enumerate() {
         if matches!(input, Input::File(_)) {
-            paths.push(input.path());
-            sizes.push(*size);
+            files.push((input.path(), *size));
             positions.push(position);
         }
     }
 
     let mut outcomes: Vec<Option<Outcome>> = (0..sources.len()).map(|_| None).collect();
-    for (index, outcome) in hash_paths(&paths, &sizes, plan).into_iter().enumerate() {
+    for (index, outcome) in hash_paths(&files, plan).into_iter().enumerate() {
         outcomes[positions[index]] = outcome;
     }
     for (position, (input, _)) in sources.iter().enumerate() {
@@ -2201,6 +2162,19 @@ fn hash_sources(sources: &[(Input, u64)], plan: &HashPlan) -> Vec<Option<Outcome
         }
     }
     outcomes
+}
+
+/// The inputs that produced a digest, paired with it, in the order they were named.
+fn hashed<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    outcomes: &'a [Option<Outcome>],
+) -> impl Iterator<Item = (&'a Path, &'a Hashed)> {
+    paths
+        .zip(outcomes)
+        .filter_map(|(path, outcome)| match outcome {
+            Some(Ok(digest)) => Some((path, digest)),
+            _ => None,
+        })
 }
 
 // endregion: Input Processing
@@ -2212,41 +2186,55 @@ fn run_check(
     output: &mut dyn Write,
     notes: &mut dyn Write,
 ) -> Result<Status, Failure> {
-    let (lines, unreadable) = read_check_list(list)?;
+    let text = fs::read(list).at(list.to_string_lossy())?;
+    let (lines, unreadable) = read_check_list(&text);
     if lines.is_empty() {
         eprintln!("sz-sha256: {}: no checksum lines found", list.display());
         return Ok(Status::Error);
     }
 
-    let paths: Vec<&Path> = lines.iter().map(|line| line.path.as_path()).collect();
     // A checksum list names files rather than walking to them, so this is their only measurement.
-    let sizes: Vec<u64> = paths
+    // A name that will not stat is worth nothing to the scheduler and is left at zero; whether it
+    // is missing or merely unreachable is answered by the open, not by this.
+    let files: Vec<Measured> = lines
         .iter()
-        .map(|path| fs::metadata(path).map(|data| data.len()).unwrap_or(0))
+        .map(|line| {
+            let size = fs::metadata(&line.path).map(|data| data.len()).unwrap_or(0);
+            (line.path.as_ref(), size)
+        })
         .collect();
-    let plan = HashPlan::from_args(args, paths.len(), sizes.iter().sum());
+    let plan = HashPlan::from_args(args, files.len(), files.iter().map(|(_, size)| size).sum());
     let started = std::time::Instant::now();
-    let outcomes = hash_paths(&paths, &sizes, &plan);
+    let outcomes = hash_paths(&files, &plan);
     let elapsed = started.elapsed();
 
-    let mut total_bytes = 0u64;
+    let total_bytes: u64 = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            Some(Ok(hashed)) => Some(hashed.bytes),
+            _ => None,
+        })
+        .sum();
+    // Only a name the open reports absent is passed over: a file that is present but unreachable —
+    // one whose parent directory denies a lookup, say — is a failure to verify, not a gap in a
+    // partial download.
     let verdicts: Vec<Verdict> = lines
         .iter()
         .zip(&outcomes)
         .map(|(line, outcome)| match outcome {
-            Some(Ok(hashed)) => {
-                total_bytes += hashed.bytes;
-                if hashed.digest == line.digest {
-                    Verdict::Matched
-                } else {
-                    Verdict::Mismatched
-                }
+            Some(Ok(hashed)) if hashed.digest == line.digest => Verdict::Matched,
+            Some(Ok(_)) => Verdict::Mismatched,
+            Some(Err(error)) if args.ignore_missing && error.kind() == io::ErrorKind::NotFound => {
+                Verdict::Skipped
             }
-            _ if args.ignore_missing && !line.path.exists() => Verdict::Skipped,
             _ => Verdict::Unreadable,
         })
         .collect();
 
+    let checked = verdicts
+        .iter()
+        .filter(|verdict| **verdict != Verdict::Skipped)
+        .count();
     let failed = write_check_report_to(output, &lines, &verdicts, args.quiet).at("-")?;
     output.flush().at("-")?;
 
@@ -2270,10 +2258,6 @@ fn run_check(
 
     // Skipping every line leaves a run that verified nothing, which is a failure to do the job
     // rather than a clean bill of health.
-    let checked = verdicts
-        .iter()
-        .filter(|verdict| **verdict != Verdict::Skipped)
-        .count();
     if checked == 0 {
         eprintln!("sz-sha256: {}: no file was verified", list.display());
         return Ok(Status::NoResult);
@@ -2326,7 +2310,6 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         return Ok(tally.status());
     }
 
-    let paths: Vec<&Path> = sources.iter().map(|(input, _)| input.path()).collect();
     // The standard input cannot be sized before it is read, so it is no part of the budget the
     // widths are derived from.
     let sized = sources
@@ -2338,23 +2321,17 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     let outcomes = hash_sources(&sources, &plan);
     let elapsed = started.elapsed();
 
-    // Naming happens here rather than in a worker: `.at` is the only way to build a
-    // `Failure::Io`, and the path is already at hand where an allocation costs nothing.
+    // Naming happens here rather than in a worker, where the path is already at hand.
     let mut hashed_count = 0;
     let mut total_bytes = 0u64;
-    for (position, outcome) in outcomes.iter().enumerate() {
+    for ((input, _), outcome) in sources.iter().zip(&outcomes) {
         match outcome {
             Some(Ok(entry)) => {
                 hashed_count += 1;
                 total_bytes += entry.bytes;
             }
             Some(Err(error)) => {
-                let named = io::Error::new(error.kind(), error.to_string());
-                let failure = Failure::Io {
-                    path: paths[position].to_string_lossy().into_owned(),
-                    source: named,
-                };
-                eprintln!("sz-sha256: {}", failure);
+                eprintln!("sz-sha256: {}: {}", input.path().display(), error);
                 tally.failed();
             }
             None => {}
@@ -2373,7 +2350,11 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
             None => Destination::Stdout,
         };
         destination.write("sz-sha256", output, |file| {
-            write_digests_to(file, &paths, &outcomes, &config)
+            write_digests_to(
+                file,
+                hashed(sources.iter().map(|(input, _)| input.path()), &outcomes),
+                &config,
+            )
         })?
     };
     output.flush().at("-")?;
@@ -2423,17 +2404,15 @@ mod tests {
         (directory, paths)
     }
 
-    /// Sizes for a set of scratch files. The tool itself gets these from the walk, which is
-    /// where the one and only measurement happens; a test that builds its own list measures here.
-    fn measure(paths: &[PathBuf]) -> Vec<u64> {
+    /// The paths paired with their sizes, which is what the queue claims from.
+    fn measured_files(paths: &[PathBuf]) -> Vec<Measured<'_>> {
         paths
             .iter()
-            .map(|path| fs::metadata(path).map(|data| data.len()).unwrap_or(0))
+            .map(|path| {
+                let size = fs::metadata(path).map(|data| data.len()).unwrap_or(0);
+                (path.as_path(), size)
+            })
             .collect()
-    }
-
-    fn borrowed(paths: &[PathBuf]) -> Vec<&Path> {
-        paths.iter().map(PathBuf::as_path).collect()
     }
 
     fn plan_with(chunk_bytes: usize, threads: usize) -> HashPlan {
@@ -2448,14 +2427,10 @@ mod tests {
     }
 
     fn digests_via(paths: &[PathBuf], chunk_bytes: usize) -> Vec<Digest> {
-        hash_paths(
-            &borrowed(paths),
-            &measure(paths),
-            &plan_with(chunk_bytes, 1),
-        )
-        .into_iter()
-        .map(|outcome| outcome.unwrap().unwrap().digest)
-        .collect()
+        hash_paths(&measured_files(paths), &plan_with(chunk_bytes, 1))
+            .into_iter()
+            .map(|outcome| outcome.unwrap().unwrap().digest)
+            .collect()
     }
 
     /// The digest each file would get on its own, which every concurrent arrangement must match.
@@ -2542,14 +2517,11 @@ mod tests {
         let expected = digests_directly(&paths);
 
         for threads in [1, 2, 4, 8] {
-            let digests: Vec<Digest> = hash_paths(
-                &borrowed(&paths),
-                &measure(&paths),
-                &plan_with(1 << 16, threads),
-            )
-            .into_iter()
-            .map(|outcome| outcome.unwrap().unwrap().digest)
-            .collect();
+            let digests: Vec<Digest> =
+                hash_paths(&measured_files(&paths), &plan_with(1 << 16, threads))
+                    .into_iter()
+                    .map(|outcome| outcome.unwrap().unwrap().digest)
+                    .collect();
             assert_eq!(digests, expected, "threads {}", threads);
         }
     }
@@ -2560,25 +2532,19 @@ mod tests {
         // the results the caller sees.
         let (_directory, paths) = scratch_files(&[10, 900_000, 50, 400_000, 3]);
         let expected = digests_directly(&paths);
-        let digests: Vec<Digest> =
-            hash_paths(&borrowed(&paths), &measure(&paths), &plan_with(1 << 16, 2))
-                .into_iter()
-                .map(|outcome| outcome.unwrap().unwrap().digest)
-                .collect();
+        let digests: Vec<Digest> = hash_paths(&measured_files(&paths), &plan_with(1 << 16, 2))
+            .into_iter()
+            .map(|outcome| outcome.unwrap().unwrap().digest)
+            .collect();
         assert_eq!(digests, expected);
     }
 
     #[test]
     fn reports_an_unreadable_file_without_abandoning_the_others() {
-        let (directory, paths) = scratch_files(&[10, 20]);
-        let mut all = paths.clone();
+        let (directory, mut all) = scratch_files(&[10, 20]);
         all.insert(1, directory.path().join("absent.bin"));
 
-        let outcomes = hash_paths(
-            &borrowed(&all),
-            &measure(&all),
-            &plan_with(DIRECT_IO_ALIGNMENT, 1),
-        );
+        let outcomes = hash_paths(&measured_files(&all), &plan_with(DIRECT_IO_ALIGNMENT, 1));
 
         assert_eq!(outcomes.len(), 3);
         assert!(matches!(outcomes[0], Some(Ok(_))));
@@ -2589,11 +2555,7 @@ mod tests {
     #[test]
     fn writes_coreutils_format_byte_for_byte() {
         let (_directory, paths) = scratch_files(&[7]);
-        let outcomes = hash_paths(
-            &borrowed(&paths),
-            &measure(&paths),
-            &plan_with(DIRECT_IO_ALIGNMENT, 1),
-        );
+        let outcomes = hash_paths(&measured_files(&paths), &plan_with(DIRECT_IO_ALIGNMENT, 1));
         let config = OutputConfig {
             format: Format::Coreutils,
             terminator: Terminator::Newline,
@@ -2601,7 +2563,12 @@ mod tests {
 
         let mut rendered = Vec::new();
         assert_eq!(
-            write_digests_to(&mut rendered, &borrowed(&paths), &outcomes, &config).unwrap(),
+            write_digests_to(
+                &mut rendered,
+                hashed(paths.iter().map(PathBuf::as_path), &outcomes),
+                &config
+            )
+            .unwrap(),
             1
         );
 
@@ -2616,18 +2583,19 @@ mod tests {
     #[test]
     fn terminates_records_with_nul_under_null() {
         let (_directory, paths) = scratch_files(&[3]);
-        let outcomes = hash_paths(
-            &borrowed(&paths),
-            &measure(&paths),
-            &plan_with(DIRECT_IO_ALIGNMENT, 1),
-        );
+        let outcomes = hash_paths(&measured_files(&paths), &plan_with(DIRECT_IO_ALIGNMENT, 1));
         let config = OutputConfig {
             format: Format::Coreutils,
             terminator: Terminator::Null,
         };
 
         let mut rendered = Vec::new();
-        write_digests_to(&mut rendered, &borrowed(&paths), &outcomes, &config).unwrap();
+        write_digests_to(
+            &mut rendered,
+            hashed(paths.iter().map(PathBuf::as_path), &outcomes),
+            &config,
+        )
+        .unwrap();
         assert_eq!(rendered.last(), Some(&0));
     }
 
@@ -2661,7 +2629,7 @@ mod tests {
                 depth: 4,
                 open_cap: 2 * LANE_COUNT,
             };
-            let digests: Vec<Digest> = hash_paths(&borrowed(&paths), &measure(&paths), &plan)
+            let digests: Vec<Digest> = hash_paths(&measured_files(&paths), &plan)
                 .into_iter()
                 .map(|outcome| outcome.unwrap().unwrap().digest)
                 .collect();
@@ -2679,7 +2647,7 @@ mod tests {
         plan.io_width = LANE_COUNT;
         plan.open_cap = LANE_COUNT;
 
-        let digests: Vec<Digest> = hash_paths(&borrowed(&paths), &measure(&paths), &plan)
+        let digests: Vec<Digest> = hash_paths(&measured_files(&paths), &plan)
             .into_iter()
             .map(|outcome| outcome.unwrap().unwrap().digest)
             .collect();
@@ -2700,7 +2668,7 @@ mod tests {
                 plan.backend = backend;
                 plan.io_width = io_width;
                 plan.open_cap = io_width;
-                let digests: Vec<Digest> = hash_paths(&borrowed(&paths), &measure(&paths), &plan)
+                let digests: Vec<Digest> = hash_paths(&measured_files(&paths), &plan)
                     .into_iter()
                     .map(|outcome| outcome.unwrap().unwrap().digest)
                     .collect();
@@ -2764,7 +2732,7 @@ mod tests {
             .iter()
             .map(|path| CheckLine {
                 digest: sz::Sha256::hash(&fs::read(path).unwrap()),
-                path: path.clone(),
+                path: Cow::Borrowed(path.as_path()),
             })
             .collect();
 
@@ -2805,7 +2773,12 @@ mod tests {
             format: Format::Bsd,
             terminator: Terminator::from_null(false),
         };
-        write_digests_to(&mut rendered, &borrowed(&paths), &outcomes, &config).unwrap();
+        write_digests_to(
+            &mut rendered,
+            hashed(paths.iter().map(PathBuf::as_path), &outcomes),
+            &config,
+        )
+        .unwrap();
 
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.starts_with("SHA256 ("), "{}", text);
@@ -2845,11 +2818,11 @@ mod tests {
         let lines = vec![
             CheckLine {
                 digest: [1u8; 32],
-                path: PathBuf::from("present"),
+                path: Cow::Borrowed(Path::new("present")),
             },
             CheckLine {
                 digest: [2u8; 32],
-                path: PathBuf::from("absent"),
+                path: Cow::Borrowed(Path::new("absent")),
             },
         ];
         let verdicts = [Verdict::Matched, Verdict::Skipped];
@@ -2912,18 +2885,19 @@ mod tests {
     #[test]
     fn writes_json_lines_with_escaped_paths() {
         let (_directory, paths) = scratch_files(&[5]);
-        let outcomes = hash_paths(
-            &borrowed(&paths),
-            &measure(&paths),
-            &plan_with(DIRECT_IO_ALIGNMENT, 1),
-        );
+        let outcomes = hash_paths(&measured_files(&paths), &plan_with(DIRECT_IO_ALIGNMENT, 1));
         let config = OutputConfig {
             format: Format::Json,
             terminator: Terminator::Newline,
         };
 
         let mut rendered = Vec::new();
-        write_digests_to(&mut rendered, &borrowed(&paths), &outcomes, &config).unwrap();
+        write_digests_to(
+            &mut rendered,
+            hashed(paths.iter().map(PathBuf::as_path), &outcomes),
+            &config,
+        )
+        .unwrap();
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.starts_with(r#"{"type":"file","data":{"path":"#));
         assert!(text.contains(r#""bytes":5"#));
