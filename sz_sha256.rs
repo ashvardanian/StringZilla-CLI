@@ -1913,6 +1913,19 @@ fn write_digest_to(output: &mut dyn Write, digest: &Digest) -> io::Result<()> {
     output.write_all(&text)
 }
 
+/// A path as the bytes the filesystem holds, which is what a manifest has to record for a
+/// name that is not valid UTF-8 to survive being read back.
+fn path_bytes(path: &Path) -> &[u8] {
+    #[cfg(unix)]
+    {
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::as_bytes(path.as_os_str())
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_str().unwrap_or_default().as_bytes()
+    }
+}
+
 /// Render every outcome, reporting how many records were written.
 fn write_digests_to(
     output: &mut dyn Write,
@@ -1925,19 +1938,23 @@ fn write_digests_to(
         let Some(Ok(hashed)) = outcome else {
             continue;
         };
+        // The three text formats carry the name's own bytes, so a manifest round-trips a
+        // filename that is not valid UTF-8. JSON cannot: a string there has to be UTF-8, so
+        // it keeps the lossy rendering.
         let path = paths[position].to_string_lossy();
+        let path_bytes = path_bytes(paths[position]);
         match config.format {
             // Two spaces between digest and path is what `sha256sum` writes and what its own
             // `--check` expects back, so this stays byte-for-byte rather than merely similar.
             Format::Coreutils => {
                 write_digest_to(output, &hashed.digest)?;
                 output.write_all(b"  ")?;
-                output.write_all(path.as_bytes())?;
+                output.write_all(path_bytes)?;
             }
             // What `sha256sum --tag` writes, and what its `--check` reads back.
             Format::Bsd => {
                 output.write_all(b"SHA256 (")?;
-                output.write_all(path.as_bytes())?;
+                output.write_all(path_bytes)?;
                 output.write_all(b") = ")?;
                 write_digest_to(output, &hashed.digest)?;
             }
@@ -1946,7 +1963,7 @@ fn write_digests_to(
                 let mut buffer = [0u8; 26];
                 let bytes = format_grouped_number(&mut buffer, hashed.bytes as usize);
                 write!(output, "  {:>15}  ", bytes)?;
-                output.write_all(path.as_bytes())?;
+                output.write_all(path_bytes)?;
             }
             Format::Json => {
                 output.write_all(br#"{"type":"file","data":{"path":"#)?;
@@ -2051,10 +2068,16 @@ fn parse_check_line(line: &[u8]) -> Option<CheckLine> {
         digest[index] = (value(pair[0])? << 4) | value(pair[1])?;
     }
 
-    Some(CheckLine {
-        digest,
-        path: PathBuf::from(String::from_utf8_lossy(path).into_owned()),
-    })
+    // The manifest holds the name's bytes, so it is rebuilt from them: rendering it through
+    // `from_utf8_lossy` first would substitute U+FFFD and then fail to open a file that is
+    // sitting right there.
+    #[cfg(unix)]
+    let path = PathBuf::from(std::ffi::OsString::from(
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
+    ));
+    #[cfg(not(unix))]
+    let path = PathBuf::from(String::from_utf8_lossy(path).into_owned());
+    Some(CheckLine { digest, path })
 }
 
 /// Read a checksum list, keeping only the lines that are checksum lines.
@@ -2922,6 +2945,26 @@ mod tests {
         }
         assert!(accepts(&["--format", "json"]));
         assert!(accepts(&["--io-chunk", "8Ki"]));
+    }
+
+    /// A manifest has to record the name's own bytes, or `--check` reports a file that is
+    /// sitting right there as unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn round_trips_a_name_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from(std::ffi::OsStr::from_bytes(
+            b"bad\xff\xfename.txt",
+        )));
+        let mut line = Vec::new();
+        write_digest_to(&mut line, &[0x11; 32]).unwrap();
+        line.extend_from_slice(b"  ");
+        line.extend_from_slice(path_bytes(&path));
+
+        let parsed = parse_check_line(&line).expect("a manifest line");
+        assert_eq!(parsed.path, path, "the manifest lost the name's bytes");
+        assert_eq!(parsed.digest, [0x11; 32]);
     }
 }
 

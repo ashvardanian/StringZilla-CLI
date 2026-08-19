@@ -505,12 +505,15 @@ fn segment_input(
     path_json: &mut Vec<u8>,
     output: &mut dyn Write,
 ) -> io::Result<usize> {
-    let name = input.display_name();
-    let source = if can_stream(segmentation, config) {
-        get_input_streaming(Some(&name))?
-    } else {
-        get_input(Some(&name))?
+    let source = match input {
+        Input::Stdin if can_stream(segmentation, config) => get_input_streaming(None)?,
+        Input::Stdin => get_input(None)?,
+        Input::File(entry) if can_stream(segmentation, config) => {
+            open_input_streaming(entry.path())?
+        }
+        Input::File(entry) => open_input(entry.path())?,
     };
+    let name = input.display_name();
 
     path_json.clear();
     if config.render == Render::Json {
@@ -1075,5 +1078,36 @@ mod tests {
                 "version",
             ]
         );
+    }
+
+    /// A walked file is opened by its path, not by its lossy rendering, so a name that is
+    /// not valid UTF-8 still gets segmented rather than failing to open.
+    #[cfg(unix)]
+    #[test]
+    fn segments_a_walked_name_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let awkward = directory
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"bad\xff\xfename.txt"));
+        std::fs::write(&awkward, b"alpha beta gamma\n").unwrap();
+        std::fs::write(directory.path().join("plain.txt"), b"delta epsilon\n").unwrap();
+
+        let args = Args::try_parse_from([
+            "sz-segment-utf8",
+            "--by",
+            "words",
+            "--show",
+            "count",
+            directory.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let mut output = Vec::new();
+        let status = run(&args, &mut output).expect("the walk succeeds");
+
+        assert_eq!(status, Status::Success);
+        let counted: Vec<&str> = std::str::from_utf8(&output).unwrap().lines().collect();
+        assert_eq!(counted.len(), 2, "both files reported: {:?}", counted);
     }
 }

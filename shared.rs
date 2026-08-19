@@ -107,12 +107,17 @@ pub fn get_input_streaming(path: Option<&str>) -> io::Result<InputSource> {
         widen_stdin_pipe();
         return Ok(InputSource::Pipe(Box::new(io::stdin().lock())));
     };
-    // A FIFO or process substitution has no mapping, so it streams rather than buffering.
+    open_input_streaming(Path::new(path))
+}
+
+/// Map `path` as [`open_input`] does, except that a source with no mapping streams rather
+/// than buffering, which is what keeps a named FIFO from being read whole into memory.
+pub fn open_input_streaming(path: &Path) -> io::Result<InputSource> {
     let file = File::open(path)?;
     if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
         return Ok(InputSource::Pipe(Box::new(file)));
     }
-    open_input(Path::new(path))
+    open_input(path)
 }
 
 /// Map descriptor 0 when it is a regular file read from its start.
