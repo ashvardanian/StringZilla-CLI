@@ -1,33 +1,21 @@
-//! SIMD-accelerated column extraction utility
+//! Column extraction, standing in for `cut -f` and `awk '{print $N}'`.
 //!
-//! A simpler, faster replacement for `cut -f` and `awk '{print $N}'`.
-//! Uses StringZilla for fast delimiter scanning.
+//! Columns come out in the order they are named, so `--columns 3,1` writes the third then the
+//! first. `cut` cannot express that at all: given `-f3,1` it emits ascending order and says
+//! nothing, which is the behaviour this exists to replace rather than merely outrun.
 //!
-//! # Examples
+//! Fields are split on a single byte located by a SIMD scan, with no quote awareness — a CSV whose
+//! quoted fields contain the delimiter needs a real parser, not this.
 //!
-//! ```bash
-//! # Extract second column (tab-delimited by default)
-//! sz-cols -f 2 data.tsv
-//!
-//! # Extract multiple columns
-//! sz-cols -f 1,3,5 data.tsv
-//!
-//! # Use comma as delimiter (CSV)
-//! sz-cols -d ',' -f 2 data.csv
-//!
-//! # Extract column range
-//! sz-cols -f 2-5 data.tsv
-//!
-//! # From stdin
-//! cat data.tsv | sz-cols -f 2
-//! ```
+//! Exit: 0 wrote a record, 1 ran and wrote none, 2 could not run. A line too short for the
+//! requested column still yields an empty field, so a narrow file exits 0, not 1.
 
 use std::io::{self, Write};
+use std::ops::RangeInclusive;
 
-use clap::Parser;
+use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
 use stringzilla::sz::{FindSplits, MatcherType};
 
-mod shared;
 use shared::*;
 
 /// Extract columns from delimited text
@@ -38,38 +26,103 @@ struct Args {
     /// Input file (use '-' or omit for stdin)
     input: Option<String>,
 
-    /// Field(s) to extract: single (2), list (1,3,5), or range (2-5)
-    #[arg(short = 'f', long = "fields", required = true)]
-    fields: String,
+    /// Column(s) to extract: single (2), list (1,3,5), or range (2-5)
+    #[arg(long, required = true)]
+    columns: String,
 
-    /// Field delimiter (default: tab)
-    #[arg(short = 'd', long = "delimiter", default_value = "\t")]
+    /// Column delimiter
+    #[arg(long, default_value = "\t")]
     delimiter: String,
 
-    /// Output delimiter (default: same as input delimiter)
-    #[arg(short = 'D', long = "output-delimiter")]
+    /// Output delimiter [default: the input delimiter]
+    #[arg(long)]
     output_delimiter: Option<String>,
 
-    /// Only output lines with at least N fields
-    #[arg(long = "min-fields")]
-    min_fields: Option<usize>,
+    /// Only output lines with at least N columns [default: no minimum]
+    #[arg(long)]
+    min_columns: Option<usize>,
 
-    /// Enable UTF-8 mode (validate input)
+    /// Treat the input as UTF-8 text
     #[arg(long)]
     utf8: bool,
 
-    /// Emit JSON Lines, one record per output line
-    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
-    json: bool,
+    /// How records are rendered
+    #[arg(
+        long,
+        value_enum,
+        default_value = "text",
+        help_heading = "Output Formats"
+    )]
+    format: Format,
 
-    /// NUL-terminate each output record; -D still separates fields within a record
-    #[arg(short = '0', long, help_heading = "Output Formats")]
+    /// NUL-terminate each output record instead of newline, for `xargs -0`
+    #[arg(long, help_heading = "Output Formats")]
     null: bool,
+
+    /// Suppress all output; exit 0 if any record was extracted, 1 otherwise
+    #[arg(long, conflicts_with_all = ["format", "null", "output_delimiter"], help_heading = "Output Formats")]
+    quiet: bool,
 }
 
-/// Parse field specification into a list of 0-based field indices
-fn parse_fields(spec: &str) -> Result<Vec<usize>, String> {
-    let mut fields = Vec::new();
+/// How records are rendered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Format {
+    /// The selected columns, joined by the output delimiter.
+    Text,
+    /// JSON Lines, one record per output line.
+    Json,
+}
+
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+}
+
+/// The constraints clap cannot express: `conflicts_with` fires on a flag's presence,
+/// never on its value, and an empty delimiter reaches the splitter unchecked.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    if args.delimiter.is_empty() {
+        return Err(reject("--delimiter cannot be empty"));
+    }
+    if args.format == Format::Json {
+        if args.output_delimiter.is_some() {
+            return Err(reject(
+                "--format json nests columns, so --output-delimiter has no effect",
+            ));
+        }
+        if args.null {
+            return Err(reject("--format json cannot be combined with --null"));
+        }
+    }
+    Ok(())
+}
+
+/// Read one 1-based column number into the 0-based index the split uses.
+///
+/// Every message names the token it read, which is why the empty case is separate: `2-`
+/// splits into `2` and nothing, and "invalid column number: " names nothing at all.
+fn parse_column(token: &str) -> Result<usize, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("a column number is missing; write both ends of a range, as in `2-5`".into());
+    }
+    let column: usize = token
+        .parse()
+        .map_err(|_| format!("`{token}` is not a column number"))?;
+    if column == 0 {
+        return Err("column numbers start at 1".into());
+    }
+    Ok(column - 1)
+}
+
+/// Parse a column specification — a number, a comma list, or a range — into 0-based terms,
+/// each kept as the inclusive range it names rather than as every index between its ends.
+fn parse_columns(spec: &str) -> Result<Vec<RangeInclusive<usize>>, String> {
+    if spec.trim().is_empty() {
+        return Err("no columns given; pass a column, a list, or a range".into());
+    }
+    let mut columns = Vec::new();
 
     for part in spec.split(',') {
         let part = part.trim();
@@ -77,167 +130,223 @@ fn parse_fields(spec: &str) -> Result<Vec<usize>, String> {
             // Range: "2-5"
             let parts: Vec<&str> = part.split('-').collect();
             if parts.len() != 2 {
-                return Err(format!("Invalid range: {}", part));
+                return Err(format!("`{part}` is not a range; a range has two ends"));
             }
-            let start: usize = parts[0]
-                .parse()
-                .map_err(|_| format!("Invalid field number: {}", parts[0]))?;
-            let end: usize = parts[1]
-                .parse()
-                .map_err(|_| format!("Invalid field number: {}", parts[1]))?;
-            if start == 0 || end == 0 {
-                return Err("Field numbers start at 1".to_string());
-            }
+            let (start, end) = (parse_column(parts[0])?, parse_column(parts[1])?);
             if start > end {
-                return Err(format!("Invalid range: {} > {}", start, end));
+                return Err(format!(
+                    "`{part}` runs backwards; a range reads low to high"
+                ));
             }
-            for i in start..=end {
-                fields.push(i - 1); // Convert to 0-based
-            }
+            columns.push(start..=end);
         } else {
-            // Single field: "2"
-            let num: usize = part
-                .parse()
-                .map_err(|_| format!("Invalid field number: {}", part))?;
-            if num == 0 {
-                return Err("Field numbers start at 1".to_string());
-            }
-            fields.push(num - 1); // Convert to 0-based
+            let index = parse_column(part)?;
+            columns.push(index..=index);
         }
     }
 
-    if fields.is_empty() {
-        return Err("No fields specified".to_string());
-    }
-
-    Ok(fields)
+    Ok(columns)
 }
 
-/// Split a line into `out` on the delimiter (SIMD `FindSplits`), reusing the
-/// caller's buffer to avoid a per-line allocation. Separator semantics give the
-/// trailing empty field on a trailing delimiter for free; an empty line has no
-/// fields (matching `cut`).
-fn split_fields<'a>(line: &'a [u8], delimiter: &'a [u8], out: &mut Vec<&'a [u8]>) {
+/// How far past the selection a line is read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldTally {
+    /// Stop at the fields the selection names.
+    Prefix,
+    /// Walk to the end of the line, and drop it below this many fields.
+    AtLeast(usize),
+}
+
+/// Split a line into `out` on the delimiter (SIMD `FindSplits`), as offsets into the line so
+/// that one buffer serves every window, and answer how many fields the line holds. Only the
+/// first `needed` are kept; `tally` decides whether the rest are counted or left unread. An
+/// empty line has no fields, matching `cut`.
+fn split_fields(
+    line: &[u8],
+    delimiter: &[u8],
+    needed: usize,
+    tally: FieldTally,
+    out: &mut Vec<Span>,
+) -> usize {
     out.clear();
     if line.is_empty() {
-        return;
+        return 0;
     }
-    out.extend(FindSplits::new(line, MatcherType::Find(delimiter)));
+    let mut splits = FindSplits::new(line, MatcherType::Find(delimiter)).map(|field| Span {
+        offset: offset_within(line, field),
+        length: field.len(),
+    });
+    out.extend(splits.by_ref().take(needed));
+    match tally {
+        FieldTally::Prefix => out.len(),
+        FieldTally::AtLeast(_) => out.len() + splits.count(),
+    }
+}
+
+/// Which fields to extract and how far each line has to be split, decided once from `Args`.
+#[derive(Clone, Copy)]
+struct ColumnSelection<'a> {
+    /// The specification's terms, in output order.
+    parts: &'a [RangeInclusive<usize>],
+    /// How many leading fields to split out.
+    needed: usize,
+    /// How far past those the line is read.
+    tally: FieldTally,
+    /// Separates fields within an input line.
+    delimiter: &'a [u8],
+}
+
+impl<'a> ColumnSelection<'a> {
+    /// Select `parts`, splitting only as far as the furthest of them reaches.
+    /// `--min-columns` tests the total column count, so it counts the rest as well.
+    fn new(
+        parts: &'a [RangeInclusive<usize>],
+        delimiter: &'a [u8],
+        min_columns: Option<usize>,
+    ) -> Self {
+        ColumnSelection {
+            parts,
+            needed: parts
+                .iter()
+                .map(|part| *part.end())
+                .max()
+                .map_or(0, |end| end + 1),
+            tally: match min_columns {
+                Some(minimum) => FieldTally::AtLeast(minimum),
+                None => FieldTally::Prefix,
+            },
+            delimiter,
+        }
+    }
+
+    /// Split `line` into `out` and answer whether the line is written.
+    #[inline]
+    fn takes(&self, line: &[u8], out: &mut Vec<Span>) -> bool {
+        let total = split_fields(line, self.delimiter, self.needed, self.tally, out);
+        match self.tally {
+            FieldTally::Prefix => true,
+            FieldTally::AtLeast(minimum) => total >= minimum,
+        }
+    }
+}
+
+/// What [`extract_data`] carries between windows, so a second call resumes where the first
+/// stopped. The field buffer lives here so one allocation serves the whole run.
+#[derive(Default)]
+struct ColsState {
+    /// Input lines seen so far, which `--format json` reports.
+    line_number: usize,
+    /// Records written so far, which decides whether the run found anything.
+    emitted: usize,
+    /// Fields of the line being written, as offsets into it, kept only as far as the
+    /// selection reaches.
+    fields: Vec<Span>,
+}
+
+/// How one extracted record is written out: the selected fields joined by a delimiter and
+/// closed by a terminator, or a JSON record nesting them as an array.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rendering<'a> {
+    Delimited {
+        delimiter: &'a [u8],
+        terminator: Terminator,
+    },
+    Json,
 }
 
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig<'a> {
-    json: bool,
-    terminator: Terminator,
-    /// Separates fields within one record; unused under `--json`, which nests them.
-    output_delimiter: &'a [u8],
-    /// Input name carried into the JSON envelope.
+    rendering: Rendering<'a>,
+    /// The input's path, carried into the JSON envelope.
     path: &'a str,
 }
 
-/// Write one extracted record as text, honoring the record terminator.
-fn write_record_text(
-    output: &mut dyn Write,
-    config: &OutputConfig,
-    fields: &[&[u8]],
-    field_indices: &[usize],
-) -> io::Result<()> {
-    let mut first = true;
-    for &index in field_indices {
-        if !first {
-            output.write_all(config.output_delimiter)?;
-        }
-        first = false;
-
-        if index < fields.len() {
-            output.write_all(fields[index])?;
-        }
-        // If field doesn't exist, output empty string (like cut)
+/// The selected field of `line`, or the empty one a line too short to hold it stands in
+/// for, which is what `cut` emits.
+#[inline]
+fn field_at<'a>(line: &'a [u8], fields: &[Span], index: usize) -> &'a [u8] {
+    match fields.get(index) {
+        Some(span) => &line[span.offset..span.offset + span.length],
+        None => b"",
     }
-    output.write_all(&[config.terminator.as_byte()])
 }
 
-/// Write one extracted record as a JSON Lines object, with the fields as an array.
-fn write_record_json(
+/// Write one extracted record. `line_number` is one-based, and only JSON reports it.
+fn write_record(
     output: &mut dyn Write,
     config: &OutputConfig,
-    fields: &[&[u8]],
-    field_indices: &[usize],
+    line: &[u8],
+    fields: &[Span],
+    parts: &[RangeInclusive<usize>],
     line_number: usize,
 ) -> io::Result<()> {
-    output.write_all(br#"{"type":"line","data":{"path":"#)?;
-    json_text_field_to(output, config.path.as_bytes())?;
-    output.write_all(br#","fields":["#)?;
-    let mut first = true;
-    for &index in field_indices {
-        if !first {
-            output.write_all(b",")?;
+    match config.rendering {
+        Rendering::Delimited {
+            delimiter,
+            terminator,
+        } => {
+            for (position, index) in parts.iter().cloned().flatten().enumerate() {
+                if position > 0 {
+                    output.write_all(delimiter)?;
+                }
+                output.write_all(field_at(line, fields, index))?;
+            }
+            output.write_all(&[terminator.as_byte()])
         }
-        first = false;
-        let field = fields.get(index).copied().unwrap_or(b"");
-        json_text_field_to(output, field)?;
+        Rendering::Json => {
+            output.write_all(br#"{"type":"line","data":{"path":"#)?;
+            json_text_field_to(output, config.path.as_bytes())?;
+            output.write_all(br#","columns":["#)?;
+            for (position, index) in parts.iter().cloned().flatten().enumerate() {
+                if position > 0 {
+                    output.write_all(b",")?;
+                }
+                json_text_field_to(output, field_at(line, fields, index))?;
+            }
+            write!(output, r#"],"line_number":{}}}}}"#, line_number)?;
+            output.write_all(b"\n")
+        }
     }
-    write!(output, r#"],"line_number":{}}}}}"#, line_number)?;
-    output.write_all(b"\n")
 }
 
-/// Extract specified columns from data
-fn extract_cols(
+/// Extract the selected columns from every complete line in `data`, resuming from `state`.
+fn extract_data(
     data: &[u8],
-    field_indices: &[usize],
-    delimiter: &[u8],
-    min_fields: Option<usize>,
+    state: &mut ColsState,
+    selection: &ColumnSelection,
+    newlines: Newlines,
     config: &OutputConfig,
     output: &mut dyn Write,
-) -> io::Result<usize> {
-    let mut line_count = 0;
-    let mut line_number = 0;
-    let mut fields: Vec<&[u8]> = Vec::new(); // reused across lines
-
-    for line in LineIter::new(data, Newlines::Lf) {
-        line_number += 1;
-        split_fields(line, delimiter, &mut fields);
-
-        // Skip lines with too few fields if min_fields is set
-        if let Some(min) = min_fields {
-            if fields.len() < min {
-                continue;
-            }
+) -> io::Result<()> {
+    for line in LineIter::new(data, newlines) {
+        state.line_number += 1;
+        if !selection.takes(line, &mut state.fields) {
+            continue;
         }
 
-        if config.json {
-            write_record_json(output, config, &fields, field_indices, line_number)?;
-        } else {
-            write_record_text(output, config, &fields, field_indices)?;
-        }
-        line_count += 1;
+        write_record(
+            output,
+            config,
+            line,
+            &state.fields,
+            selection.parts,
+            state.line_number,
+        )?;
+        state.emitted += 1;
     }
 
-    output.flush()?;
-    Ok(line_count)
+    Ok(())
 }
 
-fn main() {
-    let args = Args::parse();
+fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
 
-    // Parse field specification
-    let mut output = stdout_writer();
+    let columns = parse_columns(&args.columns)
+        .map_err(|message| Args::command().error(ErrorKind::ValueValidation, message))?;
 
-    let field_indices = match parse_fields(&args.fields) {
-        Ok(indices) => indices,
-        Err(message) => {
-            eprintln!("Error: {}", message);
-            ExitCode::Error.exit(&mut output);
-        }
-    };
-
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(error) => exit_with_error(&mut output, &error, "Error reading input"),
-    };
-
-    let data = input.as_bytes();
+    let path = args.input.as_deref().unwrap_or("-");
+    let input = get_input_streaming(args.input.as_deref()).at(path)?;
 
     let delimiter = args.delimiter.as_bytes();
     let output_delimiter = args
@@ -246,23 +355,47 @@ fn main() {
         .map(|delimiter| delimiter.as_bytes())
         .unwrap_or(delimiter);
 
+    let selection = ColumnSelection::new(&columns, delimiter, args.min_columns);
+
     let config = OutputConfig {
-        json: args.json,
-        terminator: Terminator::from_null(args.null),
-        output_delimiter,
-        path: args.input.as_deref().unwrap_or("-"),
+        rendering: match args.format {
+            Format::Json => Rendering::Json,
+            Format::Text => Rendering::Delimited {
+                delimiter: output_delimiter,
+                terminator: Terminator::from_null(args.null),
+            },
+        },
+        path,
     };
 
-    if let Err(error) = extract_cols(
-        data,
-        &field_indices,
-        delimiter,
-        args.min_fields,
-        &config,
-        &mut output,
-    ) {
-        exit_on_write_error(&mut output, &error, "Error");
-    }
+    // A quiet run still extracts, so the record count that answers it stays honest.
+    let destination = if args.quiet {
+        Destination::Discard
+    } else {
+        Destination::Stdout
+    };
+
+    let newlines = Newlines::from_utf8(args.utf8);
+    let mut state = ColsState::default();
+    // A whole input arrives as one window, so mapped and piped share this loop.
+    destination.write("sz-cols", output, |writer| {
+        let mut walk = Windows::over(input);
+        let mut consumed = 0;
+        while let Some((window, _)) = walk.next(newlines.into(), consumed)? {
+            consumed = window.len();
+            extract_data(window, &mut state, &selection, newlines, &config, writer)?;
+        }
+        Ok(())
+    })?;
+
+    output.flush().at("-")?;
+    Ok(Status::from_found(state.emitted > 0))
+}
+
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
+    let mut output = stdout_writer();
+    report("sz-cols", run(&args, &mut output))
 }
 
 #[cfg(test)]
@@ -270,39 +403,238 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_single_field_index() {
-        assert_eq!(parse_fields("2").unwrap(), vec![1]); // 0-based
-        assert_eq!(parse_fields("1").unwrap(), vec![0]);
+    fn names_the_token_it_read_in_every_column_error() {
+        // A range with a missing end used to report `Invalid column number: `, naming nothing.
+        for (spec, expected) in [
+            ("2-", "a column number is missing"),
+            ("abc", "`abc` is not a column number"),
+            ("0", "column numbers start at 1"),
+            ("5-2", "runs backwards"),
+            ("1-2-3", "is not a range"),
+            ("", "no columns given"),
+        ] {
+            let error = parse_columns(spec).expect_err("must not parse");
+            assert!(error.contains(expected), "`{spec}` reported `{error}`");
+        }
+    }
+    #[test]
+    fn counts_records_a_quiet_run_never_writes() {
+        // `--quiet` extracts into a sink, so the count that becomes the exit status
+        // is the same one a printing run would report.
+        let selection = ColumnSelection::new(&[0..=0], b"\t", None);
+        let config = text_config(b"\t");
+
+        let mut state = ColsState::default();
+        let mut discard = io::sink();
+        extract_data(
+            b"a\tb\n",
+            &mut state,
+            &selection,
+            Newlines::Lf,
+            &config,
+            &mut discard,
+        )
+        .unwrap();
+        assert!(Status::from_found(state.emitted > 0) == Status::Success);
+
+        let mut state = ColsState::default();
+        extract_data(
+            b"",
+            &mut state,
+            &selection,
+            Newlines::Lf,
+            &config,
+            &mut discard,
+        )
+        .unwrap();
+        assert!(Status::from_found(state.emitted > 0) == Status::NoResult);
     }
 
     #[test]
-    fn parses_comma_separated_field_list() {
-        assert_eq!(parse_fields("1,3,5").unwrap(), vec![0, 2, 4]);
-        assert_eq!(parse_fields("2, 4").unwrap(), vec![1, 3]); // with spaces
+    fn quiet_rejects_the_flags_it_would_ignore() {
+        // Under `--quiet` the exit status is the whole output, so nothing that shapes a
+        // record can reach it.
+        let rejected = [
+            vec!["sz-cols", "--columns", "1", "--quiet", "--format", "json"],
+            vec!["sz-cols", "--columns", "1", "--quiet", "--null"],
+            vec![
+                "sz-cols",
+                "--columns",
+                "1",
+                "--quiet",
+                "--output-delimiter",
+                ",",
+            ],
+        ];
+        for arguments in rejected {
+            assert!(
+                Args::try_parse_from(&arguments).is_err(),
+                "{:?} must be rejected",
+                arguments
+            );
+        }
+
+        // Which rows survive still steers the status, so the filters compose.
+        let accepted = [
+            vec!["sz-cols", "--columns", "1", "--quiet", "--min-columns", "3"],
+            vec!["sz-cols", "--columns", "1", "--quiet", "--delimiter", ","],
+            vec!["sz-cols", "--columns", "1", "--quiet", "--utf8"],
+        ];
+        for arguments in accepted {
+            assert!(
+                Args::try_parse_from(&arguments).is_ok(),
+                "{:?} must compose",
+                arguments
+            );
+        }
     }
 
     #[test]
-    fn parses_field_range() {
-        assert_eq!(parse_fields("2-5").unwrap(), vec![1, 2, 3, 4]);
-        assert_eq!(parse_fields("1-3").unwrap(), vec![0, 1, 2]);
+    fn declares_no_short_flags() {
+        assert!(Args::command()
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
     }
 
     #[test]
-    fn parses_mixed_field_list_and_range() {
-        assert_eq!(parse_fields("1,3-5,7").unwrap(), vec![0, 2, 3, 4, 6]);
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "columns",
+                "delimiter",
+                "output-delimiter",
+                "min-columns",
+                "utf8",
+                "format",
+                "null",
+                "quiet",
+                "help",
+                "version",
+            ]
+        );
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
     }
 
     #[test]
-    fn rejects_invalid_field_specs() {
-        assert!(parse_fields("0").is_err()); // 0 not allowed
-        assert!(parse_fields("5-2").is_err()); // invalid range
-        assert!(parse_fields("abc").is_err()); // not a number
+    fn names_the_path_a_failure_happened_on() {
+        // A missing input used to report `Error reading input: …`, naming nothing.
+        let args = Args::parse_from(["sz-cols", "--columns", "1", "missing.tsv"]);
+        let Err(failure) = run(&args, &mut io::sink()) else {
+            panic!("a missing input must fail");
+        };
+        assert!(
+            failure.to_string().starts_with("missing.tsv: "),
+            "{}",
+            failure
+        );
+    }
+
+    #[test]
+    fn rejects_what_json_would_silently_ignore() {
+        // An empty delimiter used to reach the splitter, and JSON used to drop both flags.
+        let parsed = |arguments: &[&str]| Args::try_parse_from(arguments).unwrap();
+        assert!(validate(&parsed(&["sz-cols", "--columns", "1", "--delimiter", ""])).is_err());
+        assert!(validate(&parsed(&[
+            "sz-cols",
+            "--columns",
+            "1",
+            "--format",
+            "json",
+            "--output-delimiter",
+            ","
+        ]))
+        .is_err());
+        assert!(validate(&parsed(&[
+            "sz-cols",
+            "--columns",
+            "1",
+            "--format",
+            "json",
+            "--null"
+        ]))
+        .is_err());
+        assert!(validate(&parsed(&[
+            "sz-cols",
+            "--columns",
+            "1",
+            "--output-delimiter",
+            ","
+        ]))
+        .is_ok());
+        assert!(validate(&parsed(&["sz-cols", "--columns", "1", "--null"])).is_ok());
+    }
+
+    #[test]
+    fn parses_single_column_index() {
+        assert_eq!(expanded("2"), vec![1]); // 0-based
+        assert_eq!(expanded("1"), vec![0]);
+    }
+
+    #[test]
+    fn parses_comma_separated_column_list() {
+        assert_eq!(expanded("1,3,5"), vec![0, 2, 4]);
+        assert_eq!(expanded("2, 4"), vec![1, 3]); // with spaces
+    }
+
+    #[test]
+    fn parses_column_range() {
+        assert_eq!(expanded("2-5"), vec![1, 2, 3, 4]);
+        assert_eq!(expanded("1-3"), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn parses_mixed_column_list_and_range() {
+        assert_eq!(expanded("1,3-5,7"), vec![0, 2, 3, 4, 6]);
+        // Order and duplicates are the flag's point, so neither is normalized away.
+        assert_eq!(expanded("3,1"), vec![2, 0]);
+        assert_eq!(expanded("1,1"), vec![0, 0]);
+        // A range is one term however wide, so the spec never sizes an allocation.
+        assert_eq!(
+            parse_columns("1-4000000000").unwrap(),
+            vec![0..=3_999_999_999]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_column_specs() {
+        assert!(parse_columns("0").is_err()); // 0 not allowed
+        assert!(parse_columns("5-2").is_err()); // invalid range
+        assert!(parse_columns("abc").is_err()); // not a number
+    }
+
+    /// The indices a specification names, in the order it names them.
+    fn expanded(spec: &str) -> Vec<usize> {
+        parse_columns(spec)
+            .unwrap()
+            .iter()
+            .cloned()
+            .flatten()
+            .collect()
     }
 
     fn fields<'a>(line: &'a [u8], delimiter: &'a [u8]) -> Vec<&'a [u8]> {
-        let mut out = Vec::new();
-        split_fields(line, delimiter, &mut out);
-        out
+        let mut spans = Vec::new();
+        split_fields(
+            line,
+            delimiter,
+            usize::MAX,
+            FieldTally::AtLeast(0),
+            &mut spans,
+        );
+        (0..spans.len())
+            .map(|index| field_at(line, &spans, index))
+            .collect()
     }
 
     #[test]
@@ -329,21 +661,80 @@ mod tests {
         );
     }
 
-    fn text_config(output_delimiter: &'static [u8]) -> OutputConfig<'static> {
+    fn text_config(delimiter: &'static [u8]) -> OutputConfig<'static> {
         OutputConfig {
-            json: false,
-            terminator: Terminator::Newline,
-            output_delimiter,
+            rendering: Rendering::Delimited {
+                delimiter,
+                terminator: Terminator::Newline,
+            },
             path: "-",
         }
+    }
+
+    /// Extract from a whole buffer, returning the output and the record count.
+    fn extract(
+        data: &[u8],
+        selection: &ColumnSelection,
+        newlines: Newlines,
+        config: &OutputConfig,
+    ) -> (Vec<u8>, usize) {
+        let mut state = ColsState::default();
+        let mut output = Vec::new();
+        extract_data(data, &mut state, selection, newlines, config, &mut output).unwrap();
+        (output, state.emitted)
+    }
+
+    /// Where a `capacity`-byte window ends: at the last record boundary inside it, or the
+    /// first one past it when no record fits, which is what a stream widens to.
+    fn window_end(data: &[u8], capacity: usize, newlines: Newlines) -> usize {
+        if capacity >= data.len() {
+            return data.len();
+        }
+        last_cut(&data[..capacity], newlines.into()).unwrap_or_else(|| {
+            LineSpans::new(data, newlines)
+                .next()
+                .map_or(data.len(), |span| span.length)
+        })
+    }
+
+    /// Extract the same way, one `capacity`-byte window at a time. [`Windows`] is fixed at
+    /// [`DEFAULT_WINDOW_BYTES`], which no test-sized input reaches, so the seams are drawn here.
+    fn extract_streamed(
+        data: &[u8],
+        capacity: usize,
+        selection: &ColumnSelection,
+        newlines: Newlines,
+        config: &OutputConfig,
+    ) -> (Vec<u8>, usize) {
+        let mut state = ColsState::default();
+        let mut output = Vec::new();
+        let mut rest = data;
+        while !rest.is_empty() {
+            let end = window_end(rest, capacity, newlines);
+            extract_data(
+                &rest[..end],
+                &mut state,
+                selection,
+                newlines,
+                config,
+                &mut output,
+            )
+            .unwrap();
+            rest = &rest[end..];
+        }
+        (output, state.emitted)
     }
 
     #[test]
     fn extracts_single_column() {
         let data = b"a\tb\tc\n1\t2\t3\n";
-        let mut output = Vec::new();
 
-        let count = extract_cols(data, &[1], b"\t", None, &text_config(b"\t"), &mut output).unwrap();
+        let (output, count) = extract(
+            data,
+            &ColumnSelection::new(&[1..=1], b"\t", None),
+            Newlines::Lf,
+            &text_config(b"\t"),
+        );
 
         assert_eq!(count, 2);
         assert_eq!(output, b"b\n2\n");
@@ -352,9 +743,13 @@ mod tests {
     #[test]
     fn extracts_and_reorders_multiple_columns() {
         let data = b"a\tb\tc\td\n";
-        let mut output = Vec::new();
 
-        extract_cols(data, &[0, 2], b"\t", None, &text_config(b","), &mut output).unwrap();
+        let (output, _) = extract(
+            data,
+            &ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
+            Newlines::Lf,
+            &text_config(b","),
+        );
 
         assert_eq!(output, b"a,c\n");
     }
@@ -362,21 +757,28 @@ mod tests {
     #[test]
     fn emits_empty_field_when_missing() {
         let data = b"a\tb\n";
-        let mut output = Vec::new();
 
-        extract_cols(data, &[0, 2], b"\t", None, &text_config(b"\t"), &mut output).unwrap();
+        let (output, _) = extract(
+            data,
+            &ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
+            Newlines::Lf,
+            &text_config(b"\t"),
+        );
 
         // Field 3 (index 2) doesn't exist, should output empty
         assert_eq!(output, b"a\t\n");
     }
 
     #[test]
-    fn skips_rows_below_min_fields() {
+    fn skips_rows_below_min_columns() {
         let data = b"a\tb\tc\na\n1\t2\t3\n";
-        let mut output = Vec::new();
 
-        let count =
-            extract_cols(data, &[1], b"\t", Some(3), &text_config(b"\t"), &mut output).unwrap();
+        let (output, count) = extract(
+            data,
+            &ColumnSelection::new(&[1..=1], b"\t", Some(3)),
+            Newlines::Lf,
+            &text_config(b"\t"),
+        );
 
         // Only lines with 3+ fields
         assert_eq!(count, 2);
@@ -386,31 +788,141 @@ mod tests {
     #[test]
     fn terminates_records_with_nul() {
         let data = b"a\tb\n1\t2\n";
-        let mut output = Vec::new();
         let mut config = text_config(b"\t");
-        config.terminator = Terminator::Null;
+        config.rendering = Rendering::Delimited {
+            delimiter: b"\t",
+            terminator: Terminator::Null,
+        };
 
-        extract_cols(data, &[0], b"\t", None, &config, &mut output).unwrap();
+        let (output, _) = extract(
+            data,
+            &ColumnSelection::new(&[0..=0], b"\t", None),
+            Newlines::Lf,
+            &config,
+        );
 
         assert_eq!(output, b"a\0\x31\0");
     }
 
     #[test]
-    fn emits_json_records_with_fields() {
+    fn emits_json_records_with_columns() {
         let data = b"a\tb\tc\n";
-        let mut output = Vec::new();
         let mut config = text_config(b"\t");
-        config.json = true;
+        config.rendering = Rendering::Json;
 
-        extract_cols(data, &[0, 2], b"\t", None, &config, &mut output).unwrap();
+        let (output, _) = extract(
+            data,
+            &ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
+            Newlines::Lf,
+            &config,
+        );
 
         assert_eq!(
             String::from_utf8(output).unwrap(),
             concat!(
                 r#"{"type":"line","data":{"path":{"text":"-"},"#,
-                r#""fields":[{"text":"a"},{"text":"c"}],"line_number":1}}"#,
+                r#""columns":[{"text":"a"},{"text":"c"}],"line_number":1}}"#,
                 "\n"
             )
         );
+    }
+
+    #[test]
+    fn stops_splitting_once_selected_columns_are_in_hand() {
+        let wide: Vec<u8> = {
+            let mut line: Vec<u8> = (0..64)
+                .map(|column| format!("c{}", column))
+                .collect::<Vec<_>>()
+                .join("\t")
+                .into_bytes();
+            line.push(b'\n');
+            line
+        };
+
+        let early = extract(
+            &wide,
+            &ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
+            Newlines::Lf,
+            &text_config(b"\t"),
+        );
+        let whole = extract(
+            &wide,
+            &ColumnSelection {
+                parts: &[0..=0, 2..=2],
+                needed: usize::MAX,
+                tally: FieldTally::AtLeast(0),
+                delimiter: b"\t",
+            },
+            Newlines::Lf,
+            &text_config(b"\t"),
+        );
+
+        let selection = ColumnSelection::new(&[0..=0, 2..=2], b"\t", None);
+        assert_eq!((selection.needed, selection.tally), (3, FieldTally::Prefix));
+        let counted = ColumnSelection::new(&[0..=0, 2..=2], b"\t", Some(4));
+        assert_eq!((counted.needed, counted.tally), (3, FieldTally::AtLeast(4)));
+        assert_eq!(early, whole);
+        assert_eq!(early.0, b"c0\tc2\n");
+    }
+
+    #[test]
+    fn splits_rows_on_unicode_newlines_under_utf8() {
+        // Line separators, which only the Unicode newline set breaks on.
+        let data = "a\tb\u{2028}c\td\n".as_bytes();
+        let selection = ColumnSelection::new(&[1..=1], b"\t", None);
+
+        let (output, count) = extract(data, &selection, Newlines::Unicode, &text_config(b"\t"));
+        assert_eq!(count, 2);
+        assert_eq!(output, b"b\nd\n");
+
+        // Without it the separator is ordinary text inside one wide field.
+        let (output, count) = extract(data, &selection, Newlines::Lf, &text_config(b"\t"));
+        assert_eq!(count, 1);
+        assert_eq!(output, "b\u{2028}c\n".as_bytes());
+    }
+
+    #[test]
+    fn streams_identically_to_whole_buffer() {
+        // A blank line, an over-wide line, and a final line without a terminator.
+        let data =
+            "a\tb\tc\n\t\t\n\nvery\tlong\trecord\u{2028}that\toutgrows\ta\ttiny\twindow\nx\ty"
+                .as_bytes();
+        let mut json = text_config(b",");
+        json.rendering = Rendering::Json;
+
+        for (newline_set, newlines) in [("lf", Newlines::Lf), ("unicode", Newlines::Unicode)] {
+            for selection in [
+                ColumnSelection::new(&[1..=1], b"\t", None),
+                ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
+                ColumnSelection::new(&[1..=1], b"\t", Some(3)),
+            ] {
+                for config in [text_config(b"\t"), text_config(b","), json] {
+                    let whole = extract(data, &selection, newlines, &config);
+                    for capacity in [7, 13, 64, 4096] {
+                        assert_eq!(
+                            extract_streamed(data, capacity, &selection, newlines, &config),
+                            whole,
+                            "{} newlines at capacity {}",
+                            newline_set,
+                            capacity
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streams_an_empty_input_without_records() {
+        let (output, count) = extract_streamed(
+            b"",
+            7,
+            &ColumnSelection::new(&[0..=0], b"\t", None),
+            Newlines::Lf,
+            &text_config(b"\t"),
+        );
+
+        assert!(output.is_empty());
+        assert_eq!(count, 0);
     }
 }

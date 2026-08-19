@@ -1,0 +1,31 @@
+{
+    "name": "stringzilla-cli",
+    "version": "0.1.0",
+    "description": "Search text with full Unicode case folding via sz-find, and edit files by content hash with sz-replace so a stale write refuses instead of clobbering. Plus faster drop-ins for sort, wc, cut, split and UAX-29 segmentation.",
+    "author": {
+        "name": "Ash Vardanian",
+        "url": "https://github.com/ashvardanian"
+    },
+    "homepage": "https://github.com/ashvardanian/StringZilla-CLI",
+    "repository": "https://github.com/ashvardanian/StringZilla-CLI",
+    "license": "Apache-2.0",
+    "keywords": [
+        "search",
+        "editing",
+        "text-processing",
+        "unicode",
+        "case-folding",
+        "utf8",
+        "simd",
+        "grep",
+        "sed"
+    ],
+    "skills": "./.agents/skills/",
+    "interface": {
+        "displayName": "StringZilla CLI",
+        "shortDescription": "SIMD string tools with Unicode folding and content-addressed editing",
+        "developerName": "Ash Vardanian",
+        "category": "Productivity",
+        "websiteURL": "https://github.com/ashvardanian/StringZilla-CLI"
+    }
+}
