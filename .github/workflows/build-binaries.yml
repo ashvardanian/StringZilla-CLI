@@ -144,7 +144,7 @@ jobs:
           mkdir -p "staging/$NAME"
           find "$RELEASE_DIR" -maxdepth 1 -type f -name 'sz-*' ! -name '*.d' ! -name '*.pdb' -exec cp {} "staging/$NAME/" \;
           cp README.md LICENSE "staging/$NAME/"
-          test "$(find "staging/$NAME" -name 'sz-*' | wc -l)" -eq 9
+          test "$(find "staging/$NAME" -name 'sz-*' | wc -l)" -eq 10
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
       # `COPYFILE_DISABLE` stops bsdtar on macOS from writing an `._` AppleDouble sibling for
@@ -226,7 +226,7 @@ jobs:
         run: |
           dpkg-deb --info "${{ steps.deb.outputs.file }}"
           dpkg-deb --field "${{ steps.deb.outputs.file }}" Architecture | grep -qx "${{ matrix.debarch }}"
-          test "$(dpkg-deb --contents "${{ steps.deb.outputs.file }}" | grep -c './usr/bin/sz-')" -eq 9
+          test "$(dpkg-deb --contents "${{ steps.deb.outputs.file }}" | grep -c './usr/bin/sz-')" -eq 10
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v5
