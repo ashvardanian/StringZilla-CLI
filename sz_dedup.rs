@@ -158,9 +158,12 @@ impl AppendOnlyFlatHashSet {
 #[inline]
 fn compute_hash(line: &[u8], ignore_case: bool, scratch: &mut Vec<u8>) -> u64 {
     if ignore_case {
-        // UTF-8 case folding can expand characters (e.g., ß → ss), max ~3x
-        scratch.clear();
-        scratch.resize(line.len().saturating_mul(3).max(64), 0);
+        // Folding can expand a character threefold (ß → ss), and only ever grows the buffer:
+        // re-zeroing what the fold overwrites would memset three times the line, per line.
+        let needed = line.len().saturating_mul(3).max(64);
+        if scratch.len() < needed {
+            scratch.resize(needed, 0);
+        }
         let folded_len = sz::utf8_uncased_fold(line, &mut scratch[..]);
         sz::hash(&scratch[..folded_len])
     } else {
@@ -303,7 +306,6 @@ fn dedup_to_writer(
     if config.rendering == Rendering::Json {
         write_summary_json(output, config.path, counts)?;
     }
-    output.flush()?;
     Ok(counts)
 }
 
@@ -410,40 +412,30 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     let input = get_input(args.input.as_deref()).at(path)?;
     let data = input.as_bytes();
 
-    // In-place is opt-in: the default writes to stdout like every other binary,
-    // so `sz-dedup file | head` cannot destroy the input.
-    let counts = if args.in_place {
-        let config = OutputConfig {
-            rendering: Rendering::Verbatim,
-            path,
-        };
-        write_replacing("sz-dedup", path, |output| {
-            dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
-        })?
-    } else if args.dry_run || args.quiet {
-        let config = OutputConfig {
-            rendering: Rendering::Terminated(Terminator::from_null(args.null)),
-            path,
-        };
-        dedup_to_writer(data, &mut io::sink(), args.ignore_case, utf8_mode, &config).at(path)?
+    // The destination decides the rendering: a rewritten file must differ from the original
+    // only by the lines that were dropped, and JSON is only legal where the records do not
+    // share stdout with the bytes they describe.
+    let (destination, rendering) = if args.in_place {
+        (Destination::Replacing(path), Rendering::Verbatim)
     } else {
-        let config = OutputConfig {
-            rendering: match args.format {
-                Format::Json => Rendering::Json,
-                Format::Text => Rendering::Terminated(Terminator::from_null(args.null)),
-            },
-            path,
+        let rendering = match args.format {
+            Format::Json => Rendering::Json,
+            Format::Text => Rendering::Terminated(Terminator::from_null(args.null)),
         };
-        // Through a temporary like `--in-place`, so an interrupted run leaves the previous
-        // file rather than a half-written one, and naming the input as the output does not
-        // truncate the mapping this run is still reading from.
-        match args.output.as_deref().filter(|path| *path != "-") {
-            Some(destination) => write_creating("sz-dedup", destination, |output| {
-                dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
-            })?,
-            None => dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config).at("-")?,
-        }
+        let destination = if args.dry_run || args.quiet {
+            Destination::Discard
+        } else {
+            match args.output.as_deref().filter(|name| *name != "-") {
+                Some(name) => Destination::Creating(name),
+                None => Destination::Stdout,
+            }
+        };
+        (destination, rendering)
     };
+    let config = OutputConfig { rendering, path };
+    let counts = destination.write("sz-dedup", output, |output| {
+        dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
+    })?;
 
     if args.format == Format::Json {
         // A run with no record stream still owes its one summary record.
@@ -678,10 +670,11 @@ mod tests {
         fs::write(&path, b"").unwrap();
         let config = verbatim_config();
 
-        let counts = write_replacing("sz-dedup", path.to_str().unwrap(), |output| {
-            dedup_to_writer(b"", output, false, false, &config)
-        })
-        .unwrap();
+        let counts = Destination::Replacing(path.to_str().unwrap())
+            .write("sz-dedup", &mut io::sink(), |output| {
+                dedup_to_writer(b"", output, false, false, &config)
+            })
+            .unwrap();
 
         assert_eq!(counts, DedupCounts::default());
         assert_eq!(fs::read(&path).unwrap(), b"");

@@ -47,7 +47,7 @@ use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz;
@@ -70,8 +70,8 @@ enum Format {
     Json,
 }
 
-/// Which kernel interface reads the files.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+/// Which kernel interface reads the files, declared fastest first and compared as declared.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
 enum IoBackend {
     /// The fastest interface this kernel offers, probed at startup.
     Auto,
@@ -159,11 +159,11 @@ struct Args {
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Performance")]
     io_chunk: Option<NonZeroUsize>,
 
-    /// Filter walked files by type (e.g., rust, py, js); named files are always hashed
+    /// Filter inputs by type (e.g., rust, py, js)
     #[arg(long = "type", help_heading = "Traversal")]
     file_type: Option<Vec<String>>,
 
-    /// Filter walked files by glob (e.g., "*.rs"); named files are always hashed
+    /// Filter inputs by glob (e.g., "*.rs")
     #[arg(long, help_heading = "Traversal")]
     glob: Option<Vec<String>>,
 
@@ -478,13 +478,16 @@ fn advance_group(
     members: &mut [usize; LANE_COUNT],
     count: usize,
 ) -> io::Result<()> {
-    debug_assert!(count <= LANE_COUNT && count <= fleet.ready());
-
-    // Taking is what guarantees the states are distinct, which the batched kernel requires: a slot
-    // sits on the ready ring at most once and cannot rejoin until `release` puts it back. The copy
-    // is 128 bytes a lane, against megabytes being hashed.
+    // Taking is what keeps the group's states distinct: a slot sits on the ready ring at most once
+    // and cannot rejoin until `release` does. Three fleets implement `ready`, so a ring that comes
+    // up short fails the group rather than the process.
+    if count > LANE_COUNT {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
     for lane in 0..count {
-        let slot = fleet.take().expect("counted before taking");
+        let Some(slot) = fleet.take() else {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        };
         members[lane] = slot;
         staging[lane] = states[slot];
     }
@@ -1653,28 +1656,22 @@ mod direct {
 fn select_fleet(plan: &HashPlan) -> Box<dyn Fleet> {
     #[cfg(target_os = "linux")]
     {
-        // `io_uring` first, AIO where it is forbidden, blocking where neither answers. Naming a
-        // backend explicitly skips the ones above it but still falls through if it is unavailable,
-        // so a wrong guess costs speed rather than the run.
-        if matches!(plan.backend, IoBackend::Auto | IoBackend::Uring) {
-            if let Ok(submitter) = direct::UringSubmitter::probe(plan.io_width, plan.depth) {
-                if let Ok(fleet) =
+        if plan.allows(IoBackend::Uring) {
+            let built =
+                direct::UringSubmitter::probe(plan.io_width, plan.depth).and_then(|submitter| {
                     direct::Streamer::new(submitter, plan.chunk_bytes, plan.io_width, plan.depth)
-                {
-                    return Box::new(fleet);
-                }
+                });
+            if let Ok(fleet) = built {
+                return Box::new(fleet);
             }
         }
-        if matches!(
-            plan.backend,
-            IoBackend::Auto | IoBackend::Uring | IoBackend::Aio
-        ) {
-            if let Ok(submitter) = direct::AioSubmitter::probe(plan.io_width, plan.depth) {
-                if let Ok(fleet) =
+        if plan.allows(IoBackend::Aio) {
+            let built =
+                direct::AioSubmitter::probe(plan.io_width, plan.depth).and_then(|submitter| {
                     direct::Streamer::new(submitter, plan.chunk_bytes, plan.io_width, plan.depth)
-                {
-                    return Box::new(fleet);
-                }
+                });
+            if let Ok(fleet) = built {
+                return Box::new(fleet);
             }
         }
     }
@@ -1729,6 +1726,12 @@ fn open_cap_for(files: usize, workers: usize, io_width: usize) -> usize {
 }
 
 impl HashPlan {
+    /// Whether `backend` may be tried: naming one skips the interfaces above it and still falls
+    /// through to those below when the kernel refuses it.
+    fn allows(&self, backend: IoBackend) -> bool {
+        self.backend <= backend
+    }
+
     /// Derive the widths from the memory budget. Throughput is flat from 1 KiB to 1 MiB per lane,
     /// so the chunk is a memory decision rather than a speed one, and it is what shrinks first:
     /// queue depth is what the disk actually cares about.
@@ -1775,7 +1778,7 @@ impl HashPlan {
 /// together — a group costs as much as its longest lane.
 struct WorkQueue<'a> {
     order: &'a [usize],
-    paths: &'a [PathBuf],
+    paths: &'a [&'a Path],
     sizes: &'a [u64],
     cursor: &'a AtomicUsize,
 }
@@ -1788,11 +1791,7 @@ impl<'a> Iterator for WorkQueue<'a> {
         // milliseconds to read.
         let at = self.cursor.fetch_add(1, Ordering::Relaxed);
         let position = *self.order.get(at)?;
-        Some((
-            position,
-            self.paths[position].as_path(),
-            self.sizes[position],
-        ))
+        Some((position, self.paths[position], self.sizes[position]))
     }
 }
 
@@ -1816,7 +1815,7 @@ fn dealt_round_robin(descending: Vec<usize>, workers: usize) -> Vec<usize> {
 }
 
 /// Hash every path, returning outcomes in the order the caller supplied them.
-fn hash_paths(paths: &[PathBuf], sizes: &[u64], plan: &HashPlan) -> Vec<Option<Outcome>> {
+fn hash_paths(paths: &[&Path], sizes: &[u64], plan: &HashPlan) -> Vec<Option<Outcome>> {
     let mut order: Vec<usize> = (0..paths.len()).collect();
     order.sort_by(|left, right| sizes[*right].cmp(&sizes[*left]).then(left.cmp(right)));
     let order = dealt_round_robin(order, plan.threads);
@@ -1857,7 +1856,10 @@ fn hash_paths(paths: &[PathBuf], sizes: &[u64], plan: &HashPlan) -> Vec<Option<O
         None => {
             let mut local = Vec::with_capacity(paths.len());
             run_worker(&mut local);
-            collected.lock().unwrap().extend(local);
+            collected
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(local);
         }
         // Spawned as late as possible: a `forkunion` worker spins on `PAUSE` from the moment it
         // is created, so any setup left between the spawn and the broadcast is burnt on every
@@ -1870,15 +1872,22 @@ fn hash_paths(paths: &[PathBuf], sizes: &[u64], plan: &HashPlan) -> Vec<Option<O
                 // file, never per chunk — but the capacity costs nothing to state.
                 let mut local = Vec::with_capacity(paths.len() / plan.threads + plan.io_width);
                 run_worker(&mut local);
-                // One lock per worker, at the end of its run, rather than one per file.
-                collected.lock().unwrap().extend(local);
+                // One lock per worker, at the end of its run, rather than one per file. The
+                // vector is append-only, so a poisoned lock still hands back coherent records.
+                collected
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend(local);
             });
         }
     }
 
     // Scatter back into input order, which is the only order a manifest may be written in.
     let mut outcomes: Vec<Option<Outcome>> = (0..paths.len()).map(|_| None).collect();
-    for (position, outcome) in collected.into_inner().unwrap() {
+    for (position, outcome) in collected
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+    {
         outcomes[position] = Some(outcome);
     }
     outcomes
@@ -1908,7 +1917,7 @@ fn write_digest_to(output: &mut dyn Write, digest: &Digest) -> io::Result<()> {
 /// Render every outcome, reporting how many records were written.
 fn write_digests_to(
     output: &mut dyn Write,
-    paths: &[PathBuf],
+    paths: &[&Path],
     outcomes: &[Option<Outcome>],
     config: &OutputConfig,
 ) -> io::Result<usize> {
@@ -2108,58 +2117,14 @@ fn write_check_report_to(
 
 // region: Input Processing
 
-/// What one resolved input turned out to be.
+/// Every input the names resolve to, measured once.
 ///
-/// The standard input is its own case rather than a path because no fleet can serve it: it
-/// cannot be sized before reading, reopened after a short read, or handed to a second worker.
-enum Source {
-    Stdin,
-    File(PathBuf, u64),
-}
-
-impl Source {
-    /// What this source is called in a record, which for the standard input is what
-    /// `sha256sum` calls it.
-    fn name(&self) -> PathBuf {
-        match self {
-            Source::Stdin => PathBuf::from("-"),
-            Source::File(path, _) => path.clone(),
-        }
-    }
-}
-
-/// Every source the inputs name, in the order they were named.
-fn gather_sources(
-    inputs: &[String],
-    globs: Option<&[glob::Pattern]>,
-    traversal: &TraversalOptions<'_>,
-    failures: &mut usize,
-) -> Vec<Source> {
-    let mut sources = Vec::new();
-    for input in inputs {
-        if input == "-" {
-            sources.push(Source::Stdin);
-            continue;
-        }
-        let path = Path::new(input);
-        // One stat answers every question this run has about a named file: whether it is a
-        // directory, whether it is readable, and how big it is. Measuring again later would
-        // double the syscalls on a run of many small files, where they already outnumber the
-        // reads three to one.
-        match fs::metadata(path) {
-            Ok(metadata) if metadata.is_dir() => sources.extend(
-                walk_files(path, traversal, globs, "sz-sha256", failures)
-                    .into_iter()
-                    .map(|(found, size)| Source::File(found, size)),
-            ),
-            Ok(metadata) => sources.push(Source::File(path.to_path_buf(), metadata.len())),
-            Err(error) => {
-                eprintln!("sz-sha256: {}: {}", input, error);
-                *failures += 1;
-            }
-        }
-    }
-    sources
+/// The size rides along because the queue is ordered by it: a worker that re-measured would
+/// `stat` each file a second time, and on a run of many small files those syscalls already
+/// outnumber the reads.
+fn measured(input: Input) -> Result<(Input, u64), Failure> {
+    let size = input.size().at(input.display_name())?;
+    Ok((input, size))
 }
 
 /// Hash the standard input, which no fleet can serve.
@@ -2192,13 +2157,13 @@ fn hash_stdin(chunk_bytes: usize) -> Outcome {
 ///
 /// Files go to the fleet together, so one pass still fills every lane; the standard input is
 /// spliced back into its own position afterwards.
-fn hash_sources(sources: &[Source], plan: &HashPlan) -> Vec<Option<Outcome>> {
+fn hash_sources(sources: &[(Input, u64)], plan: &HashPlan) -> Vec<Option<Outcome>> {
     let mut paths = Vec::with_capacity(sources.len());
     let mut sizes = Vec::with_capacity(sources.len());
     let mut positions = Vec::with_capacity(sources.len());
-    for (position, source) in sources.iter().enumerate() {
-        if let Source::File(path, size) = source {
-            paths.push(path.clone());
+    for (position, (input, size)) in sources.iter().enumerate() {
+        if matches!(input, Input::File(_)) {
+            paths.push(input.path());
             sizes.push(*size);
             positions.push(position);
         }
@@ -2208,8 +2173,8 @@ fn hash_sources(sources: &[Source], plan: &HashPlan) -> Vec<Option<Outcome>> {
     for (index, outcome) in hash_paths(&paths, &sizes, plan).into_iter().enumerate() {
         outcomes[positions[index]] = outcome;
     }
-    for (position, source) in sources.iter().enumerate() {
-        if matches!(source, Source::Stdin) {
+    for (position, (input, _)) in sources.iter().enumerate() {
+        if matches!(input, Input::Stdin) {
             outcomes[position] = Some(hash_stdin(plan.chunk_bytes));
         }
     }
@@ -2231,7 +2196,7 @@ fn run_check(
         return Ok(Status::Error);
     }
 
-    let paths: Vec<PathBuf> = lines.iter().map(|line| line.path.clone()).collect();
+    let paths: Vec<&Path> = lines.iter().map(|line| line.path.as_path()).collect();
     // A checksum list names files rather than walking to them, so this is their only measurement.
     let sizes: Vec<u64> = paths
         .iter()
@@ -2317,23 +2282,35 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         file_type: args.file_type.as_deref(),
     };
 
-    let mut failures = 0;
     let globs = args
         .glob
         .as_deref()
         .map(compile_globs)
         .transpose()
         .map_err(reject)?;
-    let sources = gather_sources(&args.inputs, globs.as_deref(), &traversal, &mut failures);
+
+    let mut tally = Tally::default();
+    let mut sources = Vec::new();
+    for resolved in inputs(&args.inputs, &traversal, globs.as_deref(), "sz-sha256") {
+        match resolved.and_then(measured) {
+            Ok(source) => sources.push(source),
+            Err(failure) => {
+                eprintln!("sz-sha256: {}", failure);
+                tally.failed();
+            }
+        }
+    }
     if sources.is_empty() {
-        return Ok(Status::of(failures > 0, false));
+        return Ok(tally.status());
     }
 
-    let paths: Vec<PathBuf> = sources.iter().map(Source::name).collect();
-    let sized = sources.iter().filter_map(|source| match source {
-        Source::File(_, size) => Some(*size),
-        Source::Stdin => None,
-    });
+    let paths: Vec<&Path> = sources.iter().map(|(input, _)| input.path()).collect();
+    // The standard input cannot be sized before it is read, so it is no part of the budget the
+    // widths are derived from.
+    let sized = sources
+        .iter()
+        .filter(|(input, _)| matches!(input, Input::File(_)))
+        .map(|(_, size)| *size);
     let plan = HashPlan::from_args(args, sources.len(), sized.sum());
     let started = std::time::Instant::now();
     let outcomes = hash_sources(&sources, &plan);
@@ -2356,7 +2333,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
                     source: named,
                 };
                 eprintln!("sz-sha256: {}", failure);
-                failures += 1;
+                tally.failed();
             }
             None => {}
         }
@@ -2369,14 +2346,13 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
             format: args.format,
             terminator: Terminator::from_null(args.null),
         };
-        // Through a temporary, as every other `--output` in this project is, so an interrupted
-        // run leaves the previous manifest rather than a half-written one.
-        match args.output.as_deref().filter(|path| *path != "-") {
-            Some(path) => write_creating("sz-sha256", path, |file| {
-                write_digests_to(file, &paths, &outcomes, &config)
-            })?,
-            None => write_digests_to(output, &paths, &outcomes, &config).at("-")?,
-        }
+        let destination = match args.output.as_deref().filter(|path| *path != "-") {
+            Some(path) => Destination::Creating(path),
+            None => Destination::Stdout,
+        };
+        destination.write("sz-sha256", output, |file| {
+            write_digests_to(file, &paths, &outcomes, &config)
+        })?
     };
     output.flush().at("-")?;
 
@@ -2384,7 +2360,10 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         write_summary_to(notes, hashed_count, total_bytes, elapsed).at("-")?;
     }
 
-    Ok(Status::of(failures > 0, written > 0))
+    if written > 0 {
+        tally.produced();
+    }
+    Ok(tally.status())
 }
 
 fn main() -> std::process::ExitCode {
@@ -2431,6 +2410,10 @@ mod tests {
             .collect()
     }
 
+    fn borrowed(paths: &[PathBuf]) -> Vec<&Path> {
+        paths.iter().map(PathBuf::as_path).collect()
+    }
+
     fn plan_with(chunk_bytes: usize, threads: usize) -> HashPlan {
         HashPlan {
             backend: IoBackend::Blocking,
@@ -2443,10 +2426,14 @@ mod tests {
     }
 
     fn digests_via(paths: &[PathBuf], chunk_bytes: usize) -> Vec<Digest> {
-        hash_paths(paths, &measure(paths), &plan_with(chunk_bytes, 1))
-            .into_iter()
-            .map(|outcome| outcome.unwrap().unwrap().digest)
-            .collect()
+        hash_paths(
+            &borrowed(paths),
+            &measure(paths),
+            &plan_with(chunk_bytes, 1),
+        )
+        .into_iter()
+        .map(|outcome| outcome.unwrap().unwrap().digest)
+        .collect()
     }
 
     /// The digest each file would get on its own, which every concurrent arrangement must match.
@@ -2533,11 +2520,14 @@ mod tests {
         let expected = digests_directly(&paths);
 
         for threads in [1, 2, 4, 8] {
-            let digests: Vec<Digest> =
-                hash_paths(&paths, &measure(&paths), &plan_with(1 << 16, threads))
-                    .into_iter()
-                    .map(|outcome| outcome.unwrap().unwrap().digest)
-                    .collect();
+            let digests: Vec<Digest> = hash_paths(
+                &borrowed(&paths),
+                &measure(&paths),
+                &plan_with(1 << 16, threads),
+            )
+            .into_iter()
+            .map(|outcome| outcome.unwrap().unwrap().digest)
+            .collect();
             assert_eq!(digests, expected, "threads {}", threads);
         }
     }
@@ -2548,10 +2538,11 @@ mod tests {
         // the results the caller sees.
         let (_directory, paths) = scratch_files(&[10, 900_000, 50, 400_000, 3]);
         let expected = digests_directly(&paths);
-        let digests: Vec<Digest> = hash_paths(&paths, &measure(&paths), &plan_with(1 << 16, 2))
-            .into_iter()
-            .map(|outcome| outcome.unwrap().unwrap().digest)
-            .collect();
+        let digests: Vec<Digest> =
+            hash_paths(&borrowed(&paths), &measure(&paths), &plan_with(1 << 16, 2))
+                .into_iter()
+                .map(|outcome| outcome.unwrap().unwrap().digest)
+                .collect();
         assert_eq!(digests, expected);
     }
 
@@ -2561,7 +2552,11 @@ mod tests {
         let mut all = paths.clone();
         all.insert(1, directory.path().join("absent.bin"));
 
-        let outcomes = hash_paths(&all, &measure(&all), &plan_with(DIRECT_IO_ALIGNMENT, 1));
+        let outcomes = hash_paths(
+            &borrowed(&all),
+            &measure(&all),
+            &plan_with(DIRECT_IO_ALIGNMENT, 1),
+        );
 
         assert_eq!(outcomes.len(), 3);
         assert!(matches!(outcomes[0], Some(Ok(_))));
@@ -2572,7 +2567,11 @@ mod tests {
     #[test]
     fn writes_coreutils_format_byte_for_byte() {
         let (_directory, paths) = scratch_files(&[7]);
-        let outcomes = hash_paths(&paths, &measure(&paths), &plan_with(DIRECT_IO_ALIGNMENT, 1));
+        let outcomes = hash_paths(
+            &borrowed(&paths),
+            &measure(&paths),
+            &plan_with(DIRECT_IO_ALIGNMENT, 1),
+        );
         let config = OutputConfig {
             format: Format::Coreutils,
             terminator: Terminator::Newline,
@@ -2580,7 +2579,7 @@ mod tests {
 
         let mut rendered = Vec::new();
         assert_eq!(
-            write_digests_to(&mut rendered, &paths, &outcomes, &config).unwrap(),
+            write_digests_to(&mut rendered, &borrowed(&paths), &outcomes, &config).unwrap(),
             1
         );
 
@@ -2595,14 +2594,18 @@ mod tests {
     #[test]
     fn terminates_records_with_nul_under_null() {
         let (_directory, paths) = scratch_files(&[3]);
-        let outcomes = hash_paths(&paths, &measure(&paths), &plan_with(DIRECT_IO_ALIGNMENT, 1));
+        let outcomes = hash_paths(
+            &borrowed(&paths),
+            &measure(&paths),
+            &plan_with(DIRECT_IO_ALIGNMENT, 1),
+        );
         let config = OutputConfig {
             format: Format::Coreutils,
             terminator: Terminator::Null,
         };
 
         let mut rendered = Vec::new();
-        write_digests_to(&mut rendered, &paths, &outcomes, &config).unwrap();
+        write_digests_to(&mut rendered, &borrowed(&paths), &outcomes, &config).unwrap();
         assert_eq!(rendered.last(), Some(&0));
     }
 
@@ -2636,7 +2639,7 @@ mod tests {
                 depth: 4,
                 open_cap: 2 * LANE_COUNT,
             };
-            let digests: Vec<Digest> = hash_paths(&paths, &measure(&paths), &plan)
+            let digests: Vec<Digest> = hash_paths(&borrowed(&paths), &measure(&paths), &plan)
                 .into_iter()
                 .map(|outcome| outcome.unwrap().unwrap().digest)
                 .collect();
@@ -2654,7 +2657,7 @@ mod tests {
         plan.io_width = LANE_COUNT;
         plan.open_cap = LANE_COUNT;
 
-        let digests: Vec<Digest> = hash_paths(&paths, &measure(&paths), &plan)
+        let digests: Vec<Digest> = hash_paths(&borrowed(&paths), &measure(&paths), &plan)
             .into_iter()
             .map(|outcome| outcome.unwrap().unwrap().digest)
             .collect();
@@ -2675,7 +2678,7 @@ mod tests {
                 plan.backend = backend;
                 plan.io_width = io_width;
                 plan.open_cap = io_width;
-                let digests: Vec<Digest> = hash_paths(&paths, &measure(&paths), &plan)
+                let digests: Vec<Digest> = hash_paths(&borrowed(&paths), &measure(&paths), &plan)
                     .into_iter()
                     .map(|outcome| outcome.unwrap().unwrap().digest)
                     .collect();
@@ -2780,7 +2783,7 @@ mod tests {
             format: Format::Bsd,
             terminator: Terminator::from_null(false),
         };
-        write_digests_to(&mut rendered, &paths, &outcomes, &config).unwrap();
+        write_digests_to(&mut rendered, &borrowed(&paths), &outcomes, &config).unwrap();
 
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.starts_with("SHA256 ("), "{}", text);
@@ -2887,14 +2890,18 @@ mod tests {
     #[test]
     fn writes_json_lines_with_escaped_paths() {
         let (_directory, paths) = scratch_files(&[5]);
-        let outcomes = hash_paths(&paths, &measure(&paths), &plan_with(DIRECT_IO_ALIGNMENT, 1));
+        let outcomes = hash_paths(
+            &borrowed(&paths),
+            &measure(&paths),
+            &plan_with(DIRECT_IO_ALIGNMENT, 1),
+        );
         let config = OutputConfig {
             format: Format::Json,
             terminator: Terminator::Newline,
         };
 
         let mut rendered = Vec::new();
-        write_digests_to(&mut rendered, &paths, &outcomes, &config).unwrap();
+        write_digests_to(&mut rendered, &borrowed(&paths), &outcomes, &config).unwrap();
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.starts_with(r#"{"type":"file","data":{"path":"#));
         assert!(text.contains(r#""bytes":5"#));

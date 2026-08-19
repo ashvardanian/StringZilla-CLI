@@ -35,3 +35,32 @@ if [ -n "${violations//[$'\n']/}" ]; then
     echo "$violations" >&2
     exit 1
 fi
+
+# Static analysis, on the Rust files this commit actually touches. `[lints.clippy]` in
+# Cargo.toml carries the rules; this is what makes them bite before review rather than after.
+staged_rust=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)
+if [ -n "$staged_rust" ]; then
+    # Cheapest rule first. A tally counted through an out-parameter is the shape this suite
+    # keeps re-growing: a quantity carried beside the control flow instead of returned by it.
+    # A counter is the shape that goes wrong; a `&mut bool` latch is ordinary state.
+    if tallies=$(printf '%s\n' "$staged_rust" | xargs grep -nE ':[[:space:]]*&mut (usize|u64)[,)]' 2>/dev/null \
+        | grep -vE 'state|scratch|buffer|refill|counts|index|offset'); then
+        echo "error: a counter passed as an out-parameter; return it, or fold it into a Tally." >&2
+        printf '%s\n' "$tallies" >&2
+        exit 1
+    fi
+
+    if ! cargo fmt --check >/dev/null 2>&1; then
+        echo "error: rustfmt would change staged files; run 'cargo fmt'." >&2
+        cargo fmt --check 2>&1 | head -20 >&2
+        exit 1
+    fi
+
+    # No `-D warnings` here: the `[lints.clippy]` table already says which lints block and
+    # which only inform, and promoting the informative ones would overrule it.
+    if ! clippy=$(cargo clippy --bins --lib 2>&1); then
+        echo "error: clippy rejected the staged tree." >&2
+        printf '%s\n' "$clippy" | grep -E '^(error|warning)' | head -20 >&2
+        exit 1
+    fi
+fi

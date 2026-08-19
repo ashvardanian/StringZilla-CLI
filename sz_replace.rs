@@ -298,29 +298,10 @@ enum Edit<'a> {
     Lines(Vec<Splice>),
 }
 
-/// Where the bytes to transform come from. Owned, so the borrow of the mapping lasts
-/// exactly as long as the run that is reading it.
-enum Source {
-    /// The whole input at once: a mapped file, or a pipe a run had to hold.
-    Whole(InputSource),
-    /// A pipe, read one window at a time.
-    Windows(Refill<io::StdinLock<'static>>),
-}
-
-impl Source {
-    /// The whole input, for the decisions that cannot be made without it.
-    fn whole(&self) -> Option<&[u8]> {
-        match self {
-            Source::Whole(held) => Some(held.as_bytes()),
-            Source::Windows(_) => None,
-        }
-    }
-}
-
 /// Everything the replacement needs that does not depend on where it is written, so the
 /// destinations cannot disagree about what they are producing or whether it is hashed.
 struct Substitution<'a> {
-    source: Source,
+    source: InputWindow,
     edit: Edit<'a>,
     /// Whether the produced bytes are hashed on their way out. A run that reports no hash
     /// pays for none, which is what keeps the plain pipe as fast as it was.
@@ -455,7 +436,7 @@ impl Substitution<'_> {
     fn emit(&mut self, destination: &mut dyn Write) -> io::Result<(usize, usize)> {
         let edit = &self.edit;
         match &mut self.source {
-            Source::Whole(held) => {
+            InputWindow::Whole(held) => {
                 let data = held.as_bytes();
                 match edit {
                     Edit::Substring {
@@ -487,7 +468,7 @@ impl Substitution<'_> {
                     }
                 }
             }
-            Source::Windows(refill) => {
+            InputWindow::Stream(refill) => {
                 // A name is resolved against every candidate before anything is written, so
                 // a run that addresses lines never reaches here without the whole input.
                 let Edit::Substring {
@@ -757,22 +738,22 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     let pattern = args.pattern.as_bytes();
     let replacement = args.replacement.as_bytes();
 
-    let source = match input.into_window(DEFAULT_WINDOW_BYTES) {
-        InputWindow::Whole(held) => Source::Whole(held),
-        // Hashed as it arrives, before anything reads it, so a streamed run can still report
-        // what it read without holding it.
-        InputWindow::Stream(mut refill) => {
-            if reports_hashes {
-                refill.hash_stream();
-            }
-            Source::Windows(refill)
+    let mut source = input.into_window(DEFAULT_WINDOW_BYTES);
+    // Hashed as it arrives, before anything reads it, so a streamed run can still report
+    // what it read without holding it.
+    if let InputWindow::Stream(refill) = &mut source {
+        if reports_hashes {
+            refill.hash_stream();
         }
+    }
+    let whole = match &source {
+        InputWindow::Whole(held) => Some(held.as_bytes()),
+        InputWindow::Stream(_) => None,
     };
 
     // Settled before any destination is opened, so a refused edit has nothing to retract;
     // and the fast path pays for a hash only when one will be reported.
-    let mapped_hash = source
-        .whole()
+    let mapped_hash = whole
         .filter(|_| args.expect_hash.is_some() || reports_hashes)
         .map(content_hash);
     if let Some((expected, actual)) = args.expect_hash.zip(mapped_hash) {
@@ -785,7 +766,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         }
     }
 
-    let edit = match source.whole() {
+    let edit = match whole {
         Some(data) if args.match_kind == Match::LineHash => {
             Edit::Lines(resolve_lines(args, data, path)?)
         }
@@ -822,29 +803,23 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         hashed: reports_hashes,
     };
 
-    let produced = if counting_only {
-        // Discarding the output still reads the input, so this reports a failed read rather
-        // than panicking on it, as its two siblings do.
-        substitution.write_to(&mut io::sink()).at(path)?
+    let destination = if counting_only {
+        Destination::Discard
     } else if args.in_place {
-        write_replacing("sz-replace", path, |output| substitution.write_to(output))?
-    } else if let Some(destination) = args.output.as_deref().filter(|path| *path != "-") {
-        // Through a temporary like `--in-place`, so an interrupted run leaves the previous
-        // file rather than a half-written one — and so naming the input as the output does
-        // not truncate the mapping this run is still reading from.
-        write_creating("sz-replace", destination, |output| {
-            substitution.write_to(output)
-        })?
+        Destination::Replacing(path)
     } else {
-        // Straight to stdout — no full-output buffer. A pipe closing during the flush ends
-        // the run where one closing during the write does.
-        substitution.write_to(output).at("-")?
+        match args.output.as_deref().filter(|name| *name != "-") {
+            Some(name) => Destination::Creating(name),
+            None => Destination::Stdout,
+        }
     };
+    let produced =
+        destination.write("sz-replace", output, |output| substitution.write_to(output))?;
 
     // A mapped run hashed its input up front; a streamed one accumulated it while reading.
     let hash_before = mapped_hash.or_else(|| match &substitution.source {
-        Source::Windows(refill) => refill.digest(),
-        Source::Whole(_) => None,
+        InputWindow::Stream(refill) => refill.digest(),
+        InputWindow::Whole(_) => None,
     });
     let summary = Summary {
         path,

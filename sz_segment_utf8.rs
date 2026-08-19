@@ -15,7 +15,6 @@
 
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
-use std::path::Path;
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz::{
@@ -359,7 +358,7 @@ impl OutputConfig {
     }
 }
 
-/// Write one record. `path_json` is the pre-escaped path, built once per file so the
+/// Write one record. `path_json` is the pre-escaped path, refreshed once per input so the
 /// JSON path is never re-escaped per segment.
 fn write_record(
     output: &mut dyn Write,
@@ -414,28 +413,6 @@ fn write_count(
 // endregion: Output
 
 // region: Segmentation
-
-/// Segment a whole input. A `--chunk-bytes` budget packs the segments into chunks, which
-/// re-slices the source span and so needs every byte of the input at once.
-fn segment_data(
-    data: &[u8],
-    segmentation: Segmentation,
-    config: &OutputConfig,
-    path_json: &[u8],
-    output: &mut dyn Write,
-) -> io::Result<usize> {
-    match config.chunk_bytes {
-        Some(chunk_bytes) => write_chunks(
-            data,
-            segmentation,
-            config,
-            path_json,
-            chunk_bytes.get(),
-            output,
-        ),
-        None => write_segments(data, segmentation, config, path_json, 0, output),
-    }
-}
 
 /// Segment `data` and write the records, returning how many were emitted. `base` is where
 /// `data` starts in the input, so a streamed window still reports absolute offsets.
@@ -517,109 +494,64 @@ fn write_chunks(
 
 // endregion: Segmentation
 
-// region: Streaming
-
-/// Segment a pipe one window at a time, cutting each window where [`By::cut_after`] says
-/// the automaton restarts. `base` tracks where the window starts in the input, so
-/// `--fields byte-span` and `--format json` report the absolute positions the mapped path does.
-fn segment_stream(
-    refill: &mut Refill<impl io::Read>,
-    segmentation: Segmentation,
-    config: &OutputConfig,
-    path_json: &[u8],
-    output: &mut dyn Write,
-) -> io::Result<usize> {
-    let mut records = 0;
-    let mut base = 0;
-    refill.for_each_window(segmentation.by.cut_after(), |window| {
-        records += write_segments(window, segmentation, config, path_json, base, output)?;
-        base += window.len();
-        Ok(())
-    })?;
-    Ok(records)
-}
-
-// endregion: Streaming
-
 // region: Inputs
 
-/// Segment one input, mapping it into memory when it is a file and windowing it when it
-/// is a pipe.
+/// Segment one input, walking it in windows where it arrives as a stream. `path_json` is the
+/// caller's scratch buffer, refilled here so one allocation serves the whole run.
 fn segment_input(
-    path: Option<&str>,
+    input: &Input,
     segmentation: Segmentation,
     config: &OutputConfig,
+    path_json: &mut Vec<u8>,
     output: &mut dyn Write,
 ) -> io::Result<usize> {
-    let input = if can_stream(segmentation, config) {
-        get_input_streaming(path)?
+    let name = input.display_name();
+    let source = if can_stream(segmentation, config) {
+        get_input_streaming(Some(&name))?
     } else {
-        get_input(path)?
+        get_input(Some(&name))?
     };
-    let shown = path.unwrap_or("-");
 
-    // Escape the path once per file, never per segment.
-    let mut path_json = Vec::new();
+    path_json.clear();
     if config.render == Render::Json {
-        json_text_field_to(&mut path_json, shown.as_bytes())?;
+        json_text_field_to(path_json, name.as_bytes())?;
     }
+    let path_json = &path_json[..];
 
-    let records = match input.into_window(DEFAULT_WINDOW_BYTES) {
-        InputWindow::Whole(source) => {
-            segment_data(source.as_bytes(), segmentation, config, &path_json, output)?
+    let mut windows = Windows::over(source);
+    let records = match config.chunk_bytes {
+        // Chunking re-slices the source span, so `can_stream` already refused to stream it.
+        Some(chunk_bytes) => {
+            let data = windows
+                .whole()
+                .expect("a chunked run reads the whole input");
+            write_chunks(
+                data,
+                segmentation,
+                config,
+                path_json,
+                chunk_bytes.get(),
+                output,
+            )?
         }
-        InputWindow::Stream(mut refill) => {
-            segment_stream(&mut refill, segmentation, config, &path_json, output)?
+        None => {
+            let cut = segmentation.by.cut_after();
+            let (mut records, mut consumed) = (0, 0);
+            while let Some((window, base)) = windows.next(cut, consumed)? {
+                consumed = window.len();
+                records += write_segments(window, segmentation, config, path_json, base, output)?;
+            }
+            records
         }
     };
 
     if config.report == Report::Count {
-        write_count(output, config, &path_json, records)?;
+        write_count(output, config, path_json, records)?;
     }
     Ok(records)
 }
 
-/// Collect the files named by the inputs, walking directories with ignore support.
-fn resolve_inputs(
-    inputs: &[String],
-    globs: Option<&[glob::Pattern]>,
-    traversal: &TraversalOptions<'_>,
-) -> Vec<String> {
-    let mut resolved = Vec::new();
-    for input in inputs {
-        let path = Path::new(input);
-        if input == "-" || !path.is_dir() {
-            resolved.push(input.clone());
-            continue;
-        }
-        for entry in walker(path, traversal, "sz-segment-utf8") {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    eprintln!("sz-segment-utf8: {}", error);
-                    continue;
-                }
-            };
-            if !is_readable_entry(&entry) {
-                continue;
-            }
-            // The walker has no glob filter of its own, so `--glob` is applied here.
-            if !glob_selects(globs, &entry) {
-                continue;
-            }
-            resolved.push(entry.path().display().to_string());
-        }
-    }
-    resolved
-}
-
 // endregion: Inputs
-
-/// The status a finished run reports, from whether any named input went unread and whether
-/// any record survived the filter.
-fn outcome(inputs: usize, readable: usize, records: usize) -> Status {
-    Status::of(readable < inputs, records > 0)
-}
 
 fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
@@ -639,24 +571,39 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         .map(compile_globs)
         .transpose()
         .map_err(reject)?;
-    let inputs = resolve_inputs(&args.inputs, globs.as_deref(), &traversal);
-    let mut records = 0;
-    let mut readable = 0;
+    let mut tally = Tally::default();
+    let mut path_json = Vec::new();
 
-    for input in &inputs {
-        let path = (input != "-").then_some(input.as_str());
-        match segment_input(path, segmentation, &config, output) {
-            Ok(count) => {
-                records += count;
-                readable += 1;
+    for resolved in inputs(
+        &args.inputs,
+        &traversal,
+        globs.as_deref(),
+        "sz-segment-utf8",
+    ) {
+        let input = match resolved {
+            Ok(input) => input,
+            Err(failure) => {
+                eprintln!("sz-segment-utf8: {}", failure);
+                tally.failed();
+                continue;
             }
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Err(error).at(input),
-            Err(error) => eprintln!("sz-segment-utf8: {}: {}", input, error),
+        };
+        let name = input.display_name();
+        match segment_input(&input, segmentation, &config, &mut path_json, output) {
+            Ok(records) if records > 0 => tally.produced(),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                return Err(error).at(name.as_ref())
+            }
+            Err(error) => {
+                eprintln!("sz-segment-utf8: {}: {}", name, error);
+                tally.failed();
+            }
         }
     }
 
     output.flush().at("-")?;
-    Ok(outcome(inputs.len(), readable, records))
+    Ok(tally.status())
 }
 
 fn main() -> std::process::ExitCode {
@@ -686,15 +633,28 @@ mod tests {
         (String::from_utf8(bytes).unwrap(), records)
     }
 
+    const PATH_JSON: &[u8] = br#"{"text":"-"}"#;
+
     /// Render the whole input in one call, the way a mapped file is read.
     fn whole(data: &[u8], segmentation: Segmentation, config: &OutputConfig) -> (Vec<u8>, usize) {
         let mut output = Vec::new();
-        let records =
-            segment_data(data, segmentation, config, br#"{"text":"-"}"#, &mut output).unwrap();
+        let records = match config.chunk_bytes {
+            Some(chunk_bytes) => write_chunks(
+                data,
+                segmentation,
+                config,
+                PATH_JSON,
+                chunk_bytes.get(),
+                &mut output,
+            ),
+            None => write_segments(data, segmentation, config, PATH_JSON, 0, &mut output),
+        }
+        .unwrap();
         (output, records)
     }
 
     /// Render the same input through `capacity`-byte windows, the way a pipe is read.
+    /// [`Windows`] fixes its own capacity, so the seams are driven straight off a [`Refill`].
     fn streamed(
         data: &[u8],
         segmentation: Segmentation,
@@ -703,14 +663,15 @@ mod tests {
     ) -> (Vec<u8>, usize) {
         let mut output = Vec::new();
         let mut refill = Refill::new(data, capacity);
-        let records = segment_stream(
-            &mut refill,
-            segmentation,
-            config,
-            br#"{"text":"-"}"#,
-            &mut output,
-        )
-        .unwrap();
+        let (mut records, mut base) = (0, 0);
+        refill
+            .for_each_window(segmentation.by.cut_after(), |window| {
+                records +=
+                    write_segments(window, segmentation, config, PATH_JSON, base, &mut output)?;
+                base += window.len();
+                Ok(())
+            })
+            .unwrap();
         (output, records)
     }
 
@@ -1040,17 +1001,22 @@ mod tests {
         // A `--glob` that matched nothing resolves to no inputs at all, which is a run that
         // completed and found nothing — not a run that failed. That distinction is the whole
         // point of this test: it once exited 2 with no message.
-        assert!(outcome(0, 0, 0) == Status::NoResult);
+        assert!(Tally::default().status() == Status::NoResult);
 
-        // An input that could not be read is a run that did not complete, whether it was the
-        // only one or had readable neighbours that produced records.
-        assert!(outcome(2, 0, 0) == Status::Error);
-        assert!(outcome(2, 1, 0) == Status::Error);
-        assert!(outcome(2, 1, 5) == Status::Error);
+        // A walk failure, a resolution failure and a read failure are all the same answer: the
+        // run did not complete, whatever its readable neighbours produced.
+        let mut unread = Tally::default();
+        unread.failed();
+        assert!(unread.status() == Status::Error);
+        let mut mixed = unread;
+        mixed.produced();
+        assert!(mixed.status() == Status::Error);
 
-        // Everything readable, so only the record count decides.
-        assert!(outcome(2, 2, 0) == Status::NoResult);
-        assert!(outcome(2, 2, 5) == Status::Success);
+        // Everything readable, so only whether anything was produced decides.
+        let mut readable = Tally::default();
+        assert!(readable.status() == Status::NoResult);
+        readable.produced();
+        assert!(readable.status() == Status::Success);
     }
 
     #[test]

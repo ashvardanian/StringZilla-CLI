@@ -9,12 +9,12 @@
 //! `--repeat-header` repeats a prefix into each chunk, which is the one case where a chunk is not a
 //! single contiguous range.
 //!
-//! Exit: 0 wrote a chunk, 1 wrote none, 2 could not run.
+//! Exit: 0 wrote a chunk, 1 wrote none, 2 could not run, 3 ran out of suffixes with chunks
+//! already written.
 
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
-use std::ops::ControlFlow;
 
 use clap::{CommandFactory, Parser};
 use stringzilla::sz;
@@ -106,19 +106,29 @@ enum Format {
     Json,
 }
 
-/// The chunk name suffix for `index` — aa, ab, ac, ... az, ba, bb, ... — or `None` once
-/// `index` needs more than `length` characters, where wrapping would reuse an earlier name.
-fn generate_suffix(index: usize, length: usize) -> Option<String> {
-    let mut suffix = String::with_capacity(length);
-    let mut remaining = index;
+/// Widest suffix a chunk name can carry: `NAME_MAX`, past which no filesystem here would
+/// create the file anyway.
+const MAX_SUFFIX_LENGTH: usize = 255;
 
-    for _ in 0..length {
-        suffix.insert(0, (b'a' + (remaining % 26) as u8) as char);
+/// The chunk name suffix for `index` — aa, ab, ac, ... az, ba, bb, ... — written into
+/// `buffer` from the back, or `None` once `index` needs more than `length` characters, where
+/// wrapping would reuse an earlier name.
+fn generate_suffix(
+    buffer: &mut [u8; MAX_SUFFIX_LENGTH],
+    index: usize,
+    length: usize,
+) -> Option<&str> {
+    let digits = buffer.get_mut(..length)?;
+    let mut remaining = index;
+    for slot in digits.iter_mut().rev() {
+        *slot = b'a' + (remaining % 26) as u8;
         remaining /= 26;
     }
-
     // A non-zero leftover is the overflow signal: those digits have nowhere to go.
-    (remaining == 0).then_some(suffix)
+    if remaining != 0 {
+        return None;
+    }
+    Some(std::str::from_utf8(digits).expect("suffix digits are ASCII"))
 }
 
 /// What the open chunk already holds. Deliberately not the chunk itself: choosing a
@@ -143,9 +153,7 @@ struct Fill<'a> {
     closes: bool,
 }
 
-/// A literal needle in the form its search kernel wants. Case folding is decided once, and
-/// the uncased metadata is analyzed once rather than on every call.
-///
+/// A literal needle in the form its search kernel wants, analyzed once rather than per call.
 /// Under folding a match is not the needle's length: the kernel compares folded text, so
 /// "strasse" matches "Straße" and the span covers the source bytes, not the needle's.
 struct Literal<'a> {
@@ -178,22 +186,19 @@ impl<'a> Literal<'a> {
 
 /// A line-anchored literal delimiter.
 ///
-/// The needle is the pattern alone and the anchor is checked against the byte before a
-/// match, rather than folded into the needle as `\n` + pattern. Anchoring inside the needle
-/// reads better but cannot survive streaming: a window cuts one byte past an LF, so the
-/// newline and the line it introduces always land in different windows and `\n>` is never
-/// visible whole. Checking the preceding byte works because every window — and every chunk
-/// this mode opens — begins at a line start, so offset 0 is one by construction.
+/// The needle is the pattern alone and the anchor is the byte before a match, rather than
+/// `\n` + pattern: a window cuts one byte past an LF, so a needle carrying its own newline
+/// would never be visible whole. Every window — and every chunk this mode opens — begins at
+/// a line start, so offset 0 counts as one.
 struct Delimiter<'a> {
     needle: Literal<'a>,
 }
 
 impl Delimiter<'_> {
     /// Offset in `data` where the next chunk begins: the start of the next line that opens
-    /// with the pattern, searching from `from`. `None` when no such line starts in `data`.
-    ///
-    /// Matches away from a line start are skipped rather than ending the search, so a `>`
-    /// inside a FASTA sequence line does not hide the record that follows it.
+    /// with the pattern, searching from `from`. Matches away from a line start are skipped
+    /// rather than ending the search, so a `>` inside a FASTA sequence line does not hide the
+    /// record that follows it.
     fn next_cut(&self, data: &[u8], from: usize, newlines: Newlines) -> Option<usize> {
         let mut at = from;
         loop {
@@ -209,12 +214,9 @@ impl Delimiter<'_> {
     }
 }
 
-/// How chunk boundaries are chosen, decided once from `Args`.
-///
-/// An enum rather than a trait: [`SplitConfig`] is `Copy` and threads through every path
-/// and test, so a trait object would force a lifetime and an allocation through all of
-/// them for a branch taken once per megabyte. It is also how the rest of the codebase
-/// answers "one of a fixed set of segmenters" — `LineIter`, `CutAfter`, `InputWindow`.
+/// How chunk boundaries are chosen, decided once from `Args`. An enum rather than a trait,
+/// so [`SplitConfig`] stays `Copy` and costs no allocation on a branch taken once per
+/// megabyte.
 #[derive(Clone, Copy)]
 enum SplitMode<'a> {
     /// A chunk holds this many lines, except possibly the last.
@@ -228,10 +230,9 @@ enum SplitMode<'a> {
 }
 
 impl SplitMode<'_> {
-    /// The prefix of `rest` that belongs in a chunk already holding `filled`.
-    ///
-    /// Never returns both an empty span and `closes == false`: the caller's loop makes
-    /// progress on every turn by writing bytes, closing a chunk, or both.
+    /// The prefix of `rest` that belongs in a chunk already holding `filled`. Never both an
+    /// empty span and `closes == false`: the caller's loop makes progress on every turn by
+    /// writing bytes, closing a chunk, or both.
     fn fill<'d>(&self, rest: &'d [u8], filled: Filled, newlines: Newlines) -> Fill<'d> {
         match *self {
             SplitMode::Lines(per_file) => {
@@ -282,10 +283,6 @@ impl SplitMode<'_> {
 
 /// Reject a pattern that cannot describe the start of a line: an empty one matches
 /// everywhere, and one containing a newline spans two lines rather than opening one.
-///
-/// Refusing the second is also what keeps streaming simple. Windows cut just past an LF and
-/// a delimiter begins at a line start, so a newline-free pattern always lands inside one
-/// window; a pattern carrying its own newline would need the window to hold bytes back.
 fn parse_pattern(value: &str) -> Result<String, String> {
     if value.is_empty() {
         return Err("must not be empty".to_string());
@@ -301,6 +298,8 @@ fn parse_pattern(value: &str) -> Result<String, String> {
 /// How the input is cut into chunk files, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct SplitConfig<'a> {
+    /// The input's name, so a failed read names the file rather than stdin.
+    path: &'a str,
     /// Prepended to every generated suffix to name a chunk file.
     prefix: &'a str,
     /// Which boundaries end a chunk.
@@ -336,8 +335,9 @@ struct OpenChunk {
     wrote_data: bool,
     /// Bytes written into it.
     bytes: usize,
-    /// The chunk file itself.
-    file: BufWriter<File>,
+    /// The chunk file itself. Unbuffered: a span reaches it in one write however large it
+    /// is, and a chunk closes before another could share a buffer.
+    file: File,
 }
 
 impl OpenChunk {
@@ -353,38 +353,50 @@ impl OpenChunk {
 }
 
 /// What the line splitter carries between windows, so a second call resumes where the
-/// first stopped. It owns the chunk still being filled, and allocates only when one opens.
-#[derive(Default)]
+/// first stopped. It owns the chunk still being filled, and allocates nothing per chunk.
 struct SplitState {
     /// Chunk files opened so far, which names the next one.
     file_index: usize,
+    /// The one chunk name of the run, lent to the open chunk and taken back when it closes.
+    /// Only the suffix is ever rewritten; the prefix stays where it was first written.
+    name: String,
     /// The chunk being filled, absent between chunks.
     open: Option<OpenChunk>,
 }
 
-/// The error a chunk index outgrowing its suffix width raises, naming the flag to raise
-/// and the chunk that has nowhere to go.
-fn suffix_exhausted(chunk_number: usize, suffix_length: usize) -> Failure {
-    reject(format!(
-        "Output file suffixes exhausted: chunk {} does not fit a {}-character --suffix-length",
-        chunk_number, suffix_length
-    ))
-    .into()
+impl SplitState {
+    /// A fresh run, with the chunk name seeded to the prefix every chunk keeps.
+    fn new(prefix: &str) -> Self {
+        SplitState {
+            file_index: 0,
+            name: prefix.to_string(),
+            open: None,
+        }
+    }
 }
 
-/// Flush the open chunk and record it in the manifest, readying `state` for the next one.
-/// A run under `--format none` writes the record into [`io::sink`], so there is one path here.
+/// The error a chunk index outgrowing its suffix width raises, naming the flag to raise
+/// and the chunk that has nowhere to go.
+/// A refusal rather than a usage error: the chunks that fit are already on disk.
+fn suffix_exhausted(prefix: &str, chunk_number: usize) -> Failure {
+    Failure::Unresolved {
+        path: prefix.to_string(),
+        subject: format!("chunk {}", chunk_number),
+        note: "does not fit the --suffix-length; widen it and split again",
+    }
+}
+
+/// Retire the open chunk into the manifest, readying `state` for the next one.
 fn close_chunk(
     state: &mut SplitState,
     config: &SplitConfig,
     manifest: &mut dyn Write,
 ) -> Result<(), Failure> {
-    let Some(mut chunk) = state.open.take() else {
+    let Some(chunk) = state.open.take() else {
         return Ok(());
     };
-    chunk.file.flush().at(&chunk.name)?;
     // The manifest reports the file as it is on disk, header included.
-    write_manifest_entry(
+    let written = write_manifest_entry(
         manifest,
         config.format,
         config.terminator,
@@ -393,7 +405,9 @@ fn close_chunk(
         chunk.bytes,
         chunk.header_lines,
     )
-    .at("-")
+    .at("-");
+    state.name = chunk.name;
+    written
 }
 
 /// The chunk being filled, opening the next one when none is. GNU `split` stops rather
@@ -403,11 +417,13 @@ fn open_chunk<'a>(
     config: &SplitConfig,
 ) -> Result<&'a mut OpenChunk, Failure> {
     if state.open.is_none() {
-        let width = config.suffix_length.get();
-        let suffix = generate_suffix(state.file_index, width)
-            .ok_or_else(|| suffix_exhausted(state.file_index + 1, width))?;
-        let name = format!("{}{}", config.prefix, suffix);
-        let mut file = BufWriter::new(File::create(&name).at(&name)?);
+        let mut buffer = [0u8; MAX_SUFFIX_LENGTH];
+        let suffix = generate_suffix(&mut buffer, state.file_index, config.suffix_length.get())
+            .ok_or_else(|| suffix_exhausted(config.prefix, state.file_index + 1))?;
+        let mut name = std::mem::take(&mut state.name);
+        name.truncate(config.prefix.len());
+        name.push_str(suffix);
+        let mut file = File::create(&name).at(&name)?;
         // The header is part of the chunk, so it is written and tallied here rather than
         // treated as free: under a byte budget it has to count, or the budget is not one.
         file.write_all(config.header).at(&name)?;
@@ -496,11 +512,8 @@ fn span_within_budget(data: &[u8], room: usize, chunk_is_empty: bool, newlines: 
 }
 
 /// Append `span` to the open chunk, keeping its tallies honest. Bytes reach the chunk exactly
-/// as they arrived: nothing is added, so `cat <prefix>*` reproduces the input.
-///
-/// The span goes to the kernel in one call however large it is. Feeding it in fixed pieces
-/// was measurably faster once and is not any more — over the 5 GB corpus, 800 MB chunks
-/// write in the same 0.69 s either way — so the loop that did it is gone.
+/// as they arrived: nothing is added, so `cat <prefix>*` reproduces the input, and the span
+/// goes to the kernel in one call however large it is.
 fn write_span(chunk: &mut OpenChunk, span: &[u8], lines: usize) -> Result<(), Failure> {
     chunk.file.write_all(span).at(&chunk.name)?;
     chunk.lines += lines;
@@ -557,11 +570,9 @@ fn chunk_count_exceeds_input(wanted: NonZeroUsize, total: usize) -> Failure {
 /// runs to the end. Fails when `wanted` exceeds the input's size, which no placement of
 /// boundaries can honour and which a plan would otherwise try to allocate for.
 ///
-/// Each boundary costs one search from its ideal offset rather than a scan of everything
-/// before it, so the whole plan is `wanted` searches over a mapped input regardless of how
-/// large it is. Snapping can collapse two boundaries onto the same offset when lines are
-/// long relative to `total / wanted`; the chunk between them is then empty, which is
-/// reported rather than skipped so that the run yields exactly `wanted` files.
+/// Snapping can collapse two boundaries onto the same offset when lines are long relative to
+/// `total / wanted`; the chunk between them is then empty, which is reported rather than
+/// skipped so that the run yields exactly `wanted` files.
 fn plan_equal_chunks(
     data: &[u8],
     wanted: NonZeroUsize,
@@ -593,7 +604,7 @@ fn split_at_offsets(
     config: &SplitConfig,
     manifest: &mut dyn Write,
 ) -> Result<usize, Failure> {
-    let mut state = SplitState::default();
+    let mut state = SplitState::new(config.prefix);
     let result = write_ranges(data, cuts, &mut state, config, manifest);
     finish(result, &mut state, config, manifest)
 }
@@ -644,12 +655,11 @@ fn header_exceeds_budget(header: usize, budget: usize) -> Failure {
     .into()
 }
 
-/// The first records of an input, taken off before splitting begins.
+/// The first records of an input, taken off before splitting begins. Borrowed, so a stream
+/// can probe a growing window without copying what it has so far.
 struct Header<'a> {
     /// The header itself, terminators included exactly as the input wrote them.
-    bytes: Vec<u8>,
-    /// What is left of the input once the header is removed.
-    rest: &'a [u8],
+    bytes: &'a [u8],
     /// Records the header carries.
     lines: usize,
     /// Whether the last of them ended, as opposed to running out with the input. A
@@ -661,87 +671,94 @@ struct Header<'a> {
 fn take_header(data: &[u8], lines: NonZeroUsize, newlines: Newlines) -> Header<'_> {
     let (span, seen) = span_filling_chunk(data, lines.get(), newlines);
     Header {
-        bytes: span.to_vec(),
-        rest: &data[span.len()..],
+        bytes: span,
         lines: seen,
         terminated: ends_with_terminator(span, newlines),
     }
 }
 
-/// Pull a header off the front of a stream before splitting begins, growing the window
+/// Pull a header off the front of the input before splitting begins, widening the window
 /// while the header is still incomplete.
-fn take_header_streaming<R: Read>(
-    refill: &mut Refill<R>,
+fn take_header_from(
+    walk: &mut Windows,
     lines: NonZeroUsize,
     newlines: Newlines,
-) -> Result<(Vec<u8>, usize), Failure> {
+    path: &str,
+) -> Result<(Vec<u8>, usize, usize), Failure> {
     loop {
-        // A fresh window holds nothing, and an empty buffer looks like a single
-        // unterminated line to the line counter, so fill before asking.
-        if !refill.at_eof() && refill.filled().len() < refill.capacity() {
-            refill.advance(0).at("-")?;
-        }
-        let filled = refill.filled();
-        let header = take_header(filled, lines, newlines);
+        walk.fill().at(path)?;
+        let header = take_header(walk.filled(), lines, newlines);
         // A trailing CR may be half a CRLF whose LF is still to arrive.
         let ambiguous = header.bytes.ends_with(b"\r") && newlines == Newlines::Unicode;
         // An unterminated last line may simply be a window cut mid-record, so it counts
         // only once the input has ended and no more of it is coming.
-        let complete =
-            refill.at_eof() || (header.lines >= lines.get() && header.terminated && !ambiguous);
-        let consumed = filled.len() - header.rest.len();
-        let (bytes, taken) = (header.bytes, header.lines);
-        if complete {
-            refill.advance(consumed).at("-")?;
-            return Ok((bytes, taken));
+        if walk.at_eof() || (header.lines >= lines.get() && header.terminated && !ambiguous) {
+            // Copied only now: a header still growing would be copied once per window.
+            let bytes = header.bytes.to_vec();
+            let taken = bytes.len();
+            return Ok((bytes, header.lines, taken));
         }
-        if refill.filled().len() >= MAX_HEADER_BYTES {
-            return Err(reject(format!(
-                "The first {} lines exceed the {} MiB a streamed --repeat-header may buffer",
-                lines.get(),
-                MAX_HEADER_BYTES >> 20
-            ))
-            .into());
+        if walk.filled().len() >= MAX_HEADER_BYTES {
+            return Err(header_exceeds_budget(walk.filled().len(), MAX_HEADER_BYTES));
         }
-        refill.grow().at("-")?;
+        walk.grow().at(path)?;
     }
 }
 
-/// Split a whole buffer, closing the chunk left open at the end.
+/// Split a whole slice through the production walk, for tests that hold their input.
+#[cfg(test)]
 fn split_data(
     data: &[u8],
     config: &SplitConfig,
     manifest: &mut dyn Write,
 ) -> Result<usize, Failure> {
-    let mut state = SplitState::default();
-    let result = split_by_ranges(data, &mut state, config, manifest);
-    finish(result, &mut state, config, manifest)
+    split_windows(
+        &mut Windows::over(InputSource::Buffer(data.to_vec())),
+        0,
+        config,
+        manifest,
+    )
 }
 
-// region: Streaming
-
-/// Drive [`split_by_ranges`] over a reader, handing it whole-line prefixes of one reused
-/// window so that a pipe costs bounded memory rather than the input's size.
-fn split_stream<R: Read>(
-    refill: &mut Refill<R>,
+/// Split a reader through the production walk at a chosen window width, for the seam tests.
+#[cfg(test)]
+fn split_stream(
+    data: &[u8],
+    capacity: usize,
     config: &SplitConfig,
     manifest: &mut dyn Write,
 ) -> Result<usize, Failure> {
-    let mut state = SplitState::default();
-    // A `Failure` cannot travel through the window loop's `io::Result`, so a window that
-    // fails breaks the loop and hands its error back here.
-    let mut result = Ok(());
-    let read = refill.try_for_each_window(config.newlines.into(), |window| {
-        result = split_by_ranges(window, &mut state, config, manifest);
-        Ok(match result {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
-        })
-    });
-    finish(read.at("-").and(result), &mut state, config, manifest)
+    split_windows(
+        &mut Windows::streaming(io::Cursor::new(data.to_vec()), capacity),
+        0,
+        config,
+        manifest,
+    )
 }
 
-// endregion: Streaming
+/// Drive [`split_by_ranges`] over the input, handing it whole-line prefixes of one reused
+/// window so that a pipe costs bounded memory rather than the input's size.
+fn split_windows(
+    walk: &mut Windows,
+    taken: usize,
+    config: &SplitConfig,
+    manifest: &mut dyn Write,
+) -> Result<usize, Failure> {
+    let mut state = SplitState::new(config.prefix);
+    let mut outcome = Ok(());
+    let mut consumed = taken;
+    while let Some((window, _)) = walk
+        .next(config.newlines.into(), consumed)
+        .at(config.path)?
+    {
+        consumed = window.len();
+        outcome = split_by_ranges(window, &mut state, config, manifest);
+        if outcome.is_err() {
+            break;
+        }
+    }
+    finish(outcome, &mut state, config, manifest)
+}
 
 /// Write one record naming a file that was written.
 fn write_manifest_entry(
@@ -835,84 +852,76 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         (Some(lines), _, _) => SplitMode::Lines(lines),
         (_, Some(bytes), _) => SplitMode::Bytes(bytes),
         (_, _, Some(_)) => SplitMode::Pattern(&delimiter),
+        // `--chunk-count` plans its own cuts and never reads a mode; inert, not meaningful.
         _ => SplitMode::Lines(NonZeroUsize::MIN),
     };
 
     // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
     let newlines = Newlines::from_utf8(args.utf8 || args.ignore_case);
-    let emitted = {
-        let mut discarded = io::sink();
-        let manifest: &mut dyn Write = match args.format {
-            _ if args.quiet => &mut discarded,
-            Format::None => &mut discarded,
-            _ => &mut *output,
-        };
-        // The header is taken off the input before any boundary is chosen, so every mode
-        // sees only data and every chunk is opened with the header already in it.
-        let mut window = input.into_window(DEFAULT_WINDOW_BYTES);
-        let (header, header_lines, taken, exhausted) = match (&mut window, args.repeat_header) {
-            (InputWindow::Whole(source), Some(lines)) => {
-                let header = take_header(source.as_bytes(), lines, newlines);
-                let start = source.as_bytes().len() - header.rest.len();
-                (header.bytes, header.lines, start, header.rest.is_empty())
-            }
-            (InputWindow::Stream(refill), Some(lines)) => {
-                let (header, seen) = take_header_streaming(refill, lines, newlines)?;
-                let drained = refill.at_eof() && refill.filled().is_empty();
-                (header, seen, 0, drained)
-            }
-            _ => (Vec::new(), 0, 0, false),
-        };
-
-        // An empty input legitimately writes nothing, so only a header that ate real data
-        // is a mistake worth naming.
-        if let Some(lines) = args.repeat_header {
-            if exhausted && !header.is_empty() {
-                return Err(header_exceeds_input(lines));
-            }
-        }
-
-        // A header that leaves no room for data would repeat forever without progressing.
-        if let SplitMode::Bytes(budget) = mode {
-            if header.len() >= budget.get() {
-                return Err(header_exceeds_budget(header.len(), budget.get()));
-            }
-        }
-
-        let config = SplitConfig {
-            prefix: &args.prefix,
-            mode,
-            newlines,
-            suffix_length: args.suffix_length,
-            format: args.format,
-            terminator: Terminator::from_null(args.null),
-            header: &header,
-            header_lines,
-        };
-
-        match window {
-            InputWindow::Whole(source) => {
-                let data = &source.as_bytes()[taken..];
-                match args.chunk_count {
-                    Some(wanted) => {
-                        let cuts = plan_equal_chunks(data, wanted, newlines)?;
-                        split_at_offsets(data, &cuts, &config, manifest)
-                    }
-                    None => split_data(data, &config, manifest),
-                }
-            }
-            InputWindow::Stream(mut refill) => match args.chunk_count {
-                // Only a genuine pipe lands here: a `< file` redirect is mapped above.
-                Some(_) => Err(reject(
-                    "--chunk-count needs the input's size, which a pipe does not report; \
-                     redirect from a file (sz-split --chunk-count N < file), name the file, \
-                     or use --chunk-bytes",
-                )
-                .into()),
-                None => split_stream(&mut refill, &config, manifest),
-            },
-        }?
+    // The header is taken off the input before any boundary is chosen, so every mode sees
+    // only data and every chunk is opened with the header already in it.
+    // One header pass, whether the input was mapped or streamed.
+    let mut window = Windows::over(input);
+    let (header, header_lines, taken) = match args.repeat_header {
+        Some(lines) => take_header_from(&mut window, lines, newlines, path)?,
+        None => (Vec::new(), 0, 0),
     };
+    let exhausted = window.at_eof() && window.filled().len() == taken;
+
+    // An empty input legitimately writes nothing, so only a header that ate real data
+    // is a mistake worth naming.
+    if let Some(lines) = args.repeat_header {
+        if exhausted && !header.is_empty() {
+            return Err(header_exceeds_input(lines));
+        }
+    }
+
+    // A header that leaves no room for data would repeat forever without progressing.
+    if let SplitMode::Bytes(budget) = mode {
+        if header.len() >= budget.get() {
+            return Err(header_exceeds_budget(header.len(), budget.get()));
+        }
+    }
+
+    let config = SplitConfig {
+        path,
+        prefix: &args.prefix,
+        mode,
+        newlines,
+        suffix_length: args.suffix_length,
+        format: args.format,
+        terminator: Terminator::from_null(args.null),
+        header: &header,
+        header_lines,
+    };
+
+    // A discarded manifest still splits, so the chunk count that answers `--quiet` — and
+    // `--format none`, which announces nothing either — stays honest.
+    let destination = if args.quiet || args.format == Format::None {
+        Destination::Discard
+    } else {
+        Destination::Stdout
+    };
+    // A `Failure` is no `io::Error`, so it travels back inside the result rather than
+    // through it.
+    let emitted = destination.write("sz-split", output, |manifest| {
+        Ok(match (window.whole(), args.chunk_count) {
+            // Equal chunks need the input's size, which only a whole input reports.
+            (Some(data), Some(wanted)) => {
+                let data = &data[taken..];
+                plan_equal_chunks(data, wanted, newlines)
+                    .and_then(|cuts| split_at_offsets(data, &cuts, &config, manifest))
+            }
+            // Only a genuine pipe lands here: a `< file` redirect is mapped above.
+            (None, Some(_)) => Err(reject(
+                "--chunk-count needs the input's size, which a pipe does not report; \
+                 redirect from a file (sz-split --chunk-count N < file), name the file, \
+                 or use --chunk-bytes",
+            )
+            .into()),
+            (_, None) => split_windows(&mut window, taken, &config, manifest),
+        })
+    })??;
 
     output.flush().at("-")?;
     Ok(Status::from_found(emitted > 0))
@@ -1072,6 +1081,7 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let prefix = temporary.path().join("b.").display().to_string();
         let config = SplitConfig {
+            path: "-",
             prefix: &prefix,
             mode: SplitMode::Bytes(NonZeroUsize::new(8).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
@@ -1095,6 +1105,7 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let prefix = temporary.path().join("l.").display().to_string();
         let config = SplitConfig {
+            path: "-",
             prefix: &prefix,
             mode: SplitMode::Bytes(NonZeroUsize::new(5).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
@@ -1123,6 +1134,7 @@ mod tests {
                 .display()
                 .to_string();
             let config = SplitConfig {
+                path: "-",
                 prefix: &prefix,
                 mode: SplitMode::Lines(NonZeroUsize::MIN),
                 suffix_length: NonZeroUsize::new(2).unwrap(),
@@ -1154,6 +1166,7 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let prefix = temporary.path().join("h.").display().to_string();
         let config = SplitConfig {
+            path: "-",
             prefix: &prefix,
             mode: SplitMode::Lines(NonZeroUsize::new(2).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
@@ -1181,13 +1194,15 @@ mod tests {
         // A fresh window holds nothing, and tiny capacities force the grow path, so the
         // stream has to agree with the buffer at every one of them.
         for capacity in [1usize, 3, 8, 64] {
-            let mut refill = Refill::new(data, capacity);
-            let (header, seen) = take_header_streaming(&mut refill, lines, Newlines::Lf).unwrap();
-            assert_eq!(header, whole.bytes, "capacity {}", capacity);
+            let mut walk = Windows::streaming(io::Cursor::new(data.to_vec()), capacity);
+            let (header, seen, taken) =
+                take_header_from(&mut walk, lines, Newlines::Lf, "-").unwrap();
+            assert_eq!(header.as_slice(), whole.bytes, "capacity {}", capacity);
             assert_eq!(seen, whole.lines, "capacity {}", capacity);
+            assert_eq!(taken, whole.bytes.len(), "capacity {}", capacity);
             // What is left in the window is the start of the data, not of the header.
             assert!(
-                whole.rest.starts_with(refill.filled()),
+                &data[whole.bytes.len()..].starts_with(&walk.filled()[taken..]),
                 "capacity {}",
                 capacity
             );
@@ -1219,6 +1234,7 @@ mod tests {
     /// A config over any mode with the Unicode newline set, for the byte-fidelity test.
     fn utf8_config<'a>(prefix: &'a str, mode: SplitMode<'a>) -> SplitConfig<'a> {
         SplitConfig {
+            path: "-",
             prefix,
             mode,
             newlines: Newlines::Unicode,
@@ -1233,6 +1249,7 @@ mod tests {
     /// A pattern-mode config; the delimiter is built by the caller because it borrows.
     fn pattern_config<'a>(prefix: &'a str, delimiter: &'a Delimiter<'a>) -> SplitConfig<'a> {
         SplitConfig {
+            path: "-",
             prefix,
             mode: SplitMode::Pattern(delimiter),
             suffix_length: NonZeroUsize::new(2).unwrap(),
@@ -1319,8 +1336,7 @@ mod tests {
                 needle: Literal::new(b">", false),
             };
             let config = pattern_config(&prefix, &delimiter);
-            let mut refill = Refill::new(data.as_slice(), capacity);
-            split_stream(&mut refill, &config, &mut io::sink()).unwrap();
+            split_stream(data.as_slice(), capacity, &config, &mut io::sink()).unwrap();
             assert_eq!(read_chunks(&prefix), whole, "capacity {}", capacity);
         }
     }
@@ -1350,25 +1366,28 @@ mod tests {
 
     #[test]
     fn generates_aa_ab_suffix_sequence() {
-        assert_eq!(generate_suffix(0, 2).as_deref(), Some("aa"));
-        assert_eq!(generate_suffix(1, 2).as_deref(), Some("ab"));
-        assert_eq!(generate_suffix(25, 2).as_deref(), Some("az"));
-        assert_eq!(generate_suffix(26, 2).as_deref(), Some("ba"));
-        assert_eq!(generate_suffix(27, 2).as_deref(), Some("bb"));
+        let mut buffer = [0u8; MAX_SUFFIX_LENGTH];
+        assert_eq!(generate_suffix(&mut buffer, 0, 2), Some("aa"));
+        assert_eq!(generate_suffix(&mut buffer, 1, 2), Some("ab"));
+        assert_eq!(generate_suffix(&mut buffer, 25, 2), Some("az"));
+        assert_eq!(generate_suffix(&mut buffer, 26, 2), Some("ba"));
+        assert_eq!(generate_suffix(&mut buffer, 27, 2), Some("bb"));
     }
 
     #[test]
     fn refuses_suffixes_wider_than_the_requested_length() {
         // Two characters name 26 * 26 chunks, so index 676 is the first that cannot be named.
-        assert_eq!(generate_suffix(675, 2).as_deref(), Some("zz"));
-        assert_eq!(generate_suffix(676, 2), None);
-        assert_eq!(generate_suffix(25, 1).as_deref(), Some("z"));
-        assert_eq!(generate_suffix(26, 1), None);
+        let mut buffer = [0u8; MAX_SUFFIX_LENGTH];
+        assert_eq!(generate_suffix(&mut buffer, 675, 2), Some("zz"));
+        assert_eq!(generate_suffix(&mut buffer, 676, 2), None);
+        assert_eq!(generate_suffix(&mut buffer, 25, 1), Some("z"));
+        assert_eq!(generate_suffix(&mut buffer, 26, 1), None);
     }
 
     /// A two-character-suffix config, the shape every test below splits with.
     fn config(prefix: &str, lines_per_file: usize, newlines: Newlines) -> SplitConfig<'_> {
         SplitConfig {
+            path: "-",
             prefix,
             mode: SplitMode::Lines(NonZeroUsize::new(lines_per_file).unwrap()),
             suffix_length: NonZeroUsize::new(2).unwrap(),
@@ -1382,10 +1401,12 @@ mod tests {
 
     /// The chunk files written under `prefix`, in suffix order.
     fn read_chunks(prefix: &str) -> Vec<String> {
+        let mut buffer = [0u8; MAX_SUFFIX_LENGTH];
         (0..)
-            .map_while(|index| generate_suffix(index, 2))
-            .map(|suffix| format!("{}{}", prefix, suffix))
-            .map_while(|path| fs::read_to_string(path).ok())
+            .map_while(|index| {
+                let suffix = generate_suffix(&mut buffer, index, 2)?;
+                fs::read_to_string(format!("{}{}", prefix, suffix)).ok()
+            })
             .collect()
     }
 
@@ -1464,6 +1485,7 @@ mod tests {
             .flat_map(|line| format!("line{}\n", line).into_bytes())
             .collect();
         let overflowing = SplitConfig {
+            path: "-",
             prefix: &prefix,
             mode: SplitMode::Lines(NonZeroUsize::new(1).unwrap()),
             suffix_length: NonZeroUsize::new(1).unwrap(),
@@ -1555,8 +1577,7 @@ mod tests {
                         .join(format!("s{}{}{}.", which, name, capacity))
                         .display()
                         .to_string();
-                    let mut refill = Refill::new(data, capacity);
-                    split_stream(&mut refill, &utf8_config(&prefix, mode), &mut io::sink())
+                    split_stream(data, capacity, &utf8_config(&prefix, mode), &mut io::sink())
                         .unwrap();
                     assert_eq!(
                         read_chunks(&prefix),
@@ -1622,9 +1643,9 @@ mod tests {
                         .unwrap()
                         .to_string();
                     let mut streamed_manifest = Vec::new();
-                    let mut refill = Refill::new(data, capacity);
                     split_stream(
-                        &mut refill,
+                        data,
+                        capacity,
                         &config(&prefix, lines_per_file, newlines),
                         &mut streamed_manifest,
                     )
@@ -1656,13 +1677,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let prefix = temp_dir.path().join("empty_").to_str().unwrap().to_string();
 
-        let mut refill = Refill::new(&b""[..], 7);
-        split_stream(
-            &mut refill,
-            &config(&prefix, 2, Newlines::Lf),
-            &mut io::sink(),
-        )
-        .unwrap();
+        split_stream(b"", 7, &config(&prefix, 2, Newlines::Lf), &mut io::sink()).unwrap();
 
         assert!(read_chunks(&prefix).is_empty());
     }

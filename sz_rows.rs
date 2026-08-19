@@ -12,7 +12,7 @@
 //! Exit: 0 wrote a row, 1 ran and selected nothing, 2 could not run.
 
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
@@ -96,6 +96,14 @@ enum Format {
     Json,
 }
 
+impl Args {
+    /// Whether the whole input has to be in hand before the first row is written: a text run
+    /// prints the file hash as a header, where JSON names the file on its closing record.
+    fn hashes_before_writing(&self) -> bool {
+        self.fields.contains(&Field::FileHash) && self.format != Format::Json
+    }
+}
+
 /// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
 /// same usage block, same exit code. The kind is never displayed, so one kind serves all.
 fn reject(message: impl std::fmt::Display) -> clap::Error {
@@ -147,10 +155,8 @@ enum ForwardSelector {
     Every(NonZeroUsize),
 }
 
-/// Read one 1-based row number into the 0-based index the walk uses.
-///
-/// Every message names the token it read, which is why the empty case is separate: `2-`
-/// splits into `2` and nothing, and "invalid row number: " names nothing at all.
+/// Read one 1-based row number into the 0-based index the walk uses. Every message names the
+/// token it read, which is why the empty case is separate: `2-` splits into `2` and nothing.
 fn parse_row(token: &str) -> Result<usize, String> {
     let token = token.trim();
     if token.is_empty() {
@@ -219,33 +225,42 @@ fn parse_rows(spec: &str) -> Result<RowSelector, String> {
     Ok(RowSelector::Forward(ForwardSelector::Indices(indices)))
 }
 
+/// How one extracted row is written out: behind the fields the record carries and closed by
+/// the requested terminator, or as a JSON record in a stream a summary record closes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rendering {
+    Terminated(Terminator),
+    Json,
+}
+
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig<'a> {
-    json: bool,
-    terminator: Terminator,
-    show_line_numbers: bool,
-    show_line_hashes: bool,
-    /// Whether the run reports the whole file's hash, which costs it the whole input.
-    show_file_hash: bool,
+    rendering: Rendering,
+    /// Which columns each record carries; `Field::FileHash` costs the run the whole input.
+    fields: &'a [Field],
     hash_width: usize,
     /// The input's path, carried into the JSON envelope.
     path: &'a str,
 }
 
 impl OutputConfig<'_> {
+    #[inline]
+    fn carries(&self, field: Field) -> bool {
+        self.fields.contains(&field)
+    }
+
     /// The hash naming a line, when a record was asked to carry one. Taken from the whole
     /// line rather than the bytes a row prints, so it agrees with `sz-find`.
     #[inline]
     fn naming(&self, line: &NamedLine) -> Option<u64> {
-        self.show_line_hashes.then(|| line.hash())
+        self.carries(Field::LineHashes).then(|| line.hash())
     }
 }
 
-/// Write one extracted row. `index` is zero-based; records report it one-based.
-///
-/// `hash` names the line and its terminator together, which `write_row`'s caller has and
-/// this does not — a row is printed without whatever ended it.
+/// Write one extracted row. `index` is zero-based; records report it one-based. `hash` names
+/// the line and its terminator together, which only the caller has: a row is printed without
+/// whatever ended it.
 fn write_row(
     output: &mut dyn Write,
     config: &OutputConfig,
@@ -256,28 +271,41 @@ fn write_row(
     let mut buffer = [0u8; HASH_CHARS];
     let named = hash.map(|hash| format_hash(&mut buffer, hash, config.hash_width));
 
-    if config.json {
-        return write_line_record(output, config.path, line, index, named);
-    }
-
-    if config.show_line_numbers {
+    let terminator = match config.rendering {
+        Rendering::Json => return write_line_record(output, config.path, line, index, named),
+        Rendering::Terminated(terminator) => terminator,
+    };
+    if config.carries(Field::LineNumbers) {
         write!(output, "{}:", index + 1)?;
     }
     if let Some(named) = named {
         write!(output, "{named}:")?;
     }
     output.write_all(line)?;
-    output.write_all(&[config.terminator.as_byte()])
+    output.write_all(&[terminator.as_byte()])
+}
+
+/// Write the whole file's hash: ahead of the rows in text, where no reader mistakes it for
+/// one, and as the summary record that closes a JSON stream.
+fn write_file_hash(output: &mut dyn Write, config: &OutputConfig, hash: u64) -> io::Result<()> {
+    let mut buffer = [0u8; HASH_CHARS];
+    let named = format_hash(&mut buffer, hash, HASH_CHARS);
+    match config.rendering {
+        Rendering::Terminated(_) => writeln!(output, "{}  {named}", config.path),
+        Rendering::Json => {
+            write!(output, r#"{{"type":"summary","data":{{"path":"#)?;
+            json_text_field_to(output, config.path.as_bytes())?;
+            writeln!(output, r#","file_hash":"{named}"}}}}"#)
+        }
+    }
 }
 
 // region: Tail Scan
 
-/// Byte offset at which the last `wanted` LF-terminated lines begin, and how many
-/// lines that span covers — `min(wanted, total lines)`. Each backward `rfind` touches
-/// one line's worth of bytes, so the cost scales with `wanted`, not with the input.
-///
-/// A trailing newline terminates the last line rather than starting an empty one,
-/// matching [`LineIter`]: `b""` is zero lines and `b"\n"` is one empty line.
+/// Byte offset at which the last `wanted` LF-terminated lines begin, and how many lines that
+/// span covers — `min(wanted, total lines)`. A trailing newline terminates the last line
+/// rather than starting an empty one, matching [`LineIter`]: `b""` is zero lines and `b"\n"`
+/// is one empty line.
 fn tail_start_lf(data: &[u8], wanted: NonZeroUsize) -> (usize, usize) {
     if data.is_empty() {
         return (0, 0);
@@ -405,11 +433,12 @@ fn extract_data(
                 let (start, lines_found) = tail_start_lf(data, *wanted);
                 // Absolute numbering costs a newline pass over the skipped prefix,
                 // so it is paid only when a record carries a line number.
-                let first_index = if config.json || config.show_line_numbers {
-                    LineIter::new(&data[..start], newlines).count()
-                } else {
-                    0
-                };
+                let first_index =
+                    if config.rendering == Rendering::Json || config.carries(Field::LineNumbers) {
+                        LineIter::new(&data[..start], newlines).count()
+                    } else {
+                        0
+                    };
                 for (index_in_span, named) in named_lines(&data[start..], newlines).enumerate() {
                     let line = named.as_cut;
                     write_row(
@@ -426,10 +455,9 @@ fn extract_data(
                     "tail span must hold the counted lines"
                 );
             }
-            // The Unicode newline set has no reverse kernel: `RFindSplits` matches
-            // bytes, `sz_utf8_split_newlines` scans forward only, and `rfind_byteset`
-            // cannot express the multi-byte NEL, LS, and PS. So the last N lines come
-            // from a forward walk into a ring — O(N) memory, not O(file).
+            // The Unicode newline set has no reverse kernel — `rfind_byteset` cannot
+            // express the multi-byte NEL, LS and PS — so the last N lines come from a
+            // forward walk into a ring: O(N) memory, not O(file).
             Newlines::Unicode => {
                 let wanted = wanted.get();
                 let mut ring: VecDeque<(usize, NamedLine)> =
@@ -458,8 +486,8 @@ fn extract_data(
 const TAIL_RING_RESERVE: usize = 4096;
 
 /// The last `wanted` lines seen, each owned because the window it borrowed from is about to
-/// be overwritten. An evicted buffer is refilled in place, so the steady state allocates
-/// nothing and the footprint stays bounded by `wanted × longest line`.
+/// be overwritten. An evicted buffer is refilled in place, so the footprint stays bounded by
+/// `wanted × longest line`.
 struct TailRing {
     /// How many lines the ring keeps, which `--tail` sets.
     wanted: NonZeroUsize,
@@ -504,46 +532,50 @@ impl TailRing {
     }
 }
 
-/// Drive [`extract_forward`] over a reader, handing it whole-line prefixes of one
-/// reused window. The selector's early stop ends the loop, so a bounded request such as
-/// `-r 5` stops reading rather than draining the rest of the stream.
-fn extract_forward_stream<R: Read>(
-    refill: &mut Refill<R>,
+/// Drive [`extract_forward`] over a walk, one window at a time. The selector's early stop
+/// ends the loop, so `--rows 5` stops reading rather than draining the rest of the stream.
+fn extract_forward_stream(
+    walk: &mut Windows,
     selector: &ForwardSelector,
     newlines: Newlines,
     config: &OutputConfig,
     output: &mut dyn Write,
 ) -> io::Result<usize> {
     let mut state = RowsState::default();
-    refill.try_for_each_window(newlines.into(), |window| {
-        extract_forward(window, selector, newlines, config, &mut state, output)
-    })?;
+    let mut consumed = 0;
+    while let Some((window, _)) = walk.next(newlines.into(), consumed)? {
+        consumed = window.len();
+        if extract_forward(window, selector, newlines, config, &mut state, output)?.is_break() {
+            break;
+        }
+    }
     Ok(state.emitted)
 }
 
-/// Drive the tail ring over a reader. A stream cannot be scanned backward, so the last
+/// Drive the tail ring over a walk. A stream cannot be scanned backward, so the last
 /// `wanted` lines are the ones a forward walk still holds when the reader runs out.
-fn extract_tail_stream<R: Read>(
-    refill: &mut Refill<R>,
+fn extract_tail_stream(
+    walk: &mut Windows,
     wanted: NonZeroUsize,
     newlines: Newlines,
     config: &OutputConfig,
     output: &mut dyn Write,
 ) -> io::Result<usize> {
     let mut ring = TailRing::new(wanted);
-    refill.for_each_window(newlines.into(), |window| {
+    let mut consumed = 0;
+    while let Some((window, _)) = walk.next(newlines.into(), consumed)? {
+        consumed = window.len();
         for named in named_lines(window, newlines) {
             ring.push(named.as_cut, config.naming(&named));
         }
-        Ok(())
-    })?;
+    }
     ring.write_to(config, output)
 }
 
-/// Extract rows from a reader, choosing the ring for `--tail` and the forward walk for the
+/// Extract rows from a walk, choosing the ring for `--tail` and the forward walk for the
 /// rest. Line numbers are absolute in both, matching the whole-slice paths.
-fn extract_stream<R: Read>(
-    refill: &mut Refill<R>,
+fn extract_stream(
+    walk: &mut Windows,
     selector: &RowSelector,
     newlines: Newlines,
     config: &OutputConfig,
@@ -551,10 +583,20 @@ fn extract_stream<R: Read>(
 ) -> io::Result<usize> {
     match selector {
         RowSelector::Forward(forward) => {
-            extract_forward_stream(refill, forward, newlines, config, output)
+            extract_forward_stream(walk, forward, newlines, config, output)
         }
-        RowSelector::Tail(wanted) => extract_tail_stream(refill, *wanted, newlines, config, output),
+        RowSelector::Tail(wanted) => extract_tail_stream(walk, *wanted, newlines, config, output),
     }
+}
+
+/// Read whatever a selector's early stop left in the stream, through the same window. A
+/// digest of a prefix is indistinguishable from a digest of the file.
+fn drain_remaining(walk: &mut Windows) -> io::Result<()> {
+    let mut consumed = 0;
+    while let Some((window, _)) = walk.next(CutAfter::Anywhere, consumed)? {
+        consumed = window.len();
+    }
+    Ok(())
 }
 
 // endregion: Streaming
@@ -572,11 +614,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     };
 
     let path = args.input.as_deref().unwrap_or("-");
-    // A file's hash covers bytes the header line is written long before a stream reaches, so
-    // a text run that asked for one holds the input; JSON names the file again on the record
-    // that closes it, which a stream does reach.
-    let holds_input = args.fields.contains(&Field::FileHash) && args.format != Format::Json;
-    let input = if holds_input {
+    let input = if args.hashes_before_writing() {
         get_input(args.input.as_deref())
     } else {
         get_input_streaming(args.input.as_deref())
@@ -584,73 +622,51 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     .at(path)?;
 
     let config = OutputConfig {
-        json: args.format == Format::Json,
-        terminator: Terminator::from_null(args.null),
-        show_line_numbers: args.fields.contains(&Field::LineNumbers),
-        show_line_hashes: args.fields.contains(&Field::LineHashes),
-        show_file_hash: args.fields.contains(&Field::FileHash),
+        rendering: match args.format {
+            Format::Json => Rendering::Json,
+            Format::Text => Rendering::Terminated(Terminator::from_null(args.null)),
+        },
+        fields: &args.fields,
         hash_width: args.hash_width.unwrap_or(DEFAULT_HASH_WIDTH),
         path,
     };
 
     // A quiet run still extracts, so the row count that answers it stays honest.
-    let mut discard = io::sink();
-    let writer: &mut dyn Write = if args.quiet {
-        &mut discard
+    let destination = if args.quiet {
+        Destination::Discard
     } else {
-        &mut *output
+        Destination::Stdout
     };
 
     let newlines = Newlines::from_utf8(args.utf8);
-    // Only a pipe streams, so both the reader and the writer of either arm are `-`.
-    let (emitted, file_hash) = match input.into_window(DEFAULT_WINDOW_BYTES) {
-        InputWindow::Whole(source) => {
-            let data = source.as_bytes();
-            // Ahead of the rows, as `sz-find --heading` prints it, and outside the record
-            // stream so a reader never mistakes it for a row.
-            let hash = config.show_file_hash.then(|| content_hash(data));
-            if let Some(hash) = hash.filter(|_| !config.json) {
-                let mut buffer = [0u8; HASH_CHARS];
-                writeln!(
-                    writer,
-                    "{path}  {}",
-                    format_hash(&mut buffer, hash, HASH_CHARS)
-                )
-                .at("-")?;
-            }
-            let emitted = extract_data(data, &selector, newlines, &config, writer).at("-")?;
-            (emitted, hash)
-        }
-        InputWindow::Stream(mut refill) => {
-            // Before the first window is filled: a hash installed after that would cover
-            // everything but the bytes already read.
-            if config.show_file_hash {
-                refill.hash_stream();
-            }
-            let emitted =
-                extract_stream(&mut refill, &selector, newlines, &config, writer).at("-")?;
-            // A row selector stops as soon as it has what it asked for, and a digest of a
-            // prefix is indistinguishable from a digest of the file, so the rest of the pipe
-            // is read — through the same window, at no extra memory — before it is taken.
-            if config.show_file_hash {
-                while refill.advance(refill.filled().len()).at("-")? {}
-            }
-            (emitted, refill.digest())
-        }
-    };
+    let mut walk = Windows::over(input);
+    // Before the first window is filled: a hash installed after that would cover everything
+    // but the bytes already read.
+    if config.carries(Field::FileHash) {
+        walk.hash_stream();
+    }
+    let mapped_hash = walk
+        .whole()
+        .filter(|_| config.carries(Field::FileHash))
+        .map(content_hash);
 
-    // JSON carries the file's hash on the record that closes the file, which is the one
-    // place in a stream of per-row records a whole-file value belongs.
-    if let Some(hash) = file_hash.filter(|_| config.json && !args.quiet) {
-        let mut buffer = [0u8; HASH_CHARS];
-        write!(output, r#"{{"type":"summary","data":{{"path":"#).at("-")?;
-        json_text_field_to(output, path.as_bytes()).at("-")?;
-        writeln!(
-            output,
-            r#","file_hash":"{}"}}}}"#,
-            format_hash(&mut buffer, hash, HASH_CHARS)
-        )
-        .at("-")?;
+    let emitted = destination.write("sz-rows", output, |writer| {
+        if let Some(data) = walk.whole() {
+            if let (Some(hash), Rendering::Terminated(_)) = (mapped_hash, config.rendering) {
+                write_file_hash(writer, &config, hash)?;
+            }
+            return extract_data(data, &selector, newlines, &config, writer);
+        }
+        let emitted = extract_stream(&mut walk, &selector, newlines, &config, writer)?;
+        if config.carries(Field::FileHash) {
+            drain_remaining(&mut walk)?;
+        }
+        Ok(emitted)
+    })?;
+    let file_hash = mapped_hash.or_else(|| walk.digest());
+
+    if let (Some(hash), Rendering::Json) = (file_hash, config.rendering) {
+        write_file_hash(output, &config, hash).at("-")?;
     }
 
     output.flush().at("-")?;
@@ -666,14 +682,12 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn text_config() -> OutputConfig<'static> {
         OutputConfig {
-            json: false,
-            terminator: Terminator::Newline,
-            show_line_numbers: false,
-            show_line_hashes: false,
-            show_file_hash: false,
+            rendering: Rendering::Terminated(Terminator::Newline),
+            fields: &[],
             hash_width: DEFAULT_HASH_WIDTH,
             path: "-",
         }
@@ -764,8 +778,22 @@ mod tests {
         RowSelector::Tail(NonZeroUsize::new(wanted).unwrap())
     }
 
-    /// Extract the same way [`extract_data`] does, but through a window of exactly
-    /// `capacity` bytes.
+    /// Where a `capacity`-byte window ends: at the last record boundary inside it, or the
+    /// first one past it when no record fits, which is what a stream widens to.
+    fn window_end(data: &[u8], capacity: usize, newlines: Newlines) -> usize {
+        if capacity >= data.len() {
+            return data.len();
+        }
+        last_cut(&data[..capacity], newlines.into()).unwrap_or_else(|| {
+            LineSpans::new(data, newlines)
+                .next()
+                .map_or(data.len(), |span| span.length)
+        })
+    }
+
+    /// Extract the same way [`extract_data`] does, one `capacity`-byte window at a time.
+    /// [`Windows`] is fixed at [`DEFAULT_WINDOW_BYTES`], which no test-sized input reaches,
+    /// so the seams are drawn here.
     fn extract_streamed(
         data: &[u8],
         capacity: usize,
@@ -773,21 +801,50 @@ mod tests {
         newlines: Newlines,
         config: &OutputConfig,
     ) -> (Vec<u8>, usize) {
-        let mut refill = Refill::new(data, capacity);
+        let mut windows = Vec::new();
+        let mut rest = data;
+        while !rest.is_empty() {
+            let end = window_end(rest, capacity, newlines);
+            windows.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+
         let mut output = Vec::new();
-        let count = extract_stream(&mut refill, selector, newlines, config, &mut output).unwrap();
+        let count = match selector {
+            RowSelector::Forward(forward) => {
+                let mut state = RowsState::default();
+                for window in windows {
+                    let flow =
+                        extract_forward(window, forward, newlines, config, &mut state, &mut output)
+                            .unwrap();
+                    if flow.is_break() {
+                        break;
+                    }
+                }
+                state.emitted
+            }
+            RowSelector::Tail(wanted) => {
+                let mut ring = TailRing::new(*wanted);
+                for window in windows {
+                    for named in named_lines(window, newlines) {
+                        ring.push(named.as_cut, config.naming(&named));
+                    }
+                }
+                ring.write_to(config, &mut output).unwrap()
+            }
+        };
         (output, count)
     }
 
     /// A reader that fails once a budget of bytes has been handed out, so a test can prove
     /// a selector stopped reading rather than merely stopped writing.
-    struct BudgetedReader<'a> {
-        data: &'a [u8],
+    struct BudgetedReader {
+        data: Vec<u8>,
         position: usize,
         budget: usize,
     }
 
-    impl Read for BudgetedReader<'_> {
+    impl Read for BudgetedReader {
         fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
             if self.position >= self.budget {
                 return Err(io::Error::other("read past the budget"));
@@ -1073,7 +1130,7 @@ mod tests {
 
         let selector = range(0, 1); // lines 1-2
         let mut config = text_config();
-        config.show_line_numbers = true;
+        config.fields = &[Field::LineNumbers];
 
         extract_data(data, &selector, Newlines::Lf, &config, &mut output).unwrap();
 
@@ -1085,7 +1142,7 @@ mod tests {
         let data = b"a\nb\n";
         let mut output = Vec::new();
         let mut config = text_config();
-        config.terminator = Terminator::Null;
+        config.rendering = Rendering::Terminated(Terminator::Null);
 
         extract_data(data, &range(0, 1), Newlines::Lf, &config, &mut output).unwrap();
 
@@ -1097,7 +1154,7 @@ mod tests {
         let data = b"a\nb\n";
         let mut output = Vec::new();
         let mut config = text_config();
-        config.json = true;
+        config.rendering = Rendering::Json;
 
         extract_data(data, &range(1, 1), Newlines::Lf, &config, &mut output).unwrap();
 
@@ -1186,7 +1243,7 @@ mod tests {
         let data = b"line1\nline2\nline3\nline4\n";
         let mut output = Vec::new();
         let mut config = text_config();
-        config.show_line_numbers = true;
+        config.fields = &[Field::LineNumbers];
 
         extract_data(data, &tail(2), Newlines::Lf, &config, &mut output).unwrap();
 
@@ -1250,9 +1307,9 @@ mod tests {
             every(5),
         ];
         let mut numbered = text_config();
-        numbered.show_line_numbers = true;
+        numbered.fields = &[Field::LineNumbers];
         let mut json = text_config();
-        json.json = true;
+        json.rendering = Rendering::Json;
 
         for data in inputs {
             for selector in &selectors {
@@ -1302,7 +1359,7 @@ mod tests {
     fn streams_tail_with_absolute_line_numbers() {
         let data = b"line1\nline2\nline3\nline4\n";
         let mut config = text_config();
-        config.show_line_numbers = true;
+        config.fields = &[Field::LineNumbers];
 
         let (output, count) = extract_streamed(data, 7, &tail(2), Newlines::Lf, &config);
 
@@ -1337,23 +1394,36 @@ mod tests {
 
     #[test]
     fn bounded_selectors_stop_reading_the_stream() {
-        let data =
-            b"l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\n";
-        let window = 40; // Ten lines, so the first window already passes index 4.
+        // A budget of exactly one window, over an input needing two, so a selector answered
+        // by the first proves itself by never asking for the second.
+        let mut data = Vec::new();
+        while data.len() < DEFAULT_WINDOW_BYTES * 2 {
+            data.extend_from_slice(format!("l{:07}\n", data.len()).as_bytes());
+        }
+        let budget = DEFAULT_WINDOW_BYTES;
+        let piped = |data: &[u8]| {
+            Windows::over(InputSource::Pipe(Box::new(BudgetedReader {
+                data: data.to_vec(),
+                position: 0,
+                budget,
+            })))
+        };
 
         for selector in [indices(&[4]), range(0, 4)] {
             let mut expected = Vec::new();
-            extract_data(data, &selector, Newlines::Lf, &text_config(), &mut expected).unwrap();
+            extract_data(
+                &data,
+                &selector,
+                Newlines::Lf,
+                &text_config(),
+                &mut expected,
+            )
+            .unwrap();
 
-            let reader = BudgetedReader {
-                data,
-                position: 0,
-                budget: window,
-            };
-            let mut refill = Refill::new(reader, window);
+            let mut walk = piped(&data);
             let mut output = Vec::new();
             extract_stream(
-                &mut refill,
+                &mut walk,
                 &selector,
                 Newlines::Lf,
                 &text_config(),
@@ -1364,15 +1434,10 @@ mod tests {
         }
 
         // The same budget proves itself by failing the selector that must read on.
-        let reader = BudgetedReader {
-            data,
-            position: 0,
-            budget: window,
-        };
-        let mut refill = Refill::new(reader, window);
+        let mut walk = piped(&data);
         let mut output = Vec::new();
         assert!(extract_stream(
-            &mut refill,
+            &mut walk,
             &every(5),
             Newlines::Lf,
             &text_config(),

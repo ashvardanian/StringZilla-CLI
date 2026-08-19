@@ -6,11 +6,11 @@
 //! buffered stdin, or a pipe it may only read once. [`InputSource`] hides that, and the one place
 //! it leaks — a true pipe has no whole slice — is visible in the type rather than in a comment.
 
-use std::fs::{File, OpenOptions};
+use std::borrow::Cow;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, Write};
 use std::num::{NonZeroUsize, ParseIntError};
-use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process;
 use std::sync::OnceLock;
 
@@ -40,17 +40,17 @@ pub enum InputSource {
     MappedFile(Mmap),
     /// Buffered stdin data
     Buffer(Vec<u8>),
-    /// An undrained pipe on stdin, the one source with no whole slice. Produced only
-    /// by [`get_input_streaming`], so [`get_input`]'s callers never observe it.
-    Pipe(io::StdinLock<'static>),
+    /// An undrained stream, the one source with no whole slice. Produced only by
+    /// [`get_input_streaming`], so [`get_input`]'s callers never observe it.
+    Pipe(Box<dyn Read>),
 }
 
 /// The two shapes an input takes: one whole slice, or a window to refill.
 pub enum InputWindow {
     /// A source that hands over all of its bytes at once.
     Whole(InputSource),
-    /// A pipe, read through one window reused for the whole stream.
-    Stream(Refill<io::StdinLock<'static>>),
+    /// A stream, read through one window reused for the whole run.
+    Stream(Refill<Box<dyn Read>>),
 }
 
 impl InputSource {
@@ -105,8 +105,13 @@ pub fn get_input_streaming(path: Option<&str>) -> io::Result<InputSource> {
             return Ok(InputSource::MappedFile(mmap));
         }
         widen_stdin_pipe();
-        return Ok(InputSource::Pipe(io::stdin().lock()));
+        return Ok(InputSource::Pipe(Box::new(io::stdin().lock())));
     };
+    // A FIFO or process substitution has no mapping, so it streams rather than buffering.
+    let file = File::open(path)?;
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(InputSource::Pipe(Box::new(file)));
+    }
     open_input(Path::new(path))
 }
 
@@ -186,7 +191,7 @@ pub fn open_input(path: &Path) -> io::Result<InputSource> {
 
 /// Whether a walked entry should be read: any regular file, plus explicitly named
 /// non-directories, which is what lets `<(cmd)` and `/dev/stdin` through.
-pub fn is_readable_entry(entry: &ignore::DirEntry) -> bool {
+fn is_readable_entry(entry: &ignore::DirEntry) -> bool {
     match entry.file_type() {
         Some(kind) if kind.is_file() => true,
         Some(kind) => entry.depth() == 0 && !kind.is_dir(),
@@ -204,7 +209,7 @@ pub fn is_readable_entry(entry: &ignore::DirEntry) -> bool {
 ///
 /// The path is attached here rather than by the caller, since every failure below is about
 /// this one file and the function already knows which.
-pub fn write_replacing<T>(
+fn write_replacing<T>(
     tool: &str,
     path: &str,
     write: impl FnOnce(&mut dyn Write) -> io::Result<T>,
@@ -236,7 +241,7 @@ pub fn write_replacing<T>(
 /// Unlike [`write_replacing`] this is the destination rather than the source, so a target
 /// that is not a regular file — `/dev/null`, a FIFO, a terminal — is written straight
 /// through. Renaming a regular file over a device node would replace it.
-pub fn write_creating<T>(
+fn write_creating<T>(
     tool: &str,
     path: &str,
     write: impl FnOnce(&mut dyn Write) -> io::Result<T>,
@@ -283,18 +288,20 @@ fn resolve_target(path: &str) -> io::Result<Target> {
     match OpenOptions::new().write(true).open(path) {
         Ok(file) => {
             let metadata = file.metadata()?;
-            if metadata.is_file() {
-                if let Ok(resolved) = std::fs::canonicalize(path) {
-                    if denotes(&resolved, &metadata) {
-                        return Ok(Target::Replaceable {
-                            resolved,
-                            file,
-                            metadata,
-                        });
-                    }
-                }
+            if !metadata.is_file() {
+                return Ok(Target::Direct(file));
             }
-            Ok(Target::Direct(file))
+            let Ok(resolved) = std::fs::canonicalize(path) else {
+                return Ok(Target::Direct(file));
+            };
+            if !denotes(&resolved, &metadata) {
+                return Ok(Target::Direct(file));
+            }
+            Ok(Target::Replaceable {
+                resolved,
+                file,
+                metadata,
+            })
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             // A symlink whose target does not exist yet is still the caller's chosen name
@@ -386,7 +393,7 @@ fn write_through_temporary<T>(
         // file already had, and a fresh file lands where `File::create` would have put it.
         let landing = landing_permissions(existing.as_ref().map(|(_, data)| data), directory);
         if let Some(permissions) = landing {
-            let _ = temporary.set_permissions(permissions);
+            temporary.set_permissions(permissions)?;
         }
         temporary.sync_all()?;
         temporary.seek(io::SeekFrom::Start(0))?;
@@ -538,6 +545,197 @@ fn create_temporary(directory: &Path, mode: u32) -> io::Result<(File, std::path:
         io::ErrorKind::AlreadyExists,
         "could not create a temporary file",
     ))
+}
+
+/// Whether a whole input has already been handed over.
+enum Walked {
+    NotYet,
+    Done,
+}
+
+/// How the bytes arrive, which callers reach only through [`Windows`]'s methods.
+enum Walk {
+    Whole {
+        source: InputSource,
+        walked: Walked,
+        /// Bytes the caller has finished with, so a prefix taken first leaves the rest.
+        taken: usize,
+    },
+    Stream {
+        refill: Refill<Box<dyn Read>>,
+        base: usize,
+    },
+}
+
+/// One walk over an input's bytes, whether it arrived whole or has to be streamed.
+///
+/// A mapped file yields one window covering everything; a pipe yields as many as it takes.
+/// The base offset comes back with each window so a caller that reports absolute positions
+/// does not have to accumulate one itself.
+pub struct Windows(Walk);
+
+impl Windows {
+    /// Open `source` as a walk, streaming only what cannot be handed over at once.
+    pub fn over(source: InputSource) -> Self {
+        match source.into_window(DEFAULT_WINDOW_BYTES) {
+            InputWindow::Whole(held) => Windows(Walk::Whole {
+                source: held,
+                walked: Walked::NotYet,
+                taken: 0,
+            }),
+            InputWindow::Stream(refill) => Windows(Walk::Stream { refill, base: 0 }),
+        }
+    }
+
+    /// A walk that reads through a window of `capacity` bytes, the way a pipe is read.
+    pub fn streaming(reader: impl Read + 'static, capacity: usize) -> Self {
+        Windows(Walk::Stream {
+            refill: Refill::new(Box::new(reader), capacity),
+            base: 0,
+        })
+    }
+
+    /// Every byte at once, where the input could give them at once.
+    pub fn whole(&self) -> Option<&[u8]> {
+        match &self.0 {
+            Walk::Whole { source, .. } => Some(source.as_bytes()),
+            Walk::Stream { .. } => None,
+        }
+    }
+
+    /// Hash the bytes as they arrive. Must be asked before the first window, since a hash
+    /// installed later would miss what has already been read.
+    pub fn hash_stream(&mut self) {
+        if let Walk::Stream { refill, .. } = &mut self.0 {
+            refill.hash_stream();
+        }
+    }
+
+    /// What the stream hashed, once it has been walked to the end.
+    pub fn digest(&self) -> Option<u64> {
+        match &self.0 {
+            Walk::Whole { .. } => None,
+            Walk::Stream { refill, .. } => refill.digest(),
+        }
+    }
+
+    /// Bring bytes into view without consuming any, so a caller can judge what it has
+    /// before deciding how much to take. Reports whether anything is in view.
+    pub fn fill(&mut self) -> io::Result<bool> {
+        match &mut self.0 {
+            Walk::Whole { source, taken, .. } => Ok(*taken < source.as_bytes().len()),
+            Walk::Stream { refill, .. } => refill.advance(0),
+        }
+    }
+
+    /// What is in view right now, which [`Windows::fill`] and [`Windows::grow`] widen.
+    pub fn filled(&self) -> &[u8] {
+        match &self.0 {
+            Walk::Whole { source, taken, .. } => &source.as_bytes()[*taken..],
+            Walk::Stream { refill, .. } => refill.filled(),
+        }
+    }
+
+    /// Whether everything the input will ever give is already in the window.
+    pub fn at_eof(&self) -> bool {
+        match &self.0 {
+            Walk::Whole { .. } => true,
+            Walk::Stream { refill, .. } => refill.at_eof(),
+        }
+    }
+
+    /// Widen the window, for a caller that needs more than one window's worth in view at
+    /// once. A whole input is already as wide as it gets.
+    pub fn grow(&mut self) -> io::Result<()> {
+        match &mut self.0 {
+            Walk::Whole { .. } => Ok(()),
+            Walk::Stream { refill, .. } => refill.grow(),
+        }
+    }
+
+    /// The next window and where it starts, or `None` at the end.
+    ///
+    /// `consumed` is how much of the previous window the caller finished with: passing less
+    /// than all of it is how a scanner keeps a partial record in view across a seam. Cutting
+    /// only on `cut` keeps records whole, and a record wider than the window grows it.
+    pub fn next(&mut self, cut: CutAfter, consumed: usize) -> io::Result<Option<(&[u8], usize)>> {
+        match &mut self.0 {
+            Walk::Whole {
+                source,
+                walked,
+                taken,
+            } => {
+                let data = source.as_bytes();
+                let start = *taken + consumed;
+                // A whole input cannot grow, so a caller that consumed nothing has already
+                // seen everything there is.
+                if matches!(walked, Walked::Done) && (consumed == 0 || start >= data.len()) {
+                    return Ok(None);
+                }
+                *taken = start;
+                *walked = Walked::Done;
+                Ok(Some((&data[start..], start)))
+            }
+            Walk::Stream { refill, base } => {
+                // Consuming nothing says the last window was not enough, so the window has to
+                // widen before it is handed back — otherwise the caller sees it again forever.
+                let stalled = consumed == 0 && !refill.filled().is_empty();
+                *base += consumed;
+                let start = *base;
+                if !refill.advance(consumed)? {
+                    return Ok(None);
+                }
+                if stalled && !refill.at_eof() {
+                    refill.grow()?;
+                }
+                loop {
+                    if refill.at_eof() {
+                        return Ok(Some((refill.filled(), start)));
+                    }
+                    match last_cut(refill.filled(), cut) {
+                        Some(end) => return Ok(Some((&refill.filled()[..end], start))),
+                        None => refill.grow()?,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Where a run's output lands.
+///
+/// The four rungs every rewriting tool spells out by hand, in one place and one order. A
+/// discarding run still writes, so the count that answers `--quiet` stays honest.
+pub enum Destination<'a> {
+    /// Written and thrown away, for `--quiet` and `--dry-run`.
+    Discard,
+    /// The caller's standard output.
+    Stdout,
+    /// A named file that need not exist, as `--output` asks.
+    Creating(&'a str),
+    /// The input itself, swapped in atomically, as `--in-place` asks.
+    Replacing(&'a str),
+}
+
+impl Destination<'_> {
+    /// Run `body` against this destination.
+    ///
+    /// `FnOnce` rather than a borrowed writer, because a replaced file is only durable once
+    /// the body has returned and the temporary has been flushed, permissioned, synced and
+    /// renamed — a caller holding the writer could not be told when that had happened.
+    pub fn write<T>(
+        self,
+        tool: &str,
+        stdout: &mut dyn Write,
+        body: impl FnOnce(&mut dyn Write) -> io::Result<T>,
+    ) -> Result<T, Failure> {
+        match self {
+            Destination::Discard => body(&mut io::sink()).at("-"),
+            Destination::Stdout => body(stdout).at("-"),
+            Destination::Creating(path) => write_creating(tool, path, body),
+            Destination::Replacing(path) => write_replacing(tool, path, body),
+        }
+    }
 }
 
 /// Buffered, locked stdout. `io::Stdout` is line-buffered, costing a syscall per record.
@@ -905,18 +1103,11 @@ impl<R: Read> Refill<R> {
         self.fill()
     }
 
-    /// Hand `body` one window after another, each ending where `cut` says a record does, until
-    /// the reader runs dry or `body` answers [`ControlFlow::Break`]. A record wider than the
-    /// window widens it, so `body` always sees whole records.
-    ///
-    /// End of input is tested __before__ the cut, and that order is load-bearing: the last
-    /// window has nothing following it, so every byte in it is a whole record, and a cut that
-    /// reported a shorter prefix — [`CutAfter::Characters`] over a truncated sequence — would
-    /// leave a remainder no [`Refill::grow`] can complete.
-    pub fn try_for_each_window(
+    /// Hand `body` every window, for a caller that reads its input to the end.
+    pub fn for_each_window(
         &mut self,
         cut: CutAfter,
-        mut body: impl FnMut(&[u8]) -> io::Result<ControlFlow<()>>,
+        mut body: impl FnMut(&[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         let mut consumed = 0;
         while self.advance(consumed)? {
@@ -933,23 +1124,10 @@ impl<R: Read> Refill<R> {
                     }
                 }
             };
-            if body(&self.filled()[..end])?.is_break() {
-                return Ok(());
-            }
+            body(&self.filled()[..end])?;
             consumed = end;
         }
         Ok(())
-    }
-
-    /// Hand `body` every window, for a caller that reads its input to the end.
-    pub fn for_each_window(
-        &mut self,
-        cut: CutAfter,
-        mut body: impl FnMut(&[u8]) -> io::Result<()>,
-    ) -> io::Result<()> {
-        self.try_for_each_window(cut, |window| {
-            body(window).map(|()| ControlFlow::Continue(()))
-        })
     }
 
     /// Read until the window is full or the reader is exhausted, retrying interruptions.
@@ -1514,7 +1692,9 @@ pub fn walker(root: &Path, options: &TraversalOptions<'_>, tool: &str) -> ignore
         .git_global(!options.no_ignore)
         .git_exclude(!options.no_ignore)
         .follow_links(options.follow)
-        .max_depth(options.max_depth);
+        .max_depth(options.max_depth)
+        // Sorted as it reads, per directory, so a walk is reproducible without collecting it.
+        .sort_by_file_path(Path::cmp);
 
     if let Some(names) = options.file_type {
         let mut types = ignore::types::TypesBuilder::new();
@@ -1554,7 +1734,7 @@ pub fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, String> 
 /// Takes the entry rather than its path because [`ignore::DirEntry::file_name`] falls back to the
 /// whole path where there is no final component, which `Path::file_name` reports as nothing at
 /// all — so a walk rooted at `.` or `/` filters on the name the user typed.
-pub fn glob_selects(globs: Option<&[glob::Pattern]>, entry: &ignore::DirEntry) -> bool {
+fn glob_selects(globs: Option<&[glob::Pattern]>, entry: &ignore::DirEntry) -> bool {
     let Some(globs) = globs else {
         return true;
     };
@@ -1565,38 +1745,91 @@ pub fn glob_selects(globs: Option<&[glob::Pattern]>, entry: &ignore::DirEntry) -
         .any(|pattern| pattern.matches(&path_text) || pattern.matches(&name_text))
 }
 
-/// The files a directory holds with their sizes, sorted, every walk failure warned about.
+/// One resolved input: the standard input, or a file the walk reached.
 ///
-/// The size comes back because the walk already asked the filesystem for it — a caller that
-/// re-measured would `stat` every file a second time, and on a run of many small files that
-/// second pass costs more syscalls than the reading does. A file whose size cannot be read is
-/// reported as zero rather than dropped.
-///
-/// Eager and sorted, which suits a tool that schedules a batch or prints a stable table. A tool
-/// that streams entries and stops early wants [`walker`] directly instead.
-pub fn walk_files(
-    root: &Path,
-    options: &TraversalOptions<'_>,
-    globs: Option<&[glob::Pattern]>,
-    tool: &str,
-    failures: &mut usize,
-) -> Vec<(PathBuf, u64)> {
-    let mut found = Vec::new();
-    for result in walker(root, options, tool) {
-        match result {
-            Ok(entry) if is_readable_entry(&entry) && glob_selects(globs, &entry) => {
-                let size = entry.metadata().map(|data| data.len()).unwrap_or(0);
-                found.push((entry.path().to_path_buf(), size))
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("{tool}: {}", error);
-                *failures += 1;
-            }
+/// A named file and a walked file are the same thing, because `ignore::Walk` over a plain path
+/// yields one depth-zero entry for it. The entry owns the path the walk already allocated, so
+/// holding it costs nothing beyond what the walk spent.
+pub enum Input {
+    Stdin,
+    File(ignore::DirEntry),
+}
+
+impl Input {
+    /// Where this input lives. The standard input answers `-`, as every tool prints it.
+    pub fn path(&self) -> &Path {
+        match self {
+            Input::Stdin => Path::new("-"),
+            Input::File(entry) => entry.path(),
         }
     }
-    found.sort();
-    found
+
+    /// The name a record carries, lossy where a path is not UTF-8.
+    pub fn display_name(&self) -> Cow<'_, str> {
+        self.path().to_string_lossy()
+    }
+
+    /// The file's length, asked for only when a caller needs it: on Unix this is a `stat` the
+    /// walk did not already pay for, so it stays out of the walk.
+    pub fn size(&self) -> io::Result<u64> {
+        match self {
+            Input::Stdin => Ok(0),
+            Input::File(entry) => entry.metadata().map(|data| data.len()).map_err(|error| {
+                error
+                    .into_io_error()
+                    .unwrap_or_else(|| io::Error::other("could not measure the file"))
+            }),
+        }
+    }
+}
+
+/// Every input the names resolve to, in the order they were named, walking directories as it
+/// goes.
+///
+/// Lazy, and failures arrive as items rather than through a counter the caller has to thread:
+/// a consumer that stops early never walks the rest, and one that wants them all collects.
+pub fn inputs<'a>(
+    names: &'a [String],
+    traversal: &'a TraversalOptions<'a>,
+    globs: Option<&'a [glob::Pattern]>,
+    tool: &'a str,
+) -> impl Iterator<Item = Result<Input, Failure>> + 'a {
+    names.iter().flat_map(move |name| {
+        let stdin = (name == "-").then(|| Ok(Input::Stdin));
+        // A name the filesystem cannot answer for is reported here rather than left to the
+        // walker, whose message already carries the path and would print it twice.
+        let unreadable = (name != "-")
+            .then(|| fs::metadata(Path::new(name)).err())
+            .flatten()
+            .map(|source| {
+                Err(Failure::Io {
+                    path: name.clone(),
+                    source,
+                })
+            });
+        let walked = (name != "-" && unreadable.is_none()).then(|| {
+            // `--glob` and `--type` filter what a walk finds, never what the caller asked for
+            // by name, so a named file carries neither.
+            let named = !Path::new(name).is_dir();
+            let options = TraversalOptions {
+                file_type: if named { None } else { traversal.file_type },
+                ..traversal.clone()
+            };
+            walker(Path::new(name), &options, tool).filter_map(move |entry| match entry {
+                Ok(entry) if !is_readable_entry(&entry) => None,
+                Ok(entry) if !named && !glob_selects(globs, &entry) => None,
+                Ok(entry) => Some(Ok(Input::File(entry))),
+                Err(error) => Some(Err(Failure::Io {
+                    path: name.clone(),
+                    source: io::Error::other(error.to_string()),
+                })),
+            })
+        });
+        stdin
+            .into_iter()
+            .chain(unreadable)
+            .chain(walked.into_iter().flatten())
+    })
 }
 
 // endregion: Directory Traversal
@@ -1616,6 +1849,42 @@ pub enum Status {
 /// as "fix your arguments", and those are different recoveries. Not a [`Status`], because a
 /// run that declined produced nothing and so is only ever reached from an `Err`.
 pub const REFUSED_EXIT_CODE: u8 = 3;
+
+/// What a run has seen, folded as it goes, so no caller counts on the side.
+///
+/// A failure is anything that stopped an input being read or written; `produced` is whatever
+/// that tool calls a result — a row, a record, a chunk. The pair answers the exit code.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Tally {
+    failures: usize,
+    produced: bool,
+}
+
+impl Tally {
+    /// Record an input that could not be read.
+    #[inline]
+    pub fn failed(&mut self) {
+        self.failures += 1;
+    }
+
+    /// Record that the run produced something.
+    #[inline]
+    pub fn produced(&mut self) {
+        self.produced = true;
+    }
+
+    /// Whether anything failed, which some tools also report in prose.
+    #[inline]
+    pub fn failures(&self) -> usize {
+        self.failures
+    }
+
+    /// The exit status this run has earned.
+    #[inline]
+    pub fn status(self) -> Status {
+        Status::of(self.failures > 0, self.produced)
+    }
+}
 
 impl Status {
     /// The status a finished run reports.
@@ -1774,16 +2043,21 @@ pub fn report(tool: &str, outcome: Result<Status, Failure>) -> process::ExitCode
             | Failure::Ambiguous { .. }
             | Failure::Unresolved { .. }),
         ) => {
-            eprintln!("{tool}: {failure}");
+            note(tool, &failure);
             process::ExitCode::from(REFUSED_EXIT_CODE)
         }
         // Named rather than caught, so a new variant is a compile error instead of a
         // silent exit 2.
         Err(failure @ Failure::Io { .. }) => {
-            eprintln!("{tool}: {failure}");
+            note(tool, &failure);
             process::ExitCode::from(Status::Error as u8)
         }
     }
+}
+
+/// Write one diagnostic to stderr. Unlike `eprintln!`, a failed write is not a panic.
+fn note(tool: &str, failure: &Failure) {
+    let _ = writeln!(io::stderr(), "{tool}: {failure}");
 }
 
 // endregion: Failure and Exit Conventions
@@ -2093,6 +2367,311 @@ mod tests {
     }
 
     #[test]
+    fn resolves_a_named_file_and_a_directory_through_one_walk() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let root = directory.path();
+        fs::write(root.join("one.txt"), b"a\n").unwrap();
+        fs::write(root.join("two.log"), b"b\n").unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(root.join("nested/three.txt"), b"c\n").unwrap();
+
+        let traversal = TraversalOptions {
+            hidden: false,
+            no_ignore: true,
+            follow: false,
+            max_depth: None,
+            file_type: None,
+        };
+
+        // A named file yields exactly itself: `ignore::Walk` over a plain path is one entry,
+        // so there is no separate code path for it.
+        let named = vec![root.join("one.txt").display().to_string()];
+        let found: Vec<_> = inputs(&named, &traversal, None, "sz-test")
+            .map(|input| input.unwrap().display_name().into_owned())
+            .collect();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("one.txt"));
+
+        // A directory yields every file under it, and stdin rides the same stream.
+        let mixed = vec!["-".to_string(), root.display().to_string()];
+        let mut names: Vec<String> = inputs(&mixed, &traversal, None, "sz-test")
+            .map(|input| input.unwrap().display_name().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 4, "stdin plus three files: {:?}", names);
+        assert!(names.contains(&"-".to_string()));
+        assert!(names.iter().any(|name| name.ends_with("three.txt")));
+    }
+
+    #[test]
+    fn a_glob_selects_without_hiding_a_walk_failure() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let root = directory.path();
+        fs::write(root.join("keep.txt"), b"a\n").unwrap();
+        fs::write(root.join("drop.log"), b"b\n").unwrap();
+
+        let traversal = TraversalOptions {
+            hidden: false,
+            no_ignore: true,
+            follow: false,
+            max_depth: None,
+            file_type: None,
+        };
+        let globs = vec![glob::Pattern::new("*.txt").unwrap()];
+        let names = vec![root.display().to_string()];
+
+        let kept: Vec<String> = inputs(&names, &traversal, Some(&globs), "sz-test")
+            .map(|input| input.unwrap().display_name().into_owned())
+            .collect();
+        assert_eq!(kept.len(), 1, "{:?}", kept);
+        assert!(kept[0].ends_with("keep.txt"));
+    }
+
+    #[test]
+    fn a_named_file_survives_a_filter_that_would_exclude_it() {
+        // Every tool's help promises that `--glob` and `--type` filter walked files and that
+        // a named file is always taken. Filtering the name the caller typed would make the
+        // flag mean the opposite of what it says.
+        let directory = tempfile::TempDir::new().unwrap();
+        let named = directory.path().join("kept.log");
+        fs::write(&named, b"a\n").unwrap();
+        fs::write(directory.path().join("walked.log"), b"b\n").unwrap();
+        fs::write(directory.path().join("walked.txt"), b"c\n").unwrap();
+
+        let traversal = TraversalOptions {
+            hidden: false,
+            no_ignore: true,
+            follow: false,
+            max_depth: None,
+            file_type: None,
+        };
+        let globs = vec![glob::Pattern::new("*.txt").unwrap()];
+
+        let by_name = vec![named.display().to_string()];
+        let taken: Vec<_> = inputs(&by_name, &traversal, Some(&globs), "sz-test").collect();
+        assert_eq!(taken.len(), 1, "a named file is not filtered by --glob");
+
+        let by_walk = vec![directory.path().display().to_string()];
+        let found: Vec<String> = inputs(&by_walk, &traversal, Some(&globs), "sz-test")
+            .map(|input| input.unwrap().display_name().into_owned())
+            .collect();
+        assert_eq!(found.len(), 1, "a walk is filtered: {:?}", found);
+        assert!(found[0].ends_with("walked.txt"));
+    }
+
+    #[test]
+    fn an_unreadable_input_arrives_as_an_item_not_a_counter() {
+        let traversal = TraversalOptions {
+            hidden: false,
+            no_ignore: true,
+            follow: false,
+            max_depth: None,
+            file_type: None,
+        };
+        let names = vec!["no-such-path-anywhere".to_string()];
+        let outcomes: Vec<_> = inputs(&names, &traversal, None, "sz-test").collect();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].is_err(),
+            "a missing input is an item in the stream, not a side channel"
+        );
+    }
+
+    #[test]
+    fn walks_a_whole_input_as_one_window() {
+        let mut windows = Windows::over(InputSource::Buffer(b"alpha\nbeta\n".to_vec()));
+        assert_eq!(windows.whole(), Some(&b"alpha\nbeta\n"[..]));
+        let (window, base) = windows.next(CutAfter::LineFeed, 0).unwrap().unwrap();
+        assert_eq!(window, b"alpha\nbeta\n");
+        assert_eq!(base, 0);
+        let length = window.len();
+        assert!(windows.next(CutAfter::LineFeed, length).unwrap().is_none());
+    }
+
+    #[test]
+    fn takes_a_prefix_from_a_whole_input_and_leaves_the_rest() {
+        // `--repeat-header` consumes a header before the body loop starts, and a mapped file
+        // must behave like a pipe there: the rest of the input is still to come.
+        let mut windows = Windows::over(InputSource::Buffer(b"head\nbody\ntail\n".to_vec()));
+        let (first, base) = windows.next(CutAfter::LineFeed, 0).unwrap().unwrap();
+        assert_eq!(first, b"head\nbody\ntail\n");
+        assert_eq!(base, 0);
+
+        let (rest, base) = windows.next(CutAfter::LineFeed, 5).unwrap().unwrap();
+        assert_eq!(rest, b"body\ntail\n");
+        assert_eq!(base, 5);
+
+        let length = rest.len();
+        assert!(windows.next(CutAfter::LineFeed, length).unwrap().is_none());
+    }
+
+    #[test]
+    fn ends_a_whole_walk_rather_than_repeating_a_window_it_cannot_widen() {
+        // Consuming nothing asks for more; a mapped input has no more, so the walk ends
+        // instead of handing back the same bytes forever.
+        let mut windows = Windows::over(InputSource::Buffer(b"only\n".to_vec()));
+        assert!(windows.next(CutAfter::LineFeed, 0).unwrap().is_some());
+        assert!(windows.next(CutAfter::LineFeed, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn walks_a_stream_in_windows_that_report_their_offsets() {
+        // Every window cuts on a line, and the bases tile the input without a gap or an
+        // overlap — which is what lets a caller report absolute positions without counting.
+        let data: Vec<u8> = (0..4000)
+            .flat_map(|n| format!("line {n}\n").into_bytes())
+            .collect();
+        let mut windows = Windows(Walk::Stream {
+            refill: Refill::new(
+                Box::new(io::Cursor::new(data.clone())) as Box<dyn Read>,
+                1024,
+            ),
+            base: 0,
+        });
+
+        let mut seen = Vec::new();
+        let mut consumed = 0;
+        while let Some((window, base)) = windows.next(CutAfter::LineFeed, consumed).unwrap() {
+            assert_eq!(base, seen.len(), "windows must tile the input");
+            assert!(window.ends_with(b"\n"), "a window must cut on a line");
+            seen.extend_from_slice(window);
+            consumed = window.len();
+        }
+        assert_eq!(seen, data);
+    }
+
+    #[test]
+    fn keeps_a_partial_record_in_view_when_less_than_a_window_is_consumed() {
+        // A scanner that must see past what it emits consumes less than it was given; the
+        // unconsumed tail has to reappear at the head of the next window, or a match
+        // straddling the seam is lost.
+        let data: Vec<u8> = (0..2000)
+            .flat_map(|n| format!("line {n}\n").into_bytes())
+            .collect();
+        let mut windows = Windows(Walk::Stream {
+            refill: Refill::new(
+                Box::new(io::Cursor::new(data.clone())) as Box<dyn Read>,
+                512,
+            ),
+            base: 0,
+        });
+
+        let (first, _) = windows.next(CutAfter::LineFeed, 0).unwrap().unwrap();
+        let held_back = 20.min(first.len());
+        let tail: Vec<u8> = first[first.len() - held_back..].to_vec();
+        let consumed = first.len() - held_back;
+
+        let (second, base) = windows.next(CutAfter::LineFeed, consumed).unwrap().unwrap();
+        assert!(
+            second.starts_with(&tail),
+            "the unconsumed tail must lead the next window"
+        );
+        assert_eq!(
+            base, consumed,
+            "the base advances by what was consumed, not by what was seen"
+        );
+    }
+
+    #[test]
+    fn grows_a_window_for_a_record_that_never_cuts() {
+        let long = vec![b'x'; 5000];
+        let mut windows = Windows(Walk::Stream {
+            refill: Refill::new(
+                Box::new(io::Cursor::new(long.clone())) as Box<dyn Read>,
+                256,
+            ),
+            base: 0,
+        });
+        let (window, _) = windows.next(CutAfter::LineFeed, 0).unwrap().unwrap();
+        assert_eq!(
+            window.len(),
+            long.len(),
+            "an unterminated record grows the window"
+        );
+    }
+
+    #[test]
+    fn every_destination_runs_the_body_and_only_one_keeps_the_bytes() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let created = directory.path().join("made.txt");
+        let replaced = directory.path().join("existing.txt");
+        fs::write(&replaced, b"before\n").unwrap();
+
+        // A discarding run still writes, so a count taken inside the body stays honest.
+        let mut stdout = Vec::new();
+        let counted = Destination::Discard
+            .write("sz-test", &mut stdout, |output| {
+                output.write_all(b"thrown away\n")?;
+                Ok(7)
+            })
+            .unwrap();
+        assert_eq!(counted, 7);
+        assert!(stdout.is_empty());
+
+        let mut stdout = Vec::new();
+        Destination::Stdout
+            .write("sz-test", &mut stdout, |output| {
+                output.write_all(b"to stdout\n")
+            })
+            .unwrap();
+        assert_eq!(stdout, b"to stdout\n");
+
+        let mut stdout = Vec::new();
+        Destination::Creating(created.to_str().unwrap())
+            .write("sz-test", &mut stdout, |output| output.write_all(b"made\n"))
+            .unwrap();
+        assert_eq!(fs::read(&created).unwrap(), b"made\n");
+        assert!(stdout.is_empty(), "a file destination never touches stdout");
+
+        let mut stdout = Vec::new();
+        Destination::Replacing(replaced.to_str().unwrap())
+            .write("sz-test", &mut stdout, |output| {
+                output.write_all(b"after\n")
+            })
+            .unwrap();
+        assert_eq!(fs::read(&replaced).unwrap(), b"after\n");
+    }
+
+    #[test]
+    fn a_failed_body_leaves_the_previous_file_alone() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("keep.txt");
+        fs::write(&path, b"original\n").unwrap();
+
+        let mut stdout = Vec::new();
+        let outcome = Destination::Replacing(path.to_str().unwrap()).write::<()>(
+            "sz-test",
+            &mut stdout,
+            |output| {
+                output.write_all(b"partial")?;
+                Err(io::Error::other("stopped halfway"))
+            },
+        );
+        assert!(outcome.is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"original\n",
+            "a run that failed must not have replaced anything"
+        );
+    }
+
+    #[test]
+    fn a_tally_answers_the_exit_code_without_a_counter_on_the_side() {
+        assert_eq!(Tally::default().status(), Status::NoResult);
+
+        let mut produced = Tally::default();
+        produced.produced();
+        assert_eq!(produced.status(), Status::Success);
+
+        // A failure outranks a result: a partial answer is not a whole one.
+        let mut partial = Tally::default();
+        partial.produced();
+        partial.failed();
+        assert_eq!(partial.status(), Status::Error);
+        assert_eq!(partial.failures(), 1);
+    }
+
+    #[test]
     fn reports_a_refused_precondition_as_its_own_code() {
         // `report`'s catch-all would swallow a missing arm and quietly exit 2, which the
         // compiler cannot object to, so the distinction is only ever as real as this test.
@@ -2387,12 +2966,11 @@ mod tests {
         // An early stop leaves the rest of the input unread, so the digest describes what was
         // read. A caller that needs the whole input has to keep reading, not ask twice.
         let input = b"alpha\nbeta\ngamma\n";
-        let mut refill = Refill::new(&input[..], 6);
-        refill.hash_stream();
-        refill
-            .try_for_each_window(CutAfter::LineFeed, |_| Ok(ControlFlow::Break(())))
-            .unwrap();
-        let stopped = refill.digest().unwrap();
+        let mut walk = Windows::streaming(io::Cursor::new(input.to_vec()), 6);
+        walk.hash_stream();
+        // One window, then the caller stops asking — which is how an early stop is spelled.
+        walk.next(CutAfter::LineFeed, 0).unwrap().unwrap();
+        let stopped = walk.digest().unwrap();
         assert_ne!(stopped, content_hash(input));
         assert_eq!(stopped, content_hash(b"alpha\n"));
     }
@@ -2581,7 +3159,7 @@ mod tests {
         assert_eq!(buffered.as_bytes(), b"abc");
         let window = buffered.into_window(DEFAULT_WINDOW_BYTES);
         assert!(matches!(window, InputWindow::Whole(source) if source.as_bytes() == b"abc"));
-        let piped = InputSource::Pipe(io::stdin().lock());
+        let piped = InputSource::Pipe(Box::new(io::stdin().lock()));
         assert!(matches!(piped.into_window(1), InputWindow::Stream(_)));
     }
 
@@ -2884,17 +3462,12 @@ mod tests {
     }
 
     #[test]
-    fn stops_the_run_where_the_body_breaks() {
+    fn stops_the_run_where_the_caller_stops_asking() {
         // A bounded request stops reading rather than draining the rest of the stream.
-        let mut refill = Refill::new(&b"a\nb\nc\nd\n"[..], 4);
-        let mut windows = Vec::new();
-        refill
-            .try_for_each_window(CutAfter::LineFeed, |window| {
-                windows.push(window.to_vec());
-                Ok(ControlFlow::Break(()))
-            })
-            .unwrap();
-        assert_eq!(windows, vec![b"a\nb\n".to_vec()]);
+        let mut walk = Windows::streaming(io::Cursor::new(b"a\nb\nc\nd\n".to_vec()), 4);
+        let (first, base) = walk.next(CutAfter::LineFeed, 0).unwrap().unwrap();
+        assert_eq!(first, b"a\nb\n");
+        assert_eq!(base, 0);
     }
 
     #[test]

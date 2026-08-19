@@ -11,8 +11,8 @@
 //! Exit: 0 counted a row, 1 ran and counted none, 2 could not run, which includes any named
 //! input that could not be read. `--quiet` changes what is printed, never what is reported.
 
-use std::borrow::Cow;
-use std::fs::{self, File};
+use std::fmt;
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -395,13 +395,6 @@ impl Counter {
         }
     }
 
-    /// Count the selected metrics for given data, taking only the passes they call for.
-    fn count_data(self, data: &[u8]) -> Counts {
-        let mut state = CountState::default();
-        self.count_window(data, &mut state);
-        self.finish(state)
-    }
-
     /// Fold one window into the running tallies. Every plan but [`Plan::WordsOnly`] needs
     /// the window to hold whole lines, and every decoding pass needs it to hold whole
     /// characters; [`Counter::cut`] is what guarantees both.
@@ -546,7 +539,15 @@ fn trusted_file_size(path: &Path) -> io::Result<Option<usize>> {
 // region: Streaming
 
 impl Counter {
-    /// Count a single file, mapping it only when a selected field reads its bytes.
+    /// Count one resolved input.
+    fn count(self, input: &Input) -> io::Result<Counts> {
+        match input {
+            Input::Stdin => self.count_stdin(),
+            Input::File(_) => self.count_file(input.path()),
+        }
+    }
+
+    /// Count a single file, reading it only when a selected field needs its bytes.
     fn count_file(self, path: &Path) -> io::Result<Counts> {
         if !self.fields.reads_content() {
             if let Some(bytes) = trusted_file_size(path)? {
@@ -556,45 +557,34 @@ impl Counter {
                 });
             }
         }
-        let input = open_input(path)?;
-        Ok(self.count_data(input.as_bytes()))
+        self.count_windows(Windows::over(open_input(path)?))
     }
 
-    /// Count a stream through one reused window, so peak memory is the window rather than
-    /// the input. Only a true pipe reaches this; every other source is mapped or buffered.
-    fn count_stream<R: Read>(self, mut refill: Refill<R>) -> io::Result<Counts> {
+    /// Count stdin, which a redirect hands over whole and a pipe hands over in windows. A plan
+    /// that reads nothing still walks a pipe, since only the bytes going past report its length.
+    fn count_stdin(self) -> io::Result<Counts> {
+        self.count_windows(Windows::over(get_input_streaming(None)?))
+    }
+
+    /// Fold every window of one input into the tallies, retaining nothing across a seam, so
+    /// peak memory is the window rather than the input.
+    /// Fold a whole slice, which is one window that needs no cutting.
+    #[cfg(test)]
+    fn count_data(self, data: &[u8]) -> Counts {
         let mut state = CountState::default();
-        refill.for_each_window(self.cut, |window| {
+        self.count_window(data, &mut state);
+        self.finish(state)
+    }
+
+    fn count_windows(self, mut windows: Windows) -> io::Result<Counts> {
+        let mut state = CountState::default();
+        let mut consumed = 0;
+        while let Some((window, _)) = windows.next(self.cut, consumed)? {
+            consumed = window.len();
             self.count_window(window, &mut state);
-            Ok(())
-        })?;
+        }
         Ok(self.finish(state))
     }
-
-    /// Count stdin, mapping a redirect the way a named file is mapped. A pipe has neither a
-    /// length to stat nor a slice to scan, so a plan that reads nothing drains it and every
-    /// other plan windows it.
-    fn count_stdin(self) -> io::Result<Counts> {
-        match get_input_streaming(None)?.into_window(DEFAULT_WINDOW_BYTES) {
-            InputWindow::Whole(source) => Ok(self.count_data(source.as_bytes())),
-            InputWindow::Stream(refill) if !self.fields.reads_content() => Ok(Counts {
-                bytes: drained_length(refill)?,
-                ..Counts::default()
-            }),
-            InputWindow::Stream(refill) => self.count_stream(refill),
-        }
-    }
-}
-
-/// Read a stream to its end and report how many bytes went past, keeping none of them.
-/// Retaining nothing makes every window a fresh read, so the cost stays one window.
-fn drained_length<R: Read>(mut refill: Refill<R>) -> io::Result<usize> {
-    let mut bytes = 0;
-    refill.for_each_window(CutAfter::Anywhere, |window| {
-        bytes += window.len();
-        Ok(())
-    })?;
-    Ok(bytes)
 }
 
 // endregion: Streaming
@@ -608,45 +598,63 @@ struct OutputConfig {
     format: Format,
 }
 
-/// Format number with K/M/G/T suffixes
-fn format_human(value: usize) -> String {
-    if value < 1_000 {
-        value.to_string()
-    } else if value < 1_000_000 {
-        format!("{:.1}K", value as f64 / 1_000.0)
-    } else if value < 1_000_000_000 {
-        format!("{:.1}M", value as f64 / 1_000_000.0)
-    } else if value < 1_000_000_000_000 {
-        format!("{:.1}G", value as f64 / 1_000_000_000.0)
-    } else {
-        format!("{:.1}T", value as f64 / 1_000_000_000_000.0)
+struct NumberBuffer<'a> {
+    buffer: &'a mut [u8; 26],
+    written: usize,
+}
+
+impl fmt::Write for NumberBuffer<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.written + text.len();
+        let room = self.buffer.get_mut(self.written..end).ok_or(fmt::Error)?;
+        room.copy_from_slice(text.as_bytes());
+        self.written = end;
+        Ok(())
     }
+}
+
+/// Render `arguments` into `buffer`, whose 26 bytes cover the widest form: `usize::MAX` grouped.
+fn render_number<'a>(buffer: &'a mut [u8; 26], arguments: fmt::Arguments) -> &'a str {
+    let mut sink = NumberBuffer { buffer, written: 0 };
+    let written = fmt::Write::write_fmt(&mut sink, arguments).map_or(0, |()| sink.written);
+    std::str::from_utf8(&buffer[..written]).unwrap_or("")
 }
 
 /// Render one measurement into `buffer`, which the aligned table pads to width.
-/// Grouped numbers borrow the buffer; the other two forms have to allocate.
-fn format_number<'a>(
-    value: usize,
-    config: &OutputConfig,
-    buffer: &'a mut [u8; 26],
-) -> Cow<'a, str> {
+fn format_number<'a>(value: usize, config: &OutputConfig, buffer: &'a mut [u8; 26]) -> &'a str {
     match config.format {
-        Format::Human => Cow::Owned(format_human(value)),
-        Format::Table => Cow::Borrowed(format_grouped_number(buffer, value)),
-        Format::Plain | Format::Json => Cow::Owned(value.to_string()),
+        Format::Table => format_grouped_number(buffer, value),
+        Format::Plain | Format::Json => render_number(buffer, format_args!("{value}")),
+        Format::Human => {
+            let (scaled, suffix) = if value < 1_000 {
+                return render_number(buffer, format_args!("{value}"));
+            } else if value < 1_000_000 {
+                (value as f64 / 1_000.0, 'K')
+            } else if value < 1_000_000_000 {
+                (value as f64 / 1_000_000.0, 'M')
+            } else if value < 1_000_000_000_000 {
+                (value as f64 / 1_000_000_000.0, 'G')
+            } else {
+                (value as f64 / 1_000_000_000_000.0, 'T')
+            };
+            render_number(buffer, format_args!("{scaled:.1}{suffix}"))
+        }
     }
 }
 
-/// Truncate path to fit within max_width, keeping the rightmost part.
+/// The rightmost `max_width` characters of `path`, behind the `"..."` standing for the rest.
 /// Counts characters, not bytes, so multi-byte paths neither panic nor mis-measure.
-fn truncate_path(path: &str, max_width: usize) -> Cow<'_, str> {
+fn truncate_path(path: &str, max_width: usize) -> (&'static str, &str) {
     let characters = path.chars().count();
     if characters <= max_width {
-        return Cow::Borrowed(path);
+        return ("", path);
     }
-    let keep = max_width.saturating_sub(3); // Reserve 3 characters for "..."
-    let tail: String = path.chars().skip(characters - keep).collect();
-    Cow::Owned(format!("...{}", tail))
+    let keep = max_width.saturating_sub(3);
+    let start = path
+        .char_indices()
+        .nth(characters - keep)
+        .map_or(path.len(), |(offset, _)| offset);
+    ("...", &path[start..])
 }
 
 /// Every width one table needs: the name column, and each selected count column.
@@ -674,12 +682,25 @@ fn column_widths<'a>(
     widths
 }
 
+/// What a row prints: relative to the tree's root where there is one, whole otherwise.
+fn displayed<'a>(row: &'a Row, root: Option<&str>) -> &'a Path {
+    root.and_then(|root| row.path.strip_prefix(root.trim_end_matches('/')).ok())
+        .unwrap_or(&row.path)
+}
+
 /// Width of the name column: the widest name any row prints, its tree glyphs included and
 /// [`NAME_WIDTH`] the bound past which [`truncate_path`] takes over. Padding every table to
 /// that bound instead strands one short name a screen away from its own counts.
-fn name_width<'a>(names: impl Iterator<Item = (&'a str, usize)>) -> usize {
+fn name_width<'a>(names: impl Iterator<Item = (&'a Path, usize)>) -> usize {
     names
-        .map(|(name, prefix)| prefix + name.chars().count().min(NAME_WIDTH - prefix))
+        .map(|(name, prefix)| {
+            prefix
+                + name
+                    .to_string_lossy()
+                    .chars()
+                    .count()
+                    .min(NAME_WIDTH - prefix)
+        })
         .max()
         .unwrap_or(0)
 }
@@ -705,19 +726,21 @@ fn print_header(
 fn print_row(
     output: &mut dyn Write,
     prefix: &str,
-    name: &str,
+    name: &Path,
     counts: &Counts,
     config: &OutputConfig,
     widths: &TableWidths,
 ) -> io::Result<()> {
     let prefix_width = prefix.chars().count();
-    let name = truncate_path(name, NAME_WIDTH.saturating_sub(prefix_width));
+    let name = name.to_string_lossy();
+    let (elision, name) = truncate_path(&name, NAME_WIDTH.saturating_sub(prefix_width));
     output.write_all(prefix.as_bytes())?;
+    output.write_all(elision.as_bytes())?;
     write!(
         output,
         "{:width$}",
         name,
-        width = widths.name.saturating_sub(prefix_width)
+        width = widths.name.saturating_sub(prefix_width + elision.len())
     )?;
     let mut buffer = [0u8; 26];
     for ((_, value), width) in counts.columns(config.fields).zip(&widths.columns) {
@@ -798,10 +821,8 @@ fn write_total_json(
 
 /// One counted input.
 struct Row {
-    /// Full path, which JSON reports untruncated.
-    path: String,
-    /// What the table prints, which the tree view strips to a relative name.
-    name: String,
+    /// The file as the walk found it, which JSON reports untruncated.
+    path: PathBuf,
     counts: Counts,
 }
 
@@ -817,7 +838,12 @@ struct Report {
 fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io::Result<()> {
     if config.format == Format::Json {
         for row in &report.rows {
-            write_counts_json(output, &row.path, &row.counts, config.fields)?;
+            write_counts_json(
+                output,
+                &row.path.to_string_lossy(),
+                &row.counts,
+                config.fields,
+            )?;
         }
         if report.rows.len() > 1 || report.root.is_some() {
             write_total_json(output, report.rows.len(), &report.total, config.fields)?;
@@ -832,11 +858,18 @@ fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io:
             return writeln!(output, "{}", value);
         }
         let widths = TableWidths {
-            name: name_width(std::iter::once((row.name.as_str(), 0))),
+            name: name_width(std::iter::once((displayed(row, None), 0))),
             columns: column_widths(std::iter::once(&row.counts), config),
         };
         print_header(output, config, &widths)?;
-        return print_row(output, "", &row.name, &row.counts, config, &widths);
+        return print_row(
+            output,
+            "",
+            displayed(row, None),
+            &row.counts,
+            config,
+            &widths,
+        );
     }
 
     let prefix = if report.root.is_some() {
@@ -849,8 +882,13 @@ fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io:
             report
                 .root
                 .iter()
-                .map(|root| (root.as_str(), 0))
-                .chain(report.rows.iter().map(|row| (row.name.as_str(), prefix))),
+                .map(|root| (Path::new(root.as_str()), 0))
+                .chain(
+                    report
+                        .rows
+                        .iter()
+                        .map(|row| (displayed(row, report.root.as_deref()), prefix)),
+                ),
         ),
         columns: column_widths(
             report
@@ -864,7 +902,14 @@ fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io:
 
     print_header(output, config, &widths)?;
     if let Some(root) = &report.root {
-        print_row(output, "", root, &report.total, config, &widths)?;
+        print_row(
+            output,
+            "",
+            Path::new(root.as_str()),
+            &report.total,
+            config,
+            &widths,
+        )?;
     }
     for (index, row) in report.rows.iter().enumerate() {
         let branch = match (&report.root, index + 1 == report.rows.len()) {
@@ -872,7 +917,14 @@ fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io:
             (Some(_), true) => "└─ ",
             (Some(_), false) => "├─ ",
         };
-        print_row(output, branch, &row.name, &row.counts, config, &widths)?;
+        print_row(
+            output,
+            branch,
+            displayed(row, report.root.as_deref()),
+            &row.counts,
+            config,
+            &widths,
+        )?;
     }
     print_separator(output, config, &widths)?;
     print_totals(output, &report.total, config, &widths)
@@ -882,130 +934,54 @@ fn render(output: &mut dyn Write, report: &Report, config: &OutputConfig) -> io:
 
 // region: Input Processing
 
-/// What one command-line input turned out to name.
-enum Resolved {
-    Stdin,
-    File(PathBuf),
-    Directory(PathBuf),
-}
-
-/// Resolve every input, warning on the ones that cannot be stat'ed and counting them,
-/// so a missing file does not abandon the inputs beside it.
-fn resolve_inputs(inputs: &[String], failures: &mut usize) -> Vec<Resolved> {
-    let mut resolved = Vec::new();
-    for input in inputs {
-        if input == "-" {
-            resolved.push(Resolved::Stdin);
-            continue;
-        }
-        let path = Path::new(input);
-        // One stat answers both questions, and reports why an unreadable path is
-        // unreadable rather than calling every failure a missing file.
-        match fs::metadata(path) {
-            Ok(metadata) if metadata.is_dir() => resolved.push(Resolved::Directory(path.into())),
-            Ok(_) => resolved.push(Resolved::File(path.into())),
-            Err(error) => {
-                eprintln!("sz-count: {}: {}", input, error);
-                *failures += 1;
-            }
-        }
-    }
-    resolved
-}
-
-/// Count `path`, folding it into `report` or warning about why it could not be read.
-fn push_row(
-    report: &mut Report,
-    counter: Counter,
-    path: &Path,
-    name: String,
-    failures: &mut usize,
-) {
-    match counter.count_file(path) {
+/// Count one input, folding it into `report` or warning about why it could not be read.
+fn push_row(report: &mut Report, counter: Counter, input: &Input, tally: &mut Tally) {
+    match counter.count(input) {
         Ok(counts) => {
             report.total.add(&counts);
             report.rows.push(Row {
-                path: path.to_string_lossy().into_owned(),
-                name,
+                path: input.path().to_path_buf(),
                 counts,
             });
         }
         Err(error) => {
-            eprintln!("sz-count: {}: {}", path.display(), error);
-            *failures += 1;
+            eprintln!("sz-count: {}: {}", input.display_name(), error);
+            tally.failed();
         }
     }
 }
 
 /// Count every input, in the order they were named.
 fn gather(
-    inputs: &[String],
+    names: &[String],
     globs: Option<&[glob::Pattern]>,
     traversal: &TraversalOptions<'_>,
     counter: Counter,
-    failures: &mut usize,
+    tally: &mut Tally,
 ) -> Report {
-    let resolved = resolve_inputs(inputs, failures);
     let mut report = Report {
         rows: Vec::new(),
         total: Counts::default(),
-        root: None,
+        // A lone directory gets the tree view, with per-file rows hanging off its name.
+        root: match names {
+            [only] if Path::new(only).is_dir() => Some(match only.strip_suffix('/') {
+                Some(trimmed) => format!("{}/", trimmed),
+                None => format!("{}/", only),
+            }),
+            _ => None,
+        },
     };
 
-    // A lone directory gets the tree view, with per-file rows under a summary.
-    if let [Resolved::Directory(directory)] = resolved.as_slice() {
-        let text = directory.to_string_lossy().into_owned();
-        report.root = Some(if text.ends_with('/') {
-            text
-        } else {
-            format!("{}/", text)
-        });
-        for (path, _) in walk_files(directory, traversal, globs, "sz-count", failures) {
-            let name = path
-                .strip_prefix(directory)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            push_row(&mut report, counter, &path, name, failures);
-        }
-        return report;
-    }
-
-    for input in &resolved {
-        match input {
-            Resolved::Stdin => match counter.count_stdin() {
-                Ok(counts) => {
-                    report.total.add(&counts);
-                    report.rows.push(Row {
-                        path: "-".to_string(),
-                        name: "-".to_string(),
-                        counts,
-                    });
-                }
-                Err(error) => {
-                    eprintln!("sz-count: -: {}", error);
-                    *failures += 1;
-                }
-            },
-            Resolved::File(path) => {
-                let name = path.display().to_string();
-                push_row(&mut report, counter, path, name, failures);
-            }
-            Resolved::Directory(directory) => {
-                for (path, _) in walk_files(directory, traversal, globs, "sz-count", failures) {
-                    let name = path.display().to_string();
-                    push_row(&mut report, counter, &path, name, failures);
-                }
+    for resolved in inputs(names, traversal, globs, "sz-count") {
+        match resolved {
+            Ok(input) => push_row(&mut report, counter, &input, tally),
+            Err(failure) => {
+                eprintln!("sz-count: {}", failure);
+                tally.failed();
             }
         }
     }
     report
-}
-
-/// The status a finished run reports, from the count of inputs that could not be read and
-/// whether any row survived.
-fn outcome(report: &Report, failures: usize) -> Status {
-    Status::of(failures > 0, !report.rows.is_empty())
 }
 
 // endregion: Input Processing
@@ -1025,7 +1001,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         file_type: args.file_type.as_deref(),
     };
 
-    let mut failures = 0;
+    let mut tally = Tally::default();
     let globs = args
         .glob
         .as_deref()
@@ -1037,9 +1013,12 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         globs.as_deref(),
         &traversal,
         counter,
-        &mut failures,
+        &mut tally,
     );
-    let status = outcome(&counted, failures);
+    if !counted.rows.is_empty() {
+        tally.produced();
+    }
+    let status = tally.status();
 
     if status == Status::Success && !args.quiet {
         let config = OutputConfig {
@@ -1230,7 +1209,7 @@ mod tests {
     /// Count the same data through a window of `capacity` bytes, the way a pipe is counted.
     fn streamed(data: &[u8], capacity: usize, mode: Mode, fields: Fields) -> Counts {
         Counter::new(mode, fields)
-            .count_stream(Refill::new(data, capacity))
+            .count_windows(Windows::streaming(io::Cursor::new(data.to_vec()), capacity))
             .unwrap()
     }
 
@@ -1330,7 +1309,7 @@ mod tests {
             if !path.exists() {
                 continue;
             }
-            let expected = fs::read(path).unwrap().len();
+            let expected = std::fs::read(path).unwrap().len();
             assert_eq!(trusted_file_size(path).unwrap(), None, "{}", path.display());
             let measured = counter.count_file(path).unwrap();
             assert_eq!(measured.bytes, expected, "{}", path.display());
@@ -1339,14 +1318,23 @@ mod tests {
 
     #[test]
     fn drains_a_stream_without_holding_it() {
-        // Longer than one window, so the count has to survive across reads.
+        // A byte-only run cuts anywhere and keeps nothing, so its count has to survive
+        // across reads while peak memory stays the window rather than the input.
         let capacity = 4 << 10;
         let data = vec![b'x'; capacity * 2 + 7];
-        assert_eq!(
-            drained_length(Refill::new(&data[..], capacity)).unwrap(),
-            data.len()
-        );
-        assert_eq!(drained_length(Refill::new(&b""[..], capacity)).unwrap(), 0);
+        let bytes_only = Fields::from_selection(&[Field::Bytes]);
+        let counter = Counter::new(Mode::Ascii, bytes_only);
+        assert_eq!(counter.cut, CutAfter::Anywhere);
+
+        let counted = counter
+            .count_windows(Windows::streaming(io::Cursor::new(data.clone()), capacity))
+            .unwrap();
+        assert_eq!(counted.bytes, data.len());
+
+        let empty = counter
+            .count_windows(Windows::streaming(io::Cursor::new(Vec::new()), capacity))
+            .unwrap();
+        assert_eq!(empty.bytes, 0);
     }
 
     #[test]
@@ -1384,52 +1372,54 @@ mod tests {
     #[test]
     fn reports_the_exit_status_of_a_finished_run() {
         let directory = tempfile::tempdir().unwrap();
-        let counted = |arguments: &[&str], failures: &mut usize| {
+        // Exactly what `run` does: fold a tally over the gather, then ask it for the status.
+        let status_of = |arguments: &[&str]| {
             let args = Args::parse_from(arguments);
             let fields = Fields::from_selection(&args.fields);
-            gather(
+            let mut tally = Tally::default();
+            let report = gather(
                 &args.inputs,
                 None,
                 &TraversalOptions::default(),
                 Counter::new(Mode::Ascii, fields),
-                failures,
-            )
+                &mut tally,
+            );
+            if !report.rows.is_empty() {
+                tally.produced();
+            }
+            (report.rows.len(), tally.status())
         };
         let directory_path = directory.path().to_str().unwrap();
 
         // An empty directory completed and found nothing.
-        let mut failures = 0;
-        let report = counted(&["sz-count", "--quiet", directory_path], &mut failures);
-        assert!(outcome(&report, failures) == Status::NoResult);
+        assert_eq!(
+            status_of(&["sz-count", "--quiet", directory_path]).1,
+            Status::NoResult
+        );
 
         // A readable file found something, however quiet the run.
         let file = directory.path().join("trex.txt");
-        fs::write(&file, b"a b\n").unwrap();
-        let mut failures = 0;
-        let report = counted(
-            &["sz-count", "--quiet", file.to_str().unwrap()],
-            &mut failures,
+        std::fs::write(&file, b"a b\n").unwrap();
+        assert_eq!(
+            status_of(&["sz-count", "--quiet", file.to_str().unwrap()]).1,
+            Status::Success
         );
-        assert!(outcome(&report, failures) == Status::Success);
 
         // A missing input still counts its neighbour, and still reports a run that did not
         // complete: a caller cannot tell a partial answer from a whole one by exit code alone.
-        let mut failures = 0;
-        let report = counted(
-            &[
-                "sz-count",
-                "--quiet",
-                "no-such-file",
-                file.to_str().unwrap(),
-            ],
-            &mut failures,
-        );
-        assert_eq!(report.rows.len(), 1);
-        assert!(outcome(&report, failures) == Status::Error);
+        let (rows, status) = status_of(&[
+            "sz-count",
+            "--quiet",
+            "no-such-file",
+            file.to_str().unwrap(),
+        ]);
+        assert_eq!(rows, 1);
+        assert_eq!(status, Status::Error);
 
-        let mut failures = 0;
-        let report = counted(&["sz-count", "--quiet", "no-such-file"], &mut failures);
-        assert!(outcome(&report, failures) == Status::Error);
+        assert_eq!(
+            status_of(&["sz-count", "--quiet", "no-such-file"]).1,
+            Status::Error
+        );
     }
 
     #[test]
@@ -1531,26 +1521,32 @@ mod tests {
     fn truncates_multibyte_paths_on_character_boundaries() {
         // Byte-slicing here used to panic; the path is 60 non-ASCII characters.
         let path = "é".repeat(60);
-        let truncated = truncate_path(&path, 40);
-        assert!(truncated.starts_with("..."));
-        assert_eq!(truncated.chars().count(), 40);
-        assert_eq!(truncate_path("short.txt", 40), "short.txt");
+        let (elision, truncated) = truncate_path(&path, 40);
+        assert_eq!(elision, "...");
+        assert_eq!(elision.len() + truncated.chars().count(), 40);
+        assert_eq!(truncate_path("short.txt", 40), ("", "short.txt"));
     }
 
     #[test]
     fn sizes_the_name_column_to_the_names() {
         // Short names sit beside their counts rather than a column away from them.
-        assert_eq!(name_width(std::iter::once(("tiny.txt", 0))), 8);
+        assert_eq!(name_width(std::iter::once((Path::new("tiny.txt"), 0))), 8);
         // A tree entry's branch glyphs count toward the width its row occupies.
         assert_eq!(
-            name_width(std::iter::once(("tiny.txt", TREE_GLYPH_WIDTH))),
+            name_width(std::iter::once((Path::new("tiny.txt"), TREE_GLYPH_WIDTH))),
             11
         );
         // The widest row sets the column, and truncation bounds it at `NAME_WIDTH`.
-        let names = [("trex.txt", 0), ("nested/directory/dodo.txt", 0)];
+        let names = [
+            (Path::new("trex.txt"), 0),
+            (Path::new("nested/directory/dodo.txt"), 0),
+        ];
         assert_eq!(name_width(names.into_iter()), 25);
         let long = "é".repeat(60);
-        assert_eq!(name_width(std::iter::once((long.as_str(), 0))), NAME_WIDTH);
+        assert_eq!(
+            name_width(std::iter::once((Path::new(long.as_str()), 0))),
+            NAME_WIDTH
+        );
         // Empty input renders a header alone, so the column collapses rather than pads.
         assert_eq!(name_width(std::iter::empty()), 0);
     }

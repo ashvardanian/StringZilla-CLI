@@ -184,7 +184,6 @@ fn write_sorted(
     if config.format == Format::Json {
         write_summary_json(output, config.path, lines.len(), emitted)?;
     }
-    output.flush()?;
     Ok(emitted)
 }
 
@@ -340,24 +339,20 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         path,
     };
 
-    let emitted = if args.dry_run || args.quiet {
-        write_sorted(&lines, &permutation, order, &config, &mut io::sink()).at(path)?
+    // `--in-place` names the input, which validation already refused to let be stdin.
+    let destination = if args.dry_run || args.quiet {
+        Destination::Discard
     } else if args.in_place {
-        let path = args.input.as_deref().expect("validated");
-        write_replacing("sz-sort", path, |output| {
-            write_sorted(&lines, &permutation, order, &config, output)
-        })?
+        Destination::Replacing(path)
     } else {
-        // Through a temporary like `--in-place`, so an interrupted run leaves the previous
-        // file rather than a half-written one, and naming the input as the output does not
-        // truncate the mapping this run is still reading from.
-        match args.output.as_deref().filter(|path| *path != "-") {
-            Some(path) => write_creating("sz-sort", path, |output| {
-                write_sorted(&lines, &permutation, order, &config, output)
-            })?,
-            None => write_sorted(&lines, &permutation, order, &config, output).at("-")?,
+        match args.output.as_deref().filter(|name| *name != "-") {
+            Some(name) => Destination::Creating(name),
+            None => Destination::Stdout,
         }
     };
+    let emitted = destination.write("sz-sort", output, |output| {
+        write_sorted(&lines, &permutation, order, &config, output)
+    })?;
 
     if args.format == Format::Json {
         // The record stream went to a sink, so its closing summary still owes stdout.

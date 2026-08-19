@@ -10,7 +10,7 @@
 //! Exit: 0 wrote a record, 1 ran and wrote none, 2 could not run. A line too short for the
 //! requested column still yields an empty field, so a narrow file exits 0, not 1.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
 use stringzilla::sz::{FindSplits, MatcherType};
@@ -142,30 +142,21 @@ fn parse_columns(spec: &str) -> Result<Vec<usize>, String> {
         }
     }
 
-    if columns.is_empty() {
-        return Err("no columns given; pass a column, a list, or a range".into());
-    }
-
     Ok(columns)
 }
 
-/// Split a line into `out` on the delimiter (SIMD `FindSplits`), reusing the
-/// caller's buffer to avoid a per-line allocation. `limit` stops the scan once that
-/// many fields are in hand, which turns a whole-line scan into a first-delimiter scan
-/// on a wide record; `None` splits the whole line. Separator semantics give the
-/// trailing empty field on a trailing delimiter for free; an empty line has no
-/// fields (matching `cut`).
-fn split_fields<'a>(
-    line: &'a [u8],
-    delimiter: &'a [u8],
-    limit: Option<usize>,
-    out: &mut Vec<&'a [u8]>,
-) {
+/// Split a line into `out` on the delimiter (SIMD `FindSplits`), as offsets into the line so
+/// that one buffer serves every window. `limit` stops the scan once that many fields are in
+/// hand; an empty line has no fields, matching `cut`.
+fn split_fields(line: &[u8], delimiter: &[u8], limit: Option<usize>, out: &mut Vec<Span>) {
     out.clear();
     if line.is_empty() {
         return;
     }
-    let splits = FindSplits::new(line, MatcherType::Find(delimiter));
+    let splits = FindSplits::new(line, MatcherType::Find(delimiter)).map(|field| Span {
+        offset: offset_within(line, field),
+        length: field.len(),
+    });
     match limit {
         Some(limit) => out.extend(splits.take(limit)),
         None => out.extend(splits),
@@ -200,70 +191,84 @@ impl<'a> ColumnSelection<'a> {
     }
 }
 
-/// What [`extract_data`] carries between windows, so a second call resumes where the
-/// first stopped. `Copy` and lifetime-free, and it allocates nothing.
-#[derive(Clone, Copy, Default)]
+/// What [`extract_data`] carries between windows, so a second call resumes where the first
+/// stopped. The field buffer lives here so one allocation serves the whole run.
+#[derive(Default)]
 struct ColsState {
     /// Input lines seen so far, which `--format json` reports.
     line_number: usize,
     /// Records written so far. Nothing in the run reads it; the tests do, to compare a
     /// streamed extraction against a whole-buffer one.
     emitted: usize,
+    /// Fields of the line being written, as offsets into it.
+    fields: Vec<Span>,
+}
+
+/// How one extracted record is written out: the selected fields joined by a delimiter and
+/// closed by a terminator, or a JSON record nesting them as an array.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rendering<'a> {
+    Delimited {
+        delimiter: &'a [u8],
+        terminator: Terminator,
+    },
+    Json,
 }
 
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig<'a> {
-    json: bool,
-    terminator: Terminator,
-    /// Separates fields within one record; unused under `--format json`, which nests them.
-    output_delimiter: &'a [u8],
+    rendering: Rendering<'a>,
     /// The input's path, carried into the JSON envelope.
     path: &'a str,
 }
 
-/// The selected field, or the empty one a line too short to hold it stands in for,
-/// which is what `cut` emits.
+/// The selected field of `line`, or the empty one a line too short to hold it stands in
+/// for, which is what `cut` emits.
 #[inline]
-fn field_at<'a>(fields: &[&'a [u8]], index: usize) -> &'a [u8] {
-    fields.get(index).copied().unwrap_or_default()
-}
-
-/// Write one extracted record as text, honoring the record terminator.
-fn write_record_text(
-    output: &mut dyn Write,
-    config: &OutputConfig,
-    fields: &[&[u8]],
-    column_indices: &[usize],
-) -> io::Result<()> {
-    for (position, &index) in column_indices.iter().enumerate() {
-        if position > 0 {
-            output.write_all(config.output_delimiter)?;
-        }
-        output.write_all(field_at(fields, index))?;
+fn field_at<'a>(line: &'a [u8], fields: &[Span], index: usize) -> &'a [u8] {
+    match fields.get(index) {
+        Some(span) => &line[span.offset..span.offset + span.length],
+        None => b"",
     }
-    output.write_all(&[config.terminator.as_byte()])
 }
 
-/// Write one extracted record as a JSON Lines object, with the fields as an array.
-fn write_record_json(
+/// Write one extracted record. `line_number` is one-based, and only JSON reports it.
+fn write_record(
     output: &mut dyn Write,
     config: &OutputConfig,
-    fields: &[&[u8]],
+    line: &[u8],
+    fields: &[Span],
     column_indices: &[usize],
     line_number: usize,
 ) -> io::Result<()> {
-    output.write_all(br#"{"type":"line","data":{"path":"#)?;
-    json_text_field_to(output, config.path.as_bytes())?;
-    output.write_all(br#","columns":["#)?;
-    for (position, &index) in column_indices.iter().enumerate() {
-        if position > 0 {
-            output.write_all(b",")?;
+    match config.rendering {
+        Rendering::Delimited {
+            delimiter,
+            terminator,
+        } => {
+            for (position, &index) in column_indices.iter().enumerate() {
+                if position > 0 {
+                    output.write_all(delimiter)?;
+                }
+                output.write_all(field_at(line, fields, index))?;
+            }
+            output.write_all(&[terminator.as_byte()])
         }
-        json_text_field_to(output, field_at(fields, index))?;
+        Rendering::Json => {
+            output.write_all(br#"{"type":"line","data":{"path":"#)?;
+            json_text_field_to(output, config.path.as_bytes())?;
+            output.write_all(br#","columns":["#)?;
+            for (position, &index) in column_indices.iter().enumerate() {
+                if position > 0 {
+                    output.write_all(b",")?;
+                }
+                json_text_field_to(output, field_at(line, fields, index))?;
+            }
+            write!(output, r#"],"line_number":{}}}}}"#, line_number)?;
+            output.write_all(b"\n")
+        }
     }
-    write!(output, r#"],"line_number":{}}}}}"#, line_number)?;
-    output.write_all(b"\n")
 }
 
 /// Extract the selected columns from every complete line in `data`, resuming from `state`.
@@ -275,52 +280,35 @@ fn extract_data(
     config: &OutputConfig,
     output: &mut dyn Write,
 ) -> io::Result<()> {
-    let mut fields: Vec<&[u8]> = Vec::new(); // reused across lines
-
     for line in LineIter::new(data, newlines) {
         state.line_number += 1;
-        split_fields(line, selection.delimiter, selection.limit, &mut fields);
+        split_fields(
+            line,
+            selection.delimiter,
+            selection.limit,
+            &mut state.fields,
+        );
 
-        // Skip lines with too few fields if min_columns is set
-        if selection.min_columns.is_some_and(|min| fields.len() < min) {
+        if selection
+            .min_columns
+            .is_some_and(|min| state.fields.len() < min)
+        {
             continue;
         }
 
-        if config.json {
-            write_record_json(
-                output,
-                config,
-                &fields,
-                selection.indices,
-                state.line_number,
-            )?;
-        } else {
-            write_record_text(output, config, &fields, selection.indices)?;
-        }
+        write_record(
+            output,
+            config,
+            line,
+            &state.fields,
+            selection.indices,
+            state.line_number,
+        )?;
         state.emitted += 1;
     }
 
     Ok(())
 }
-
-// region: Streaming
-
-/// Drive [`extract_data`] over a reader, handing it whole-line prefixes of one reused
-/// window so that a pipe costs bounded memory rather than the input's size.
-fn extract_stream<R: Read>(
-    refill: &mut Refill<R>,
-    state: &mut ColsState,
-    selection: &ColumnSelection,
-    newlines: Newlines,
-    config: &OutputConfig,
-    output: &mut dyn Write,
-) -> io::Result<()> {
-    refill.for_each_window(newlines.into(), |window| {
-        extract_data(window, state, selection, newlines, config, output)
-    })
-}
-
-// endregion: Streaming
 
 fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
@@ -341,43 +329,35 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let selection = ColumnSelection::new(&column_indices, delimiter, args.min_columns);
 
     let config = OutputConfig {
-        json: args.format == Format::Json,
-        terminator: Terminator::from_null(args.null),
-        output_delimiter,
+        rendering: match args.format {
+            Format::Json => Rendering::Json,
+            Format::Text => Rendering::Delimited {
+                delimiter: output_delimiter,
+                terminator: Terminator::from_null(args.null),
+            },
+        },
         path,
     };
 
     // A quiet run still extracts, so the record count that answers it stays honest.
-    let mut discard = io::sink();
-    let writer: &mut dyn Write = if args.quiet {
-        &mut discard
+    let destination = if args.quiet {
+        Destination::Discard
     } else {
-        &mut *output
+        Destination::Stdout
     };
 
     let newlines = Newlines::from_utf8(args.utf8);
     let mut state = ColsState::default();
-    // Only a pipe streams, so both the reader and the writer of either arm are `-`.
-    match input.into_window(DEFAULT_WINDOW_BYTES) {
-        InputWindow::Whole(source) => extract_data(
-            source.as_bytes(),
-            &mut state,
-            &selection,
-            newlines,
-            &config,
-            writer,
-        )
-        .at("-")?,
-        InputWindow::Stream(mut refill) => extract_stream(
-            &mut refill,
-            &mut state,
-            &selection,
-            newlines,
-            &config,
-            writer,
-        )
-        .at("-")?,
-    }
+    // A whole input arrives as one window, so mapped and piped share this loop.
+    destination.write("sz-cols", output, |writer| {
+        let mut walk = Windows::over(input);
+        let mut consumed = 0;
+        while let Some((window, _)) = walk.next(newlines.into(), consumed)? {
+            consumed = window.len();
+            extract_data(window, &mut state, &selection, newlines, &config, writer)?;
+        }
+        Ok(())
+    })?;
 
     output.flush().at("-")?;
     Ok(Status::from_found(state.emitted > 0))
@@ -597,9 +577,11 @@ mod tests {
     }
 
     fn fields<'a>(line: &'a [u8], delimiter: &'a [u8]) -> Vec<&'a [u8]> {
-        let mut out = Vec::new();
-        split_fields(line, delimiter, None, &mut out);
-        out
+        let mut spans = Vec::new();
+        split_fields(line, delimiter, None, &mut spans);
+        (0..spans.len())
+            .map(|index| field_at(line, &spans, index))
+            .collect()
     }
 
     #[test]
@@ -626,11 +608,12 @@ mod tests {
         );
     }
 
-    fn text_config(output_delimiter: &'static [u8]) -> OutputConfig<'static> {
+    fn text_config(delimiter: &'static [u8]) -> OutputConfig<'static> {
         OutputConfig {
-            json: false,
-            terminator: Terminator::Newline,
-            output_delimiter,
+            rendering: Rendering::Delimited {
+                delimiter,
+                terminator: Terminator::Newline,
+            },
             path: "-",
         }
     }
@@ -648,7 +631,21 @@ mod tests {
         (output, state.emitted)
     }
 
-    /// Extract the same way, but through a window of exactly `capacity` bytes.
+    /// Where a `capacity`-byte window ends: at the last record boundary inside it, or the
+    /// first one past it when no record fits, which is what a stream widens to.
+    fn window_end(data: &[u8], capacity: usize, newlines: Newlines) -> usize {
+        if capacity >= data.len() {
+            return data.len();
+        }
+        last_cut(&data[..capacity], newlines.into()).unwrap_or_else(|| {
+            LineSpans::new(data, newlines)
+                .next()
+                .map_or(data.len(), |span| span.length)
+        })
+    }
+
+    /// Extract the same way, one `capacity`-byte window at a time. [`Windows`] is fixed at
+    /// [`DEFAULT_WINDOW_BYTES`], which no test-sized input reaches, so the seams are drawn here.
     fn extract_streamed(
         data: &[u8],
         capacity: usize,
@@ -656,18 +653,22 @@ mod tests {
         newlines: Newlines,
         config: &OutputConfig,
     ) -> (Vec<u8>, usize) {
-        let mut refill = Refill::new(data, capacity);
         let mut state = ColsState::default();
         let mut output = Vec::new();
-        extract_stream(
-            &mut refill,
-            &mut state,
-            selection,
-            newlines,
-            config,
-            &mut output,
-        )
-        .unwrap();
+        let mut rest = data;
+        while !rest.is_empty() {
+            let end = window_end(rest, capacity, newlines);
+            extract_data(
+                &rest[..end],
+                &mut state,
+                selection,
+                newlines,
+                config,
+                &mut output,
+            )
+            .unwrap();
+            rest = &rest[end..];
+        }
         (output, state.emitted)
     }
 
@@ -735,7 +736,10 @@ mod tests {
     fn terminates_records_with_nul() {
         let data = b"a\tb\n1\t2\n";
         let mut config = text_config(b"\t");
-        config.terminator = Terminator::Null;
+        config.rendering = Rendering::Delimited {
+            delimiter: b"\t",
+            terminator: Terminator::Null,
+        };
 
         let (output, _) = extract(
             data,
@@ -751,7 +755,7 @@ mod tests {
     fn emits_json_records_with_columns() {
         let data = b"a\tb\tc\n";
         let mut config = text_config(b"\t");
-        config.json = true;
+        config.rendering = Rendering::Json;
 
         let (output, _) = extract(
             data,
@@ -829,7 +833,7 @@ mod tests {
             "a\tb\tc\n\t\t\n\nvery\tlong\trecord\u{2028}that\toutgrows\ta\ttiny\twindow\nx\ty"
                 .as_bytes();
         let mut json = text_config(b",");
-        json.json = true;
+        json.rendering = Rendering::Json;
 
         for (newline_set, newlines) in [("lf", Newlines::Lf), ("unicode", Newlines::Unicode)] {
             for selection in [

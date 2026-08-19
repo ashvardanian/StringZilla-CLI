@@ -113,3 +113,19 @@ path = "sz_sha256.rs"
 io-uring = "0.7"
 libc = "0.2"
 
+# Static checks for the shapes this suite keeps re-growing: deep nesting, bool soup, eager
+# collection, and needless copies. Every lint below is at zero hits today, so a hit is a
+# regression rather than a backlog. Enforced by `.githooks/pre-commit`.
+[lints.clippy]
+cognitive_complexity = "deny"      # deep nesting and tangled conditionals
+too_many_arguments = "deny"        # a missing config struct
+fn_params_excessive_bools = "deny" # a bool that should name its states
+needless_collect = "deny"          # materializing what a lazy iterator would serve
+redundant_clone = "deny"
+unnecessary_to_owned = "deny"
+inefficient_to_string = "deny"
+large_stack_arrays = "deny"
+
+# Informative rather than blocking: each has a small, known backlog.
+too_many_lines = "warn"
+needless_pass_by_value = "warn"
