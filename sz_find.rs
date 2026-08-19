@@ -248,7 +248,7 @@ enum Match {
 /// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
 /// same usage block, same exit code. The kind is never displayed, so one kind serves all.
 fn reject(message: impl std::fmt::Display) -> clap::Error {
-    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+    Args::command().error(ErrorKind::ArgumentConflict, message)
 }
 
 /// Whether the run names each file once rather than on every record, which is where a
@@ -261,24 +261,22 @@ fn names_files_once(args: &Args) -> bool {
 /// never on its value. Every pair rejected here is inert by construction, not merely for
 /// some inputs, which is why silence would misreport what the run did.
 fn validate(args: &Args) -> Result<(), clap::Error> {
-    let reject = |message: String| Args::command().error(ErrorKind::ArgumentConflict, message);
     if args.pattern.is_empty() {
-        return Err(reject("pattern cannot be empty".to_string()));
+        return Err(reject("pattern cannot be empty"));
     }
 
     // `--quiet` stops at the first match, where a cap changes nothing — except under
     // `--summary`, which keeps the tally running and whose totals the cap does bound.
     if args.quiet && args.max_matches.is_some() && !args.summary {
         return Err(reject(
-            "--quiet stops at the first match, so it cannot be combined with --max-matches"
-                .to_string(),
+            "--quiet stops at the first match, so it cannot be combined with --max-matches",
         ));
     }
 
     let show = args.show.unwrap_or_default();
     if args.invert_match && show == Show::Matches {
         return Err(reject(
-            "--invert-match selects the lines that hold no match, so --show matches has nothing to print".to_string(),
+            "--invert-match selects the lines that hold no match, so --show matches has nothing to print",
         ));
     }
 
@@ -306,7 +304,7 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     // Sizing a hash that is never printed is inert for every value of the flag.
     if args.hash_width.is_some() && !args.fields.contains(&Field::LineHashes) {
         return Err(reject(
-            "--hash-width sizes a line hash, so it needs --fields line-hashes".to_string(),
+            "--hash-width sizes a line hash, so it needs --fields line-hashes",
         ));
     }
 
@@ -315,15 +313,13 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     if args.multiline && args.fields.contains(&Field::ColumnNumbers) {
         return Err(reject(
             "--multiline matches across lines, so --fields column-numbers has no column \
-             to resolve"
-                .to_string(),
+             to resolve",
         ));
     }
 
     if args.fields.contains(&Field::FileHash) && !names_files_once(args) {
         return Err(reject(
-            "--fields file-hash names a whole file, so it needs --format json or --heading"
-                .to_string(),
+            "--fields file-hash names a whole file, so it needs --format json or --heading",
         ));
     }
 
@@ -348,24 +344,30 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
             )));
         }
     }
-    let carried: Vec<(bool, &str)> = match args.format {
+    let carried = match args.format {
         // JSON escapes nothing, names its file in every record and reproduces whole lines.
-        Format::Json => vec![
+        Format::Json => [
             (args.null, "--null"),
             (args.heading, "--heading"),
             (colored, "--color"),
             (args.max_line_length.is_some(), "--max-line-length"),
-        ],
+        ]
+        .into_iter()
+        .find(|(present, _)| *present)
+        .map(|(_, flag)| flag),
         // Vimgrep names its file, line and column in every record, and a fifth column would
         // be a different format wearing its name.
-        Format::Vimgrep => vec![
+        Format::Vimgrep => [
             (args.heading, "--heading"),
             (!args.fields.is_empty(), "--fields"),
             (colored, "--color"),
-        ],
+        ]
+        .into_iter()
+        .find(|(present, _)| *present)
+        .map(|(_, flag)| flag),
         Format::Text => return Ok(()),
     };
-    if let Some((_, flag)) = carried.into_iter().find(|(present, _)| *present) {
+    if let Some(flag) = carried {
         let name = args.format.to_possible_value().unwrap();
         return Err(reject(format!(
             "--format {} cannot be combined with {}",
@@ -634,22 +636,32 @@ fn character_count(data: &[u8]) -> usize {
     data.iter().filter(|byte| (*byte & 0xC0) != 0x80).count()
 }
 
-/// Trim `line` to `limit` characters under [`Newlines::Unicode`], to `limit` bytes
-/// otherwise, returning the kept prefix and whether anything was dropped.
-fn trim_to_limit(line: &[u8], limit: usize, newlines: Newlines) -> (&[u8], bool) {
+/// Whether a budgeted write took a whole run or stopped inside it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fit {
+    Whole,
+    Cut,
+}
+
+/// Trim `line` to `limit` characters under [`Newlines::Unicode`], to `limit` bytes otherwise,
+/// returning the kept prefix, what it spent of the limit, and whether anything was dropped.
+fn trim_to_limit(line: &[u8], limit: usize, newlines: Newlines) -> (&[u8], usize, Fit) {
     if newlines == Newlines::Lf {
-        return truncate_at_character(line, limit);
+        // The unit is the byte here, so the kept prefix is its own count.
+        let (kept, trimmed) = truncate_at_character(line, limit);
+        let fit = if trimmed { Fit::Cut } else { Fit::Whole };
+        return (kept, kept.len(), fit);
     }
     let mut seen = 0;
     for (index, byte) in line.iter().enumerate() {
         if (byte & 0xC0) != 0x80 {
             if seen == limit {
-                return (&line[..index], true);
+                return (&line[..index], seen, Fit::Cut);
             }
             seen += 1;
         }
     }
-    (line, false)
+    (line, seen, Fit::Whole)
 }
 
 /// Information about a single match
@@ -780,20 +792,42 @@ impl Matcher<'_> {
     }
 }
 
-/// What every search reporting reads: the needle, the line split, and the selection rules.
+/// Whether anything reads how many lines a run walked over, which only a whole-buffer
+/// search pays a pass over its input to know.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineCounting {
+    Ignored,
+    Reported,
+}
+
+/// Whether a line is in the result, and the first match a column points at when one exists.
+#[derive(Clone, Copy)]
+enum Selection {
+    Rejected,
+    /// Absent under `--invert-match`, which selects the lines that hold no match.
+    Selected(Option<MatchInfo>),
+}
+
+/// What every search reporting reads: the needle, the line split, the selection rules, and
+/// whether the lines walked over are counted.
 struct Search<'a> {
     matcher: Matcher<'a>,
     newlines: Newlines,
     multiline: bool,
     invert_match: bool,
     max_matches: Option<usize>,
+    line_counting: LineCounting,
 }
 
 impl Search<'_> {
-    /// Whether the line belongs in the result, accounting for `--invert-match`.
+    /// Select the line, resolving its first match once for the column and the highlight.
     #[inline]
-    fn selects(&self, line: &[u8]) -> bool {
-        self.matcher.matches(line).next().is_some() != self.invert_match
+    fn select(&self, line: &[u8]) -> Selection {
+        match self.matcher.matches(line).next() {
+            Some(found) if !self.invert_match => Selection::Selected(Some(found)),
+            None if self.invert_match => Selection::Selected(None),
+            _ => Selection::Rejected,
+        }
     }
 }
 
@@ -834,6 +868,16 @@ enum Reporting {
     PrintContext(OutputConfig, Context),
 }
 
+/// Where a file's hash is printed, which is what decides whether it is computed at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HashPlacement {
+    Absent,
+    /// Beside the path in a heading, over the bytes the heading names.
+    Heading,
+    /// On the JSON record that closes the file, once every window is read.
+    ClosingRecord,
+}
+
 impl Reporting {
     /// Pick the reporting: existence only, plain printing, or printing with context.
     fn choose(
@@ -871,6 +915,20 @@ impl Reporting {
         match self {
             Reporting::Tally { .. } => None,
             Reporting::Print(config) | Reporting::PrintContext(config, _) => Some(config),
+        }
+    }
+
+    /// Where this run prints a file's hash, which is what decides whether it is computed at
+    /// all: a file that matched nothing never pays for a token nothing names.
+    #[inline]
+    fn hash_placement(&self) -> HashPlacement {
+        match self.config() {
+            Some(config) if config.carries(Field::FileHash) => match config.output_format {
+                OutputFormat::Heading => HashPlacement::Heading,
+                OutputFormat::Json => HashPlacement::ClosingRecord,
+                OutputFormat::Standard | OutputFormat::Vimgrep => HashPlacement::Absent,
+            },
+            _ => HashPlacement::Absent,
         }
     }
 
@@ -963,17 +1021,16 @@ impl ContextState {
 /// What a search reporting remembers between lines, and between windows once the input
 /// streams: the counters, the once-per-file heading bit and the context ring.
 struct FindState {
+    /// How many lines of this file were selected.
     match_count: usize,
+    /// How many lines of this file were walked over, selected or not.
     lines_searched: usize,
     /// Offset of the current window's first byte within the whole input, which keeps
     /// `--fields byte-offset` and the JSON and vimgrep formats absolute across a streamed run.
     window_base: usize,
+    /// Whether the once-per-file header the format calls for has been written.
     printed_heading: bool,
-    /// The whole file's hash, when `--fields file-hash` asked for one. Set where the file
-    /// is opened, since the heading is written long before the last window is read.
-    file_hash: Option<u64>,
-    /// Grown on the first highlighted line and reused for every later one.
-    highlight_buffer: Vec<u8>,
+    /// The look-behind ring and separators the context flags carry between lines.
     context: ContextState,
 }
 
@@ -985,8 +1042,6 @@ impl FindState {
             lines_searched: 0,
             window_base: 0,
             printed_heading: false,
-            file_hash: None,
-            highlight_buffer: Vec::new(),
             context: ContextState::new(lines),
         }
     }
@@ -1019,14 +1074,17 @@ fn search_window(
     reporting: &Reporting,
     state: &mut FindState,
     output: &mut dyn Write,
+    heading_hash: Option<&[u8]>,
 ) -> io::Result<ControlFlow<Stop>> {
     match reporting {
         Reporting::Tally { stop_at_first } => {
             Ok(tally_window(window, search, *stop_at_first, state))
         }
-        Reporting::Print(config) => print_window(window, path, search, config, state, output),
+        Reporting::Print(config) => {
+            print_window(window, path, search, config, state, output, heading_hash)
+        }
         Reporting::PrintContext(config, _) => {
-            print_context_window(window, path, search, config, state, output)
+            print_context_window(window, path, search, config, state, output, heading_hash)
         }
     }
 }
@@ -1048,7 +1106,7 @@ fn tally_window(
             return ControlFlow::Break(Stop::MaxMatches);
         }
 
-        if search.selects(line) {
+        if matches!(search.select(line), Selection::Selected(_)) {
             state.match_count += 1;
             if stop_at_first {
                 return ControlFlow::Break(Stop::FirstMatch);
@@ -1066,13 +1124,14 @@ fn print_window(
     config: &OutputConfig,
     state: &mut FindState,
     output: &mut dyn Write,
+    heading_hash: Option<&[u8]>,
 ) -> io::Result<ControlFlow<Stop>> {
     let mut emitter = Emitter {
         output,
         path,
         search,
         config,
-        file_hash: state.file_hash,
+        heading_hash,
     };
     for named in named_lines(window, search.newlines) {
         let line = named.as_cut;
@@ -1082,9 +1141,9 @@ fn print_window(
             return Ok(ControlFlow::Break(Stop::MaxMatches));
         }
 
-        if !search.selects(line) {
+        let Selection::Selected(first_match) = search.select(line) else {
             continue;
-        }
+        };
         state.match_count += 1;
 
         let record = LineRecord {
@@ -1093,9 +1152,10 @@ fn print_window(
             line_number: state.lines_searched,
             byte_offset: state.window_base + named.offset,
             is_match: true,
+            first_match,
         };
         emitter.file_heading(&mut state.printed_heading)?;
-        emitter.match_line(record, &mut state.highlight_buffer)?;
+        emitter.match_line(record)?;
     }
     Ok(ControlFlow::Continue(()))
 }
@@ -1109,13 +1169,14 @@ fn print_context_window(
     config: &OutputConfig,
     state: &mut FindState,
     output: &mut dyn Write,
+    heading_hash: Option<&[u8]>,
 ) -> io::Result<ControlFlow<Stop>> {
     let mut emitter = Emitter {
         output,
         path,
         search,
         config,
-        file_hash: state.file_hash,
+        heading_hash,
     };
     for named in named_lines(window, search.newlines) {
         let line = named.as_cut;
@@ -1129,7 +1190,7 @@ fn print_context_window(
         let line_start = named.offset;
         let byte_offset = state.window_base + line_start;
 
-        if search.selects(line) {
+        if let Selection::Selected(first_match) = search.select(line) {
             state.match_count += 1;
             emitter.file_heading(&mut state.printed_heading)?;
 
@@ -1158,21 +1219,20 @@ fn print_context_window(
                         line_number: buffered.line_number,
                         byte_offset: state.window_base + buffered.span.start,
                         is_match: false,
+                        first_match: None,
                     })?;
                     state.context.last_printed_line = Some(buffered.line_number);
                 }
             }
 
-            emitter.match_line(
-                LineRecord {
-                    as_cut: line,
-                    whole: named.whole,
-                    line_number,
-                    byte_offset,
-                    is_match: true,
-                },
-                &mut state.highlight_buffer,
-            )?;
+            emitter.match_line(LineRecord {
+                as_cut: line,
+                whole: named.whole,
+                line_number,
+                byte_offset,
+                is_match: true,
+                first_match,
+            })?;
             state.context.last_printed_line = Some(line_number);
             state.context.pending_after = state.context.lines.after;
         } else if state.context.pending_after > 0 {
@@ -1182,6 +1242,7 @@ fn print_context_window(
                 line_number,
                 byte_offset,
                 is_match: false,
+                first_match: None,
             })?;
             state.context.last_printed_line = Some(line_number);
             state.context.pending_after -= 1;
@@ -1280,10 +1341,7 @@ fn search_multiline(
     let context = reporting.context();
     // Groups are divided only where surrounding lines are printed, as in line mode.
     let separates_groups = context.before > 0 || context.after > 0;
-    let file_hash = reporting
-        .config()
-        .filter(|config| config.carries(Field::FileHash))
-        .map(|_| content_hash(data));
+    let placement = reporting.hash_placement();
     // Reborrowed rather than moved, so the sink is still reachable for the closing
     // JSON record once every region is printed.
     let mut emitter = reporting.config().map(|config| Emitter {
@@ -1291,14 +1349,15 @@ fn search_multiline(
         path,
         search,
         config,
-        // Only the heading prints it inline; JSON carries it on the closing record.
-        file_hash: file_hash.filter(|_| config.output_format == OutputFormat::Heading),
+        heading_hash: (placement == HashPlacement::Heading).then_some(data),
     });
 
     // Each region carries its own surrounding lines, so this reporting keeps no look-behind
     // ring, and the whole file is one window that counts its lines up front.
     let mut state = FindState::new(Context::none());
-    state.lines_searched = data.sz_matches(b"\n").count() + 1;
+    if search.line_counting == LineCounting::Reported {
+        state.lines_searched = data.sz_matches(b"\n").count() + 1;
+    }
     let mut scanned_through = 0;
     // One past the terminator of the last printed region, absent until one is printed.
     let mut last_printed_end: Option<usize> = None;
@@ -1351,6 +1410,9 @@ fn search_multiline(
                         line_number: line_number + index,
                         byte_offset: actual_start + named.offset,
                         is_match: true,
+                        // A multiline region holds no column to point at, which `validate`
+                        // refuses to ask for.
+                        first_match: None,
                     })?;
                 }
             } else {
@@ -1360,6 +1422,8 @@ fn search_multiline(
         }
     }
 
+    let closes_the_file = state.printed_heading && placement == HashPlacement::ClosingRecord;
+    let file_hash = closes_the_file.then(|| content_hash(data));
     print_json_end(output, path, reporting, &state, file_hash)?;
 
     // `--max-matches` caps this file, and reaching the cap ends the walk over the rest —
@@ -1385,9 +1449,7 @@ fn can_stream(search: &Search, reporting: &Reporting) -> bool {
         // A heading is written on the first match, long before a stream reaches the bytes a
         // file's hash covers. JSON names the file again when it closes it, which a stream
         // does reach, so only the heading has to hold the input.
-        && !reporting.config().is_some_and(|config| {
-            config.carries(Field::FileHash) && config.output_format == OutputFormat::Heading
-        })
+        && reporting.hash_placement() != HashPlacement::Heading
         && match reporting {
             Reporting::Tally { .. } | Reporting::Print(_) => true,
             Reporting::PrintContext(_, context) => context.before == 0,
@@ -1442,30 +1504,33 @@ fn search_windows<W: Windowing>(
         return search_multiline(data, path, search, reporting, output);
     }
 
-    let carries_hash = reporting
-        .config()
-        .is_some_and(|config| config.carries(Field::FileHash));
+    let placement = reporting.hash_placement();
     // A whole input names itself from its own bytes; a stream from what it hashed as it read,
     // which is why the walk was told to hash before it was asked for a window.
-    let whole_hash = walk.whole().filter(|_| carries_hash).map(content_hash);
+    let arrives_whole = walk.whole().is_some();
+    // Only an input that arrived whole holds the bytes a heading names inline.
+    let heading_hash = placement == HashPlacement::Heading && arrives_whole;
     let mut state = FindState::new(reporting.context());
-    // Only the heading prints it inline; JSON carries it on the closing record.
-    state.file_hash = whole_hash.filter(|_| {
-        reporting
-            .config()
-            .is_some_and(|config| config.output_format == OutputFormat::Heading)
-    });
 
     // A run that asked for the file's hash keeps *reading* after the search has what it
     // needs, since a digest of a prefix looks exactly like a digest of the file — but it
     // stops *searching*, or the totals would count one line per remaining window.
-    let hashing = carries_hash && whole_hash.is_none();
+    let hashing = placement != HashPlacement::Absent && !arrives_whole;
     let cut: CutAfter = search.newlines.into();
     let mut flow = ControlFlow::Continue(());
     let mut consumed = 0;
     while let Some(window) = walk.window(cut, consumed)? {
         if flow.is_continue() {
-            flow = search_window(window, path, search, reporting, &mut state, output)?;
+            // An input that arrives whole is one window, so the window is what a heading names.
+            flow = search_window(
+                window,
+                path,
+                search,
+                reporting,
+                &mut state,
+                output,
+                heading_hash.then_some(window),
+            )?;
         }
         // Counted before the flow is honoured, so a stop still reports the window it read.
         consumed = window.len();
@@ -1475,13 +1540,11 @@ fn search_windows<W: Windowing>(
         }
     }
 
-    print_json_end(
-        output,
-        path,
-        reporting,
-        &state,
-        whole_hash.or_else(|| walk.digest()),
-    )?;
+    let closes_the_file = state.printed_heading && placement == HashPlacement::ClosingRecord;
+    let file_hash = closes_the_file
+        .then(|| walk.whole().map(content_hash).or_else(|| walk.digest()))
+        .flatten();
+    print_json_end(output, path, reporting, &state, file_hash)?;
     // An early stop leaves the rest of a pipe unread, so the total describes what was
     // searched rather than what the writer still holds.
     Ok(state.result(state.window_base, flow))
@@ -1490,6 +1553,13 @@ fn search_windows<W: Windowing>(
 // endregion: Streaming
 
 // region: Line Output
+
+/// Whether a printed line has its matches wrapped in the highlight color.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Coloring {
+    Plain,
+    Matches,
+}
 
 /// One line as an emitter sees it: its bytes, where it sits, and how it was selected.
 #[derive(Clone, Copy)]
@@ -1503,6 +1573,8 @@ struct LineRecord<'a> {
     byte_offset: usize,
     /// False for a surrounding context line, which prints `-` where a match prints `:`.
     is_match: bool,
+    /// The match a column points at, found once where the line was selected.
+    first_match: Option<MatchInfo>,
 }
 
 /// Everything a printed line reads beyond the line itself: the sink, the file it came
@@ -1512,10 +1584,8 @@ struct Emitter<'a, 'p> {
     path: &'a str,
     search: &'a Search<'p>,
     config: &'a OutputConfig,
-    /// The whole file's hash, printed once beside the reporting in a heading rather than on
-    /// every record. Populated only for `OutputFormat::Heading`: JSON puts it on the record
-    /// that closes the file, which is written past this emitter.
-    file_hash: Option<u64>,
+    /// The bytes a heading names beside the path, hashed on the first record that prints one.
+    heading_hash: Option<&'a [u8]>,
 }
 
 impl Emitter<'_, '_> {
@@ -1531,7 +1601,7 @@ impl Emitter<'_, '_> {
         if *printed {
             return Ok(());
         }
-        let (path, config, file_hash) = (self.path, self.config, self.file_hash);
+        let (path, config, heading_hash) = (self.path, self.config, self.heading_hash);
         match config.output_format {
             OutputFormat::Heading => {
                 write!(
@@ -1541,7 +1611,7 @@ impl Emitter<'_, '_> {
                 )?;
                 // Beside the path, which is the only place a whole-file value belongs in a
                 // stream of per-line records.
-                if let Some(hash) = file_hash {
+                if let Some(data) = heading_hash {
                     // Two spaces rather than `:`, which would read as a `file:line` prefix,
                     // and outside the colour span as every other column's separator is.
                     let mut buffer = [0u8; HASH_CHARS];
@@ -1549,7 +1619,7 @@ impl Emitter<'_, '_> {
                         self.output,
                         "  {}{}{}",
                         config.colors.hash,
-                        format_hash(&mut buffer, hash, HASH_CHARS),
+                        format_hash(&mut buffer, content_hash(data), HASH_CHARS),
                         config.colors.reset
                     )?;
                 }
@@ -1586,25 +1656,26 @@ impl Emitter<'_, '_> {
     }
 
     /// Print a matching line, coloring its matches where the format allows.
-    fn match_line(&mut self, record: LineRecord, highlight_buffer: &mut Vec<u8>) -> io::Result<()> {
-        let (search, config) = (self.search, self.config);
-        let highlighted = (config.highlights() && self.positions_in(record))
-            .then(|| highlight_line(record.as_cut, search, config, highlight_buffer))
-            .flatten();
-        // The colored bytes travel beside the record rather than inside it: the column
-        // resolves against the line as it was found, and an escape code spliced in ahead
-        // of a match would shift that column by its own length.
-        self.write_line(record, highlighted.unwrap_or(record.as_cut))
+    fn match_line(&mut self, record: LineRecord) -> io::Result<()> {
+        // The color decision travels beside the record rather than inside it: the column
+        // resolves against the line as it was found, and an escape code ahead of a match
+        // would shift that column by its own length.
+        let coloring = if self.config.highlights() && self.positions_in(record) {
+            Coloring::Matches
+        } else {
+            Coloring::Plain
+        };
+        self.write_line(record, coloring)
     }
 
     /// Print one line with the prefixes its format asks for.
     fn line(&mut self, record: LineRecord) -> io::Result<()> {
-        self.write_line(record, record.as_cut)
+        self.write_line(record, Coloring::Plain)
     }
 
-    /// Print `body` — the line itself, or its highlighted form — behind the prefixes the
-    /// format asks for, resolving every position against `record.as_cut`.
-    fn write_line(&mut self, record: LineRecord, body: &[u8]) -> io::Result<()> {
+    /// Print the line behind the prefixes the format asks for, resolving every position
+    /// against `record.as_cut`.
+    fn write_line(&mut self, record: LineRecord, coloring: Coloring) -> io::Result<()> {
         let (path, search, config) = (self.path, self.search, self.config);
         let positioned = self.positions_in(record);
 
@@ -1624,21 +1695,21 @@ impl Emitter<'_, '_> {
                         if config.only_matches() {
                             self.output.write_all(found.text(record.as_cut))?;
                         } else {
-                            self.write_trimmed(body)?;
+                            self.write_body(record.as_cut, coloring)?;
                         }
                         self.output.write_all(&[config.terminator])?;
                     }
                 } else if record.is_match {
                     // An inverted match holds no position, so the line prints at column one.
                     write!(self.output, "{}:{}:1:", path, record.line_number)?;
-                    self.write_trimmed(body)?;
+                    self.write_body(record.as_cut, coloring)?;
                     self.output.write_all(&[config.terminator])?;
                 }
                 Ok(())
             }
             OutputFormat::Standard | OutputFormat::Heading => {
                 self.write_prefix(record)?;
-                self.write_content(record, body)?;
+                self.write_content(record, coloring)?;
                 self.output.write_all(&[config.terminator])
             }
         }
@@ -1747,10 +1818,8 @@ impl Emitter<'_, '_> {
             )?;
         }
         if config.column_numbers() && self.positions_in(record) {
-            let column = search
-                .matcher
-                .matches(record.as_cut)
-                .next()
+            let column = record
+                .first_match
                 .map_or(1, |found| found.column(record.as_cut, search.newlines));
             write!(
                 self.output,
@@ -1784,10 +1853,10 @@ impl Emitter<'_, '_> {
     }
 
     /// Write a line's content, reduced to the matches themselves under `--show matches`.
-    fn write_content(&mut self, record: LineRecord, body: &[u8]) -> io::Result<()> {
+    fn write_content(&mut self, record: LineRecord, coloring: Coloring) -> io::Result<()> {
         let (search, config) = (self.search, self.config);
         if !(config.only_matches() && self.positions_in(record)) {
-            return self.write_trimmed(body);
+            return self.write_body(record.as_cut, coloring);
         }
         for (index, found) in search.matcher.matches(record.as_cut).enumerate() {
             if index > 0 {
@@ -1808,18 +1877,54 @@ impl Emitter<'_, '_> {
         Ok(())
     }
 
-    /// Write a whole line, trimmed to `--max-line-length` on a character boundary.
-    /// One long minified line would otherwise flood a terminal or a context window.
-    fn write_trimmed(&mut self, line: &[u8]) -> io::Result<()> {
-        let Some(limit) = self.config.max_line_length else {
-            return self.output.write_all(line);
-        };
-        let (kept, trimmed) = trim_to_limit(line, limit, self.search.newlines);
-        self.output.write_all(kept)?;
-        if trimmed {
-            self.output.write_all(b" [...]")?;
+    /// Write a whole line, trimmed to `--max-line-length` on a character boundary and ending
+    /// in the mark that tells its reader the rest was dropped.
+    ///
+    /// An escape code is not a character anyone reads, so it spends none of the limit.
+    fn write_body(&mut self, line: &[u8], coloring: Coloring) -> io::Result<()> {
+        match self.write_spans(line, coloring)? {
+            Fit::Whole => Ok(()),
+            Fit::Cut => self.output.write_all(b" [...]"),
         }
-        Ok(())
+    }
+
+    /// Write the line's runs against one shared budget, wrapping every match in the highlight
+    /// color where one was asked for, and stopping where the budget runs out.
+    fn write_spans(&mut self, line: &[u8], coloring: Coloring) -> io::Result<Fit> {
+        let (search, config) = (self.search, self.config);
+        let mut budget = config.max_line_length;
+        if coloring == Coloring::Plain {
+            return self.write_run(line, &mut budget);
+        }
+        let mut cursor = 0;
+        for found in search.matcher.matches(line) {
+            if self.write_run(&line[cursor..found.offset], &mut budget)? == Fit::Cut {
+                return Ok(Fit::Cut);
+            }
+            self.output
+                .write_all(config.colors.match_highlight.as_bytes())?;
+            let fit = self.write_run(found.text(line), &mut budget)?;
+            // Written even where the budget ran out inside the match, so a trimmed line
+            // never leaves the terminal colored.
+            self.output.write_all(config.colors.reset.as_bytes())?;
+            if fit == Fit::Cut {
+                return Ok(Fit::Cut);
+            }
+            cursor = found.offset + found.length;
+        }
+        self.write_run(&line[cursor..], &mut budget)
+    }
+
+    /// Write as much of `run` as the budget still allows, spending what it wrote.
+    fn write_run(&mut self, run: &[u8], budget: &mut Option<usize>) -> io::Result<Fit> {
+        let Some(limit) = *budget else {
+            self.output.write_all(run)?;
+            return Ok(Fit::Whole);
+        };
+        let (kept, spent, fit) = trim_to_limit(run, limit, self.search.newlines);
+        *budget = Some(limit - spent);
+        self.output.write_all(kept)?;
+        Ok(fit)
     }
 
     /// Write a whole multi-line region verbatim, which is what `--multiline` prints when
@@ -1840,33 +1945,6 @@ impl Emitter<'_, '_> {
         }
         Ok(())
     }
-}
-
-/// Wrap every match in `line` with the highlight color, building into a reused buffer.
-/// `None` when the line holds no match, leaving the caller to print the line itself.
-fn highlight_line<'b>(
-    line: &[u8],
-    search: &Search,
-    config: &OutputConfig,
-    buffer: &'b mut Vec<u8>,
-) -> Option<&'b [u8]> {
-    // Peeked before the buffer is touched: a line with no match is printed as it stands.
-    let mut matches = search.matcher.matches(line).peekable();
-    matches.peek()?;
-
-    buffer.clear();
-    // Reserve capacity to minimize allocations during building
-    buffer.reserve(line.len() + 64);
-    let mut last_end = 0;
-    for found in matches {
-        buffer.extend_from_slice(&line[last_end..found.offset]);
-        buffer.extend_from_slice(config.colors.match_highlight.as_bytes());
-        buffer.extend_from_slice(found.text(line));
-        buffer.extend_from_slice(config.colors.reset.as_bytes());
-        last_end = found.offset + found.length;
-    }
-    buffer.extend_from_slice(&line[last_end..]);
-    Some(buffer)
 }
 
 /// Close the JSON Lines record for a file that opened one, once every window is done.
@@ -2177,6 +2255,11 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
             multiline: args.multiline,
             invert_match: args.invert_match,
             max_matches: args.max_matches.map(NonZeroUsize::get),
+            line_counting: if args.summary || args.format == Format::Json {
+                LineCounting::Reported
+            } else {
+                LineCounting::Ignored
+            },
         },
         // One dispatch decision for the whole run: what the per-line loop remembers.
         reporting: Reporting::choose(args, show, context, inputs, io::stdout().is_terminal()),
@@ -2288,6 +2371,7 @@ mod tests {
             multiline: false,
             invert_match: false,
             max_matches: None,
+            line_counting: LineCounting::Reported,
         }
     }
 
@@ -2724,9 +2808,12 @@ mod tests {
         assert_eq!(found.column(line, Newlines::Unicode), 7);
         assert_eq!(
             trim_to_limit(line, 5, Newlines::Unicode),
-            (&line[..10], true)
+            (&line[..10], 5, Fit::Cut)
         );
-        assert_eq!(trim_to_limit(line, 6, Newlines::Lf), (&line[..6], true));
+        assert_eq!(
+            trim_to_limit(line, 6, Newlines::Lf),
+            (&line[..6], 6, Fit::Cut)
+        );
     }
 
     #[test]
@@ -2765,11 +2852,14 @@ mod tests {
     fn inverts_line_match_selection() {
         let line = b"hello world";
         let mut search = make_search(b"hello");
-        assert!(search.selects(line));
+        assert!(matches!(search.select(line), Selection::Selected(_)));
 
         search.invert_match = true;
-        assert!(!search.selects(line));
-        assert!(search.selects(b"goodbye world"));
+        assert!(matches!(search.select(line), Selection::Rejected));
+        assert!(matches!(
+            search.select(b"goodbye world"),
+            Selection::Selected(_)
+        ));
     }
 
     #[test]
@@ -2926,20 +3016,45 @@ mod tests {
 
     #[test]
     fn wraps_matches_in_color_codes() {
-        let line = b"hello world hello";
         let search = make_search(b"hello");
         let mut config = make_config();
         config.colors = Colors::enabled();
 
-        let mut buffer = Vec::new();
-        let highlighted = highlight_line(line, &search, &config, &mut buffer).unwrap();
-        let result = String::from_utf8(highlighted.to_vec()).unwrap();
+        let (output, ..) = search_whole(b"hello world hello\n", &search, &Reporting::Print(config));
+        assert_eq!(
+            output,
+            b"\x1b[1;31mhello\x1b[0m world \x1b[1;31mhello\x1b[0m\n"
+        );
 
-        assert!(result.contains("\x1b[1;31m")); // Contains highlight
-        assert!(result.contains("\x1b[0m")); // Contains reset
+        // A line without a match is printed as it stands, escapes and all absent.
+        let (output, ..) = search_whole(
+            b"hello\nnothing here\n",
+            &make_search(b"nothing"),
+            &Reporting::Print(config),
+        );
+        assert_eq!(output, b"\x1b[1;31mnothing\x1b[0m here\n");
+    }
 
-        // A line without a match leaves the buffer alone, so the caller prints the line.
-        assert!(highlight_line(b"nothing here", &search, &config, &mut buffer).is_none());
+    /// The trimming budget counts what a reader sees, so color changes where a line is cut
+    /// but never how much of it survives.
+    #[test]
+    fn trims_colored_and_plain_lines_to_the_same_text() {
+        let data = b"one error two error three error four\n";
+        let search = make_search(b"error");
+        for limit in [1usize, 4, 9, 12, 20, 33, 36, 40] {
+            let mut config = make_config();
+            config.max_line_length = Some(limit);
+            let (plain, ..) = search_whole(data, &search, &Reporting::Print(config));
+
+            config.colors = Colors::enabled();
+            let (colored, ..) = search_whole(data, &search, &Reporting::Print(config));
+            let visible: Vec<u8> = String::from_utf8(colored)
+                .unwrap()
+                .replace("\x1b[1;31m", "")
+                .replace("\x1b[0m", "")
+                .into_bytes();
+            assert_eq!(visible, plain, "limit {}", limit);
+        }
     }
 
     #[test]
