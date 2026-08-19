@@ -1,448 +1,469 @@
 //! Fuzzy substring search over StringZilla's `szs` kernels, where `sz-find` matches literally.
 //!
-//! `--match line` runs Smith-Waterman local alignment of the needle against each line;
-//! `--match word` tokenizes first and measures Levenshtein against each token, which is the mode
-//! that carries true edit-distance semantics. Exact hits are claimed first by a literal scan, so
-//! only the remainder reaches the kernel.
+//! A query is expanded into every string within `--max-distance` edits of it, and those variants
+//! are matched exactly by one Aho-Corasick automaton. The edit model therefore lives in the
+//! vocabulary and its BM25 weights rather than in a substitution matrix, so `--max-distance` is an
+//! edit budget in every mode and digits never share a scoring class with each other.
 //!
-//! Scoring is selectable — uniform, keyboard proximity, or phonetic — and any non-uniform model
-//! routes through Smith-Waterman, which carries a `byte_to_class[256]` and a
-//! `class_substitution_costs[32][32]` matrix. Thirty-two classes cannot hold fifty-two letters, so
-//! that path folds case unconditionally and `--ignore-case` changes only the literal and
-//! Levenshtein paths.
+//! `--cost keyboard` draws substitutions and insertions from physically adjacent keys instead of
+//! the whole alphabet, which is what keeps a two-edit ball affordable.
+//!
+//! Every query's variants are pooled into one dictionary, so the corpus is walked once however many
+//! `--pattern` flags are given. BM25 scores that walk: a strictly positive weight per variant makes
+//! a positive score mean "matched", and `find_into` runs afterwards, over survivors only, when
+//! spans are actually asked for.
 //!
 //! Exit: 0 matched something, 1 matched nothing, 2 could not run.
 
-use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringzilla::sz;
 use stringzilla::szs::{
-    DeviceScope, LevenshteinDistances, LevenshteinDistancesUtf8, SmithWatermanScores,
+    AnyBytesTape, Bm25Params, CaseSensitivity, DeviceScope, OverlapPolicy, Substrings,
+    SubstringsMatch,
 };
 
+use shared::folds::Fold;
+use shared::keyboards::Keyboard;
+use shared::misspellings;
 use shared::*;
 
-// region: Scoring Matrices
+// region: Vocabulary
 
-/// Diagonal (self) score. Uniform across matrices so `--min-similarity` normalizes
-/// consistently: the maximum score a needle of N bytes can earn is `MATCH * N`.
-const MATCH: i8 = 8;
-const MATCH_I: isize = MATCH as isize;
-
-/// Class indices beyond the 26 letters.
-const CLASS_DIGIT: usize = 26;
-const CLASS_OTHER: usize = 27;
-const CLASS_SPACE: usize = 28;
-
-/// A fully-built scoring scheme: byte→class map, 32×32 class scores, affine gaps.
-struct Scheme {
-    byte_to_class: [u8; 256],
-    costs: [[i8; 32]; 32],
-    gap_open: i8,
-    gap_extend: i8,
+/// Where an edit's replacement characters come from.
+///
+/// This is the one knob that decides whether a `d <= 2` ball is a few hundred needles or a few
+/// hundred thousand: restricting substitutions and insertions to physically adjacent keys cuts the
+/// ball roughly fifteen-fold at every radius.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Alphabet {
+    /// Every character the layout carries, which is plain edit distance.
+    Script,
+    /// Only the keys adjacent to the one being replaced, for fat-finger typos.
+    Keyboard,
 }
 
-/// Shared class assignment: `a-z`/`A-Z` → 0..25 (case-folded), digit → 26,
-/// whitespace → 28, everything else → 27. Letters fold case because 26 letter
-/// classes already nearly fill the 32-class budget, so Smith-Waterman fuzzy
-/// matching is case-insensitive by construction.
-fn default_byte_to_class() -> [u8; 256] {
-    let mut map = [CLASS_OTHER as u8; 256];
-    for b in b'a'..=b'z' {
-        map[b as usize] = b - b'a';
-    }
-    for b in b'A'..=b'Z' {
-        map[b as usize] = b - b'A';
-    }
-    for b in b'0'..=b'9' {
-        map[b as usize] = CLASS_DIGIT as u8;
-    }
-    for &b in &[b' ', b'\t', b'\r', b'\n', 0x0b, 0x0c] {
-        map[b as usize] = CLASS_SPACE as u8;
-    }
-    map
+/// How a variant was derived from its query, which is what sets its weight.
+///
+/// A transposition is the likeliest real typo and a deletion the least informative, so they do not
+/// share a score even at equal edit distance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Derivation {
+    Exact,
+    /// A misspelling somebody wrote down, from hunspell `REP` or Wikipedia's list.
+    Recorded,
+    Transposition,
+    Substitution,
+    Deletion,
+    Insertion,
 }
 
-#[inline]
-fn letter(c: u8) -> usize {
-    (c - b'a') as usize
-}
-
-fn diagonal_only() -> [[i8; 32]; 32] {
-    let mut m = [[0i8; 32]; 32];
-    for (class, row) in m.iter_mut().enumerate() {
-        row[class] = MATCH;
-    }
-    m
-}
-
-/// `edit`: uniform — diagonal +MATCH, all substitutions 0. With gaps ≈ −MATCH this
-/// behaves like substitution/indel-counting edit distance under the `--max-distance` threshold.
-fn edit_scheme() -> Scheme {
-    Scheme {
-        byte_to_class: default_byte_to_class(),
-        costs: diagonal_only(),
-        gap_open: -MATCH,
-        gap_extend: -MATCH,
-    }
-}
-
-/// Staggered-QWERTY `(x, y)` coordinates per letter class (0=a .. 25=z).
-fn keyboard_coords() -> [(f32, f32); 26] {
-    let mut c = [(0.0f32, 0.0f32); 26];
-    let rows: [(&[u8], f32, f32); 3] = [
-        (b"qwertyuiop", 0.0, 0.0),
-        (b"asdfghjkl", 0.25, 1.0),
-        (b"zxcvbnm", 0.75, 2.0),
-    ];
-    for (letters, x_off, y) in rows {
-        for (i, &ch) in letters.iter().enumerate() {
-            c[letter(ch)] = (x_off + i as f32, y);
-        }
-    }
-    c
-}
-
-/// `keyboard`: substitution score falls off with Euclidean key distance.
-/// self +8, orthogonal neighbor +4, diagonal neighbor +2, two away 0, far −4.
-fn keyboard_scheme() -> Scheme {
-    let coords = keyboard_coords();
-    let mut m = diagonal_only();
-    for a in 0..26 {
-        for b in 0..26 {
-            if a == b {
-                continue;
-            }
-            let (ax, ay) = coords[a];
-            let (bx, by) = coords[b];
-            let dist = ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt();
-            let score = (MATCH as f32 - 4.0 * dist).round().clamp(-8.0, 8.0);
-            m[a][b] = score as i8;
-        }
-    }
-    penalize_nonletters(&mut m);
-    Scheme {
-        byte_to_class: default_byte_to_class(),
-        costs: m,
-        gap_open: -6,
-        gap_extend: -2,
-    }
-}
-
-/// `phonetic`: articulatory similarity, seeded by Editex (Zobel & Dart) groups.
-fn phonetic_scheme() -> Scheme {
-    let mut m = diagonal_only();
-    let mut set = |a: u8, b: u8, s: i8| {
-        m[letter(a)][letter(b)] = s;
-        m[letter(b)][letter(a)] = s;
-    };
-    // Voiced/unvoiced cognates (same place & manner) — strongest similarity.
-    for &(a, b) in &[
-        (b'b', b'p'),
-        (b'd', b't'),
-        (b'g', b'k'),
-        (b'v', b'f'),
-        (b'z', b's'),
-        (b'j', b'g'),
-    ] {
-        set(a, b, 5);
-    }
-    // Same manner / Editex group.
-    for &(a, b) in &[
-        (b'm', b'n'),
-        (b'l', b'r'),
-        (b'c', b'k'),
-        (b'c', b'q'),
-        (b'k', b'q'),
-        (b's', b'x'),
-        (b'x', b'z'),
-        (b's', b'z'),
-    ] {
-        set(a, b, 4);
-    }
-    // Vowels are highly interchangeable.
-    let vowels = *b"aeiouy";
-    for i in 0..vowels.len() {
-        for j in (i + 1)..vowels.len() {
-            set(vowels[i], vowels[j], 2);
-        }
-    }
-    // Remaining consonant↔consonant pairs are dissimilar; vowels↔consonants and the
-    // near-silent h/w stay neutral (0). h/w lean on cheap gaps instead.
-    let is_vowel = |c: u8| vowels.contains(&c);
-    let silent = |c: u8| c == b'h' || c == b'w';
-    for a in b'a'..=b'z' {
-        for b in (a + 1)..=b'z' {
-            let (ai, bi) = (letter(a), letter(b));
-            if m[ai][bi] != 0 || silent(a) || silent(b) || is_vowel(a) || is_vowel(b) {
-                continue;
-            }
-            m[ai][bi] = -2;
-            m[bi][ai] = -2;
-        }
-    }
-    penalize_nonletters(&mut m);
-    Scheme {
-        byte_to_class: default_byte_to_class(),
-        costs: m,
-        gap_open: -6,
-        gap_extend: -2,
-    }
-}
-
-/// Letters substituting with digits/other/whitespace classes are clearly wrong.
-fn penalize_nonletters(m: &mut [[i8; 32]; 32]) {
-    for &c in &[CLASS_DIGIT, CLASS_OTHER, CLASS_SPACE] {
-        m[c][..26].fill(-4);
-    }
-    for row in m.iter_mut().take(26) {
-        for &c in &[CLASS_DIGIT, CLASS_OTHER, CLASS_SPACE] {
-            row[c] = -4;
-        }
-    }
-}
-
-/// Parse a `--cost-matrix FILE`: 256 whitespace-separated class ids, then 32×32
-/// whitespace-separated i8 scores (row-major), then optional `gap_open gap_extend`.
-fn load_custom_scheme(path: &str) -> io::Result<Scheme> {
-    let text = std::fs::read_to_string(path)?;
-    let nums: Vec<i64> = text
-        .split_whitespace()
-        .map(|t| t.parse::<i64>())
-        .collect::<Result<_, _>>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?;
-    if nums.len() < 256 + 32 * 32 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cost-matrix needs 256 class ids + 32x32 scores",
-        ));
-    }
-    let mut byte_to_class = [0u8; 256];
-    for i in 0..256 {
-        byte_to_class[i] = (nums[i] as u8) & 31;
-    }
-    let mut costs = [[0i8; 32]; 32];
-    for r in 0..32 {
-        for c in 0..32 {
-            costs[r][c] = nums[256 + r * 32 + c] as i8;
-        }
-    }
-    let (gap_open, gap_extend) = if nums.len() >= 256 + 32 * 32 + 2 {
-        (nums[256 + 1024] as i8, nums[256 + 1025] as i8)
-    } else {
-        (-6, -2)
-    };
-    Ok(Scheme {
-        byte_to_class,
-        costs,
-        gap_open,
-        gap_extend,
-    })
-}
-
-fn build_scheme(cost: Cost, custom_path: Option<&str>) -> Result<Scheme, Failure> {
-    match custom_path {
-        Some(path) => load_custom_scheme(path).at(path),
-        None => Ok(match cost {
-            Cost::Edit => edit_scheme(),
-            Cost::Keyboard => keyboard_scheme(),
-            Cost::Phonetic => phonetic_scheme(),
-        }),
-    }
-}
-
-// endregion: Scoring Matrices
-
-// region: Tokenizing
-
-/// Tokenize a line into maximal runs of ASCII alphanumerics (word matching).
-fn tokenize(line: &[u8]) -> impl Iterator<Item = &[u8]> {
-    line.split(|byte: &u8| !byte.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-}
-
-/// Tokenize valid UTF-8 into maximal runs of Unicode alphanumerics.
-fn tokenize_utf8(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-}
-
-// endregion: Tokenizing
-
-// region: Queries
-
-/// One prepared query needle, carrying the state every filter needs so that no
-/// filter has to re-derive anything per line or per token.
-struct Query {
-    bytes: Vec<u8>,
-    /// Which ASCII letters occur, folded; bit 0 is `a`.
-    letters: u32,
-    /// Code points, which is what the UTF-8 kernel counts edits in.
-    chars: usize,
-}
-
-impl Query {
-    fn new(pattern: String, ignore_case: bool) -> Self {
-        let pattern = if ignore_case {
-            pattern.to_lowercase()
-        } else {
-            pattern
+impl Derivation {
+    /// The BM25 weight this derivation earns at `distance` edits.
+    ///
+    /// Every value is strictly positive, which is what makes a positive score mean "matched": a
+    /// zero weight would leave a matched line indistinguishable from an untouched one.
+    fn weight(self, distance: usize) -> f32 {
+        let base = match self {
+            Derivation::Exact => 1.0,
+            Derivation::Recorded => 0.95,
+            Derivation::Transposition => 0.9,
+            Derivation::Substitution => 0.8,
+            Derivation::Insertion => 0.7,
+            Derivation::Deletion => 0.6,
         };
-        let chars = pattern.chars().count();
-        let bytes = pattern.into_bytes();
-        let letters = letter_set(&bytes);
-        Self {
-            bytes,
-            letters,
-            chars,
-        }
-    }
-
-    /// The length the active kernel measures edits against.
-    fn length(&self, utf8: bool) -> usize {
-        if utf8 {
-            self.chars
-        } else {
-            self.bytes.len()
-        }
+        let decayed = base / (1.0 + distance as f32);
+        // `f32::MIN_POSITIVE` rather than zero, so deep balls stay above the match threshold.
+        decayed.max(f32::MIN_POSITIVE)
     }
 }
 
-/// Bitmap of the ASCII letters present, case-folded. Non-letters are ignored, so
-/// the set is a lower bound on what a match must share.
-fn letter_set(text: &[u8]) -> u32 {
-    let mut set = 0u32;
-    for &byte in text {
-        if byte.is_ascii_alphabetic() {
-            set |= 1 << (byte.to_ascii_lowercase() - b'a');
-        }
-    }
-    set
-}
-
-// endregion: Queries
-
-// region: Filtering
-
-/// Whether a token of `length` can be within `max_distance` edits of the query.
+/// The pooled dictionary of every query's variants, ready for one automaton.
 ///
-/// Levenshtein moves one character at a time, so the lengths cannot differ by more
-/// than the budget. Sound: never rejects a true match.
-#[inline]
-fn accepts_length(query: &Query, length: usize, max_distance: usize, utf8: bool) -> bool {
-    query.length(utf8).abs_diff(length) <= max_distance
+/// Queries share one automaton rather than one each, so the corpus is walked once however many
+/// `--pattern` flags are given. Which query a variant came from is recoverable from the reported
+/// `needle_index`, and is carried only once an output mode names it.
+struct Vocabulary {
+    needles: Vec<String>,
+    weights: Vec<f32>,
 }
 
-/// Whether a token sharing `letters` can be within `max_distance` edits.
-///
-/// One substitution can drop a letter from one side and add one to the other, so a
-/// symmetric difference of `d` letters needs at least `d / 2` edits. Sound, and two
-/// instructions once the query's set is precomputed.
-#[inline]
-fn accepts_letters(query: &Query, letters: u32, max_distance: usize) -> bool {
-    (query.letters ^ letters).count_ones() as usize <= 2 * max_distance
-}
+impl Vocabulary {
+    /// Build the ball of every query up to `max_distance`, drawing edits from `alphabet`.
+    ///
+    /// Empty variants are dropped rather than indexed: an empty needle matches at every position and
+    /// `Substrings::new` rejects the whole dictionary over one.
+    fn build(
+        patterns: &[String],
+        max_distance: usize,
+        alphabet: Alphabet,
+        keyboard: &Keyboard,
+        dictionary: Dictionary,
+    ) -> Self {
+        let mut best: HashMap<String, f32> = HashMap::new();
 
-/// Lines still needing the fuzzy kernel, having survived cheap rejection.
-///
-/// Only exact matches are rejected today, so every remaining line is a candidate.
-/// The partition filter belongs here: splitting the needle into `k + 1` pieces, a
-/// line holding none of them cannot be within `k` edits, because each edit can
-/// damage at most one piece. That bound covers substitutions, insertions, and
-/// deletions, but not transpositions, which touch two adjacent positions and so
-/// need `2k + 1` pieces.
-fn select_candidates(lines: &[&[u8]], matched: &[bool], candidates: &mut Vec<usize>) {
-    candidates.clear();
-    candidates.extend((0..lines.len()).filter(|&index| !matched[index]));
-}
-
-/// Both cheap bounds, in increasing cost order. Byte length stands in for code
-/// points outside UTF-8 mode, where the kernel counts bytes anyway.
-#[inline]
-fn survives(query: &Query, token: &[u8], max_distance: usize, utf8: bool) -> bool {
-    let length = if utf8 {
-        sz::count_utf8(token)
-    } else {
-        token.len()
-    };
-    accepts_length(query, length, max_distance, utf8)
-        && accepts_letters(query, letter_set(token), max_distance)
-}
-
-// endregion: Filtering
-
-// region: Matching
-
-/// Flag a line when any of its tokens is accepted.
-///
-/// Tokens arrive grouped by line, so the grouping is `runs`, one entry per line
-/// holding its owning line and the token index one past its last. Recording an
-/// owner per token instead would cost one `usize` per token across the file.
-fn mark_lines_by_run<T: Copy>(
-    row: &[T],
-    runs: &[(usize, usize)],
-    matched: &mut [bool],
-    accept: impl Fn(T) -> bool,
-) {
-    let mut start = 0;
-    for &(line, end) in runs {
-        if row[start..end].iter().any(|&value| accept(value)) {
-            matched[line] = true;
-        }
-        start = end;
-    }
-}
-
-/// Does `line` contain `needle` exactly (case-folded when `ignore_case`)?
-#[inline]
-fn exact_contains(line: &[u8], needle: &[u8], ignore_case: bool) -> bool {
-    if ignore_case {
-        sz::utf8_uncased_search(line, needle).is_some()
-    } else {
-        sz::find(line, needle).is_some()
-    }
-}
-
-/// Minimum Smith-Waterman score for a needle of `len` bytes to count as a match.
-/// `--min-similarity s` ⇒ `s · MATCH · len`; otherwise `--max-distance k` ⇒ `(len − k) · MATCH`.
-fn score_threshold(len: usize, min_similarity: Option<f64>, k: usize) -> isize {
-    match min_similarity {
-        Some(s) => (s * MATCH_I as f64 * len as f64).ceil() as isize,
-        None => (len as isize - k as isize) * MATCH_I,
-    }
-}
-
-/// Configuration resolved once from CLI args.
-struct MatchConfig {
-    ignore_case: bool,
-    word: bool,
-    cost_is_edit: bool,
-    max_distance: usize,
-    min_similarity: Option<f64>,
-    utf8: bool,
-}
-
-impl MatchConfig {
-    /// Edit budget for one query, so `--min-similarity` reaches the Levenshtein path
-    /// rather than being ignored there.
-    fn budget(&self, query: &Query) -> usize {
-        match self.min_similarity {
-            Some(similarity) => {
-                ((1.0 - similarity) * query.length(self.utf8) as f64).floor() as usize
+        for pattern in patterns {
+            // A recorded misspelling is evidence, not a guess, so it outranks a same-distance edit.
+            if dictionary == Dictionary::Known {
+                for known in misspellings::variants_of(pattern) {
+                    Vocabulary::record(&mut best, &known, Derivation::Recorded, 0);
+                }
             }
-            None => self.max_distance,
+            if pattern.is_empty() {
+                continue;
+            }
+            let mut frontier: HashSet<Vec<char>> = HashSet::new();
+            frontier.insert(pattern.chars().collect());
+            let mut seen = frontier.clone();
+            Vocabulary::record(&mut best, pattern, Derivation::Exact, 0);
+
+            for distance in 1..=max_distance {
+                let mut next: HashSet<Vec<char>> = HashSet::new();
+                for source in &frontier {
+                    for (variant, derivation) in edits_of(source, alphabet, keyboard) {
+                        if variant.is_empty() || seen.contains(&variant) {
+                            continue;
+                        }
+                        let text: String = variant.iter().collect();
+                        Vocabulary::record(&mut best, &text, derivation, distance);
+                        next.insert(variant);
+                    }
+                }
+                seen.extend(next.iter().cloned());
+                frontier = next;
+                if frontier.is_empty() {
+                    break;
+                }
+            }
         }
+
+        let mut pairs: Vec<(String, f32)> = best.into_iter().collect();
+        pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut needles = Vec::with_capacity(pairs.len());
+        let mut weights = Vec::with_capacity(pairs.len());
+        for (text, weight) in pairs {
+            needles.push(text);
+            weights.push(weight);
+        }
+        Self { needles, weights }
+    }
+
+    /// Keep the highest weight a variant earns, since the same string can be reached by several
+    /// routes and the cheapest explanation is the one a reader would give.
+    fn record(
+        best: &mut HashMap<String, f32>,
+        text: &str,
+        derivation: Derivation,
+        distance: usize,
+    ) {
+        let weight = derivation.weight(distance);
+        best.entry(text.to_string())
+            .and_modify(|held| *held = held.max(weight))
+            .or_insert(weight);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.needles.is_empty()
     }
 }
 
-/// Lowercase a token when folding, borrowing it otherwise.
-fn fold(token: &str, ignore_case: bool) -> Cow<'_, [u8]> {
-    if ignore_case {
-        Cow::Owned(token.to_lowercase().into_bytes())
-    } else {
-        Cow::Borrowed(token.as_bytes())
+/// Every string one edit away from `source`, paired with how it was reached.
+///
+/// Deletions and transpositions need no alphabet; substitutions and insertions draw from one,
+/// which is where `--cost keyboard` narrows the ball.
+fn edits_of(
+    source: &[char],
+    alphabet: Alphabet,
+    keyboard: &Keyboard,
+) -> Vec<(Vec<char>, Derivation)> {
+    let mut produced = Vec::new();
+
+    for index in 0..source.len() {
+        let mut variant = source.to_vec();
+        variant.remove(index);
+        produced.push((variant, Derivation::Deletion));
+    }
+
+    for index in 0..source.len().saturating_sub(1) {
+        let mut variant = source.to_vec();
+        variant.swap(index, index + 1);
+        produced.push((variant, Derivation::Transposition));
+    }
+
+    let replacements = |character: char| -> Vec<char> {
+        match alphabet {
+            Alphabet::Keyboard => keyboard.near(character).to_vec(),
+            Alphabet::Script => keyboard.alphabet(),
+        }
+    };
+
+    for index in 0..source.len() {
+        for replacement in replacements(source[index]) {
+            if replacement == source[index] {
+                continue;
+            }
+            let mut variant = source.to_vec();
+            variant[index] = replacement;
+            produced.push((variant, Derivation::Substitution));
+        }
+    }
+
+    for index in 0..=source.len() {
+        // An insertion at the end has no character of its own to sit beside, so it borrows the last
+        // one's neighbours; without this the tail of a needle admits no insertions at all.
+        let anchor = source[index.min(source.len().saturating_sub(1))];
+        for inserted in replacements(anchor) {
+            let mut variant = source.to_vec();
+            variant.insert(index, inserted);
+            produced.push((variant, Derivation::Insertion));
+        }
+    }
+
+    produced
+}
+
+// endregion: Vocabulary
+
+// region: Searching
+
+/// What the vocabulary is built from, resolved once from `Args`.
+struct SearchConfig {
+    max_distance: usize,
+    alphabet: Alphabet,
+    case_sensitivity: CaseSensitivity,
+    utf8: bool,
+    dictionary: Dictionary,
+    /// Lowest BM25 score a line may earn and still count as matched.
+    floor: f32,
+    /// Keep only the best `top` lines per input when set, ranked by score.
+    top: Option<usize>,
+}
+
+/// The pooled dictionary, the automaton compiled from it, and the device that walks it.
+///
+/// One engine serves the whole run: every `--pattern` contributes its variants to a single
+/// dictionary, so the corpus is walked once rather than once per query.
+struct Engine {
+    device: DeviceScope,
+    automaton: Substrings,
+    vocabulary: Vocabulary,
+    /// Applied to corpus and query alike before anything is matched.
+    folder: Option<Folder>,
+}
+
+impl Engine {
+    /// Expand every query into its ball and compile the pooled result.
+    fn build(
+        patterns: &[String],
+        config: &SearchConfig,
+        keyboard: &Keyboard,
+        fold: Option<&Fold>,
+        device: DeviceScope,
+    ) -> Result<Self, Failure> {
+        // The query is folded first, so the ball is built in the domain the corpus will be matched
+        // in rather than in the one the user typed.
+        let folder = match fold {
+            Some(fold) => Some(Folder::new(&device, fold, config.case_sensitivity)?),
+            None => None,
+        };
+        let patterns: Vec<String> = match &folder {
+            Some(folder) => {
+                let raw: Vec<&[u8]> = patterns.iter().map(|one| one.as_bytes()).collect();
+                folder
+                    .apply(&device, &raw)?
+                    .into_iter()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .collect()
+            }
+            None => patterns.to_vec(),
+        };
+        let vocabulary = Vocabulary::build(
+            &patterns,
+            config.max_distance,
+            config.alphabet,
+            keyboard,
+            config.dictionary,
+        );
+        if vocabulary.is_empty() {
+            return Err(Failure::Unresolved {
+                path: "-".to_string(),
+                subject: patterns.join(", "),
+                note: "every query was empty; pass a pattern with at least one character",
+            });
+        }
+        let automaton = Substrings::new(&device, &vocabulary.needles, config.case_sensitivity)
+            .map_err(|error| engine_failure("multi-pattern search", error))?;
+        Ok(Self {
+            device,
+            automaton,
+            vocabulary,
+            folder,
+        })
+    }
+
+    /// Score every line in one BM25 walk.
+    ///
+    /// Weights are strictly positive, so a positive score is exactly "at least one variant of at
+    /// least one query occurs in this line" - no separate counting walk is needed to decide it.
+    fn score(&self, lines: &[&[u8]]) -> Result<Vec<f32>, Failure> {
+        let mut scores = vec![0.0f32; lines.len()];
+        if lines.is_empty() {
+            return Ok(scores);
+        }
+
+        // Under a fold the corpus is rewritten once and matched in the folded domain; the caller
+        // still holds the original lines, which is what gets printed.
+        let folded = match &self.folder {
+            Some(folder) => Some(folder.apply(&self.device, lines)?),
+            None => None,
+        };
+        let borrowed: Vec<&[u8]>;
+        let lines: &[&[u8]] = match &folded {
+            Some(owned) => {
+                borrowed = owned.iter().map(Vec::as_slice).collect();
+                &borrowed
+            }
+            None => lines,
+        };
+
+        // A GPU scope reads its inputs from unified memory and refuses borrowed slices, so the
+        // corpus is copied only where it has to be.
+        let haystacks = if self.device.is_gpu() {
+            AnyBytesTape::from_sequences(lines)
+                .map_err(|error| engine_failure("corpus staging", error))?
+        } else {
+            AnyBytesTape::from_slices(lines)
+        };
+
+        // Length normalization divides by the corpus mean, and BM25 refuses a mean that is not
+        // positive rather than quietly ignoring it, so an all-empty corpus scores unnormalized.
+        let total: usize = lines.iter().map(|line| line.len()).sum();
+        let mean = total as f32 / lines.len() as f32;
+        let parameters = if mean > 0.0 {
+            Bm25Params::normalized(mean)
+        } else {
+            Bm25Params::unnormalized()
+        };
+
+        self.automaton
+            .score_bm25_into(
+                &self.device,
+                &haystacks,
+                &self.vocabulary.weights,
+                None,
+                parameters,
+                &mut scores,
+            )
+            .map_err(|error| engine_failure("BM25 scoring", error))?;
+        Ok(scores)
+    }
+
+    /// Locate the variants inside lines that already scored, for the output modes that show spans.
+    ///
+    /// Deliberately a second, much smaller walk: sizing a match buffer needs a prior count, and
+    /// paying for both over the whole corpus would triple the work to answer a question only a few
+    /// hundred lines ever ask.
+    fn locate(&self, survivors: &[&[u8]]) -> Result<Vec<SubstringsMatch>, Failure> {
+        if survivors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let haystacks = if self.device.is_gpu() {
+            AnyBytesTape::from_sequences(survivors)
+                .map_err(|error| engine_failure("corpus staging", error))?
+        } else {
+            AnyBytesTape::from_slices(survivors)
+        };
+
+        let mut counts = vec![0usize; survivors.len()];
+        let total = self
+            .automaton
+            .count_into(
+                &self.device,
+                &haystacks,
+                OverlapPolicy::LeftmostLongest,
+                &mut counts,
+            )
+            .map_err(|error| engine_failure("match counting", error))?;
+
+        let mut matches = vec![SubstringsMatch::default(); total];
+        let found = self
+            .automaton
+            .find_into(
+                &self.device,
+                &haystacks,
+                OverlapPolicy::LeftmostLongest,
+                &mut matches,
+            )
+            .map_err(|error| engine_failure("match location", error))?;
+        matches.truncate(found);
+        Ok(matches)
+    }
+}
+
+/// Whether the embedded misspelling table contributes variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dictionary {
+    Ignored,
+    Known,
+}
+
+/// A CLDR transform compiled into a rewrite, applied to corpus and query alike.
+///
+/// Folding is what lets a Han needle reach a Han corpus through pinyin, and it is a rewrite rather
+/// than a comparison so the automaton downstream never learns the transform exists.
+struct Folder {
+    automaton: Substrings,
+    targets: Vec<String>,
+}
+
+impl Folder {
+    /// Transform rules are written in lower case, so a cased fold would leave `Coronavirus` as
+    /// `Coronafirus` while `coronavirus` became `koronafirus` - the same word landing in two
+    /// domains. The fold therefore matches uncased whenever the search does, and the replacement is
+    /// inserted verbatim, which puts both spellings in one place.
+    fn new(
+        device: &DeviceScope,
+        fold: &Fold,
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<Self, Failure> {
+        let automaton = Substrings::new(device, &fold.sources, case_sensitivity)
+            .map_err(|error| engine_failure("fold", error))?;
+        Ok(Self {
+            automaton,
+            targets: fold.targets.clone(),
+        })
+    }
+
+    /// Rewrite every haystack, returning owned bytes since the product is a new tape.
+    fn apply(&self, device: &DeviceScope, lines: &[&[u8]]) -> Result<Vec<Vec<u8>>, Failure> {
+        if lines.is_empty() {
+            return Ok(Vec::new());
+        }
+        let haystacks = AnyBytesTape::from_sequences(lines)
+            .map_err(|error| engine_failure("fold staging", error))?;
+        let input_bytes: usize = lines.iter().map(|line| line.len()).sum();
+        let bound = self
+            .automaton
+            .replace_bound(&self.targets, input_bytes)
+            .map_err(|error| engine_failure("fold sizing", error))?;
+
+        let mut data = vec![0u8; bound];
+        let mut offsets = vec![0usize; lines.len() + 1];
+        self.automaton
+            .replace_into(
+                device,
+                &haystacks,
+                OverlapPolicy::LeftmostLongest,
+                &self.targets,
+                &mut data,
+                &mut offsets,
+            )
+            .map_err(|error| engine_failure("fold", error))?;
+
+        Ok((0..lines.len())
+            .map(|index| data[offsets[index]..offsets[index + 1]].to_vec())
+            .collect())
     }
 }
 
@@ -450,221 +471,95 @@ fn fold(token: &str, ignore_case: bool) -> Cow<'_, [u8]> {
 #[derive(Clone, Copy)]
 struct OutputConfig {
     line_numbers: bool,
-    count: bool,
+    scores: bool,
+    show: Show,
+    format: Format,
     /// Prefix each record with its file name, as grep does for multiple inputs.
     prefix: bool,
-    json: bool,
     summary: bool,
     terminator: Terminator,
 }
 
-/// The kernels, built once for the whole run.
-struct Engines {
-    device: DeviceScope,
-    sw: SmithWatermanScores,
-    lev: LevenshteinDistances,
-    lev_utf8: LevenshteinDistancesUtf8,
-}
-
-/// One input's lines, which of them matched, and how many word-mode kernels had to
-/// skip because `--utf8` was promised and the line was not well-formed.
+/// One input's lines and the score each earned.
 struct Searched<'a> {
     lines: Vec<&'a [u8]>,
-    matched: Vec<bool>,
-    malformed: usize,
+    scores: Vec<f32>,
 }
 
-/// Search one input's bytes; returns the lines and per-line match flags.
+impl<'a> Searched<'a> {
+    /// A line matched when it clears the floor, which defaults to any positive score - and a
+    /// positive score means "matched" only because every weight is strictly positive.
+    fn matched(&self, index: usize, floor: f32) -> bool {
+        self.scores[index] > 0.0 && self.scores[index] >= floor
+    }
+}
+
+/// Cut one input into lines and score all of them in a single walk.
 fn search_lines<'a>(
     data: &'a [u8],
-    queries: &[Query],
-    eng: &Engines,
-    cfg: &MatchConfig,
-) -> Searched<'a> {
-    let lines: Vec<&[u8]> = LineIter::new(data, Newlines::from_utf8(cfg.utf8)).collect();
-    let mut matched = vec![false; lines.len()];
-    let malformed = if cfg.utf8 && cfg.word {
-        lines
-            .iter()
-            .filter(|line| std::str::from_utf8(line).is_err())
-            .count()
-    } else {
-        0
-    };
-
-    // Reused across queries: every one of these is sized by the line count, and
-    // reallocating them per query is pure churn.
-    let mut candidates: Vec<usize> = Vec::new();
-    let mut haystacks: Vec<&[u8]> = Vec::new();
-    let mut token_runs: Vec<(usize, usize)> = Vec::new();
-    let mut tokens: Vec<Cow<'a, [u8]>> = Vec::new();
-
-    for q in queries {
-        let needle = q.bytes.as_slice();
-        let len = needle.len();
-        if len == 0 {
-            continue;
-        }
-        let thr = score_threshold(len, cfg.min_similarity, cfg.max_distance);
-        let budget = cfg.budget(q);
-
-        // Exact-first: cheap, and it covers the distance-0 case.
-        for (i, line) in lines.iter().enumerate() {
-            if !matched[i] && exact_contains(line, needle, cfg.ignore_case) {
-                matched[i] = true;
-            }
-        }
-
-        select_candidates(&lines, &matched, &mut candidates);
-        if candidates.is_empty() {
-            continue;
-        }
-
-        // One query row (the needle) against many candidate columns; `compute`
-        // returns a 1×N matrix, so `.row(0)` is the per-candidate score/distance.
-        let query = [needle];
-
-        if cfg.word {
-            // Gather every token of every candidate, remembering its line. UTF-8
-            // mode tokenizes on Unicode alphanumerics; `--utf8` promises
-            // well-formed input, so malformed lines only match via exact search.
-            // The length and letter bounds are Levenshtein properties. A score floor
-            // with class costs admits matches they would reject, so they apply only
-            // in edit mode; elsewhere every token reaches the kernel as before.
-            let filtering = cfg.cost_is_edit;
-            token_runs.clear();
-            tokens.clear();
-            for &index in &candidates {
-                if cfg.utf8 {
-                    if let Ok(text) = std::str::from_utf8(lines[index]) {
-                        tokens.extend(
-                            tokenize_utf8(text)
-                                .map(|token| fold(token, cfg.ignore_case))
-                                .filter(|token| !filtering || survives(q, token, budget, true)),
-                        );
-                    }
-                } else {
-                    tokens.extend(
-                        tokenize(lines[index])
-                            .filter(|token| !filtering || survives(q, token, budget, false))
-                            .map(Cow::Borrowed),
-                    );
-                }
-                token_runs.push((index, tokens.len()));
-            }
-            if tokens.is_empty() {
-                continue;
-            }
-            let views: Vec<&[u8]> = tokens.iter().map(|token| token.as_ref()).collect();
-            if !cfg.cost_is_edit {
-                let scores = eng
-                    .sw
-                    .compute(&eng.device, &query[..], &views)
-                    .expect("smith-waterman compute failed");
-                mark_lines_by_run(scores.row(0), &token_runs, &mut matched, |score| {
-                    score >= thr
-                });
-            } else if cfg.utf8 {
-                // Code-point-level distances; both sides validated above.
-                let needle = std::str::from_utf8(needle).expect("patterns are UTF-8 arguments");
-                let views: Vec<&str> = views
-                    .iter()
-                    .map(|t| std::str::from_utf8(t).expect("tokens cut from validated lines"))
-                    .collect();
-                let dists = eng
-                    .lev_utf8
-                    .compute(&eng.device, &[needle][..], &views[..])
-                    .expect("utf8 levenshtein compute failed");
-                mark_lines_by_run(dists.row(0), &token_runs, &mut matched, |distance| {
-                    distance <= budget
-                });
-            } else {
-                let dists = eng
-                    .lev
-                    .compute(&eng.device, &query[..], &views)
-                    .expect("levenshtein compute failed");
-                mark_lines_by_run(dists.row(0), &token_runs, &mut matched, |distance| {
-                    distance <= budget
-                });
-            }
-        } else {
-            // Substring: best local alignment of the needle within each line.
-            haystacks.clear();
-            haystacks.extend(candidates.iter().map(|&index| lines[index]));
-            // One line per result, so every run holds a single entry.
-            token_runs.clear();
-            token_runs.extend(
-                candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(position, &line)| (line, position + 1)),
-            );
-            let scores = eng
-                .sw
-                .compute(&eng.device, &query[..], &haystacks)
-                .expect("smith-waterman compute failed");
-            mark_lines_by_run(scores.row(0), &token_runs, &mut matched, |score| {
-                score >= thr
-            });
-        }
-    }
-
-    Searched {
-        lines,
-        matched,
-        malformed,
-    }
+    engine: &Engine,
+    config: &SearchConfig,
+) -> Result<Searched<'a>, Failure> {
+    let lines: Vec<&[u8]> = LineIter::new(data, Newlines::from_utf8(config.utf8)).collect();
+    let scores = engine.score(&lines)?;
+    Ok(Searched { lines, scores })
 }
 
-// endregion: Matching
+// endregion: Searching
 
 // region: CLI
-
-/// What the needle is matched against
-#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
-enum Match {
-    /// Align the needle against the whole line, scored by Smith-Waterman.
-    Line,
-    /// Tokenize first and measure Levenshtein against each token, so `--max-distance`
-    /// is an edit budget rather than a score floor.
-    Word,
-}
 
 /// One column a record can carry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Field {
     /// The 1-based line number
     LineNumbers,
+    /// The BM25 score the line earned
+    Scores,
 }
 
 /// Which record kind to emit
-#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, ValueEnum)]
 enum Show {
     /// Every matching line.
+    #[default]
     Lines,
+    /// Only the matched parts of selected lines.
+    Matches,
     /// One count per input.
     Count,
+    /// The path of every input that matched.
+    Files,
+    /// The path of every input that did not match.
+    FilesWithout,
 }
 
 /// How records are rendered
-#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, ValueEnum)]
 enum Format {
     /// The matching line, with any requested fields ahead of it.
+    #[default]
     Text,
     /// JSON Lines, one object per match.
     Json,
 }
 
-/// Which scoring model scores a substitution
+/// Which characters an edit may substitute or insert
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Cost {
-    /// Every substitution costs the same, which is plain edit distance.
+    /// Any character of the layout, which is plain edit distance.
     Edit,
-    /// Adjacent keys cost less, for fat-finger typos: `xolor` reaches `color`.
+    /// Only physically adjacent keys, for fat-finger typos: `xolor` reaches `color`.
     Keyboard,
-    /// Sounds-alike, seeded by voiced and unvoiced cognates and Editex letter groups:
-    /// `fonetik` reaches `phonetic`.
-    Phonetic,
+}
+
+impl Cost {
+    fn alphabet(self) -> Alphabet {
+        match self {
+            Cost::Edit => Alphabet::Script,
+            Cost::Keyboard => Alphabet::Keyboard,
+        }
+    }
 }
 
 /// Where the kernels run
@@ -697,21 +592,29 @@ struct Args {
     #[arg(long)]
     max_distance: Option<usize>,
 
-    /// Minimum normalized similarity; 1.0 is exact
-    #[arg(long, conflicts_with = "max_distance", value_parser = parse_similarity)]
-    min_similarity: Option<f64>,
-
-    /// Which scoring model scores a substitution
-    #[arg(long, value_enum, conflicts_with = "cost_matrix")]
+    /// Which characters an edit may substitute or insert
+    #[arg(long, value_enum)]
     cost: Option<Cost>,
 
-    /// Load a scoring matrix from FILE instead of a built-in model
-    #[arg(long)]
-    cost_matrix: Option<String>,
+    /// Keyboard layout the edits follow; detected from the pattern's script by default
+    #[arg(long, value_name = "LAYOUT")]
+    layout: Option<String>,
 
-    /// What the needle is matched against
-    #[arg(long = "match", value_enum, value_name = "MATCH")]
-    match_against: Option<Match>,
+    /// Fold corpus and query through a CLDR transform first, such as Han-Latin
+    #[arg(long, value_name = "TRANSFORM")]
+    fold: Option<String>,
+
+    /// Also match the recorded misspellings of the query
+    #[arg(long)]
+    dictionary: bool,
+
+    /// Keep only the N best-scoring lines per input, ranked by BM25
+    #[arg(long, value_name = "N")]
+    top_k: Option<usize>,
+
+    /// Lowest BM25 score a line may earn and still be reported
+    #[arg(long, value_name = "SCORE")]
+    min_score: Option<f32>,
 
     /// Where the kernels run
     #[arg(long, value_enum)]
@@ -761,18 +664,6 @@ struct Args {
     /// Suppress all output; exit 0 if any match was found, 1 otherwise
     #[arg(long, conflicts_with_all = ["show", "format", "null", "fields", "summary"], help_heading = "Output Formats")]
     quiet: bool,
-}
-
-/// A similarity outside 0..=1 is silently useless: `2.0` matches nothing, `-1.0` and
-/// `nan` match everything.
-fn parse_similarity(text: &str) -> Result<f64, String> {
-    let value: f64 = text
-        .parse()
-        .map_err(|_| format!("`{}` is not a number", text))?;
-    if !(0.0..=1.0).contains(&value) {
-        return Err(format!("`{}` is outside 0.0..=1.0", text));
-    }
-    Ok(value)
 }
 
 /// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
@@ -842,8 +733,25 @@ fn engine_failure(engine: &str, error: impl std::fmt::Debug) -> Failure {
 fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
+    let (patterns, inputs) =
+        resolve_positionals(args.pattern.as_deref(), &args.extra, &args.inputs)
+            .map_err(|message| reject(&message))?;
+
+    // The layout decides which characters count as adjacent, so it is resolved before the ball is
+    // built and named explicitly when detection would have to guess.
+    let layout = match args.layout.clone() {
+        Some(named) => named,
+        None => Keyboard::detect(&patterns.join("")),
+    };
+    let keyboard = Keyboard::load(&layout);
     let cost = args.cost.unwrap_or(Cost::Edit);
-    let cost_is_edit = args.cost_matrix.is_none() && cost == Cost::Edit;
+    if keyboard.is_empty() {
+        return Err(Failure::Unresolved {
+            path: layout,
+            subject: "keyboard layout".to_string(),
+            note: "pass --layout with one of the embedded names, such as us, de, fr or ru",
+        });
+    }
 
     let device = build_device(
         args.device.unwrap_or(Device::Auto),
@@ -851,50 +759,49 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         args.gpu_id,
     )
     .map_err(|message| reject(&message))?;
-    let scheme = build_scheme(cost, args.cost_matrix.as_deref())?;
-    let sw = SmithWatermanScores::new(
-        &device,
-        &scheme.byte_to_class,
-        &scheme.costs,
-        scheme.gap_open,
-        scheme.gap_extend,
-    )
-    .map_err(|error| engine_failure("Smith-Waterman", error))?;
 
-    // Standard unit-cost Levenshtein for word edit mode, byte- and code-point-level.
-    let lev = LevenshteinDistances::new(&device, 0, 1, 1, 1)
-        .map_err(|error| engine_failure("Levenshtein", error))?;
-    let lev_utf8 = LevenshteinDistancesUtf8::new(&device, 0, 1, 1, 1)
-        .map_err(|error| engine_failure("UTF-8 Levenshtein", error))?;
-
-    let engines = Engines {
-        device,
-        sw,
-        lev,
-        lev_utf8,
+    // A fold rewrites both sides, so a match has no span in the original bytes to report.
+    let fold = match args.fold.as_deref() {
+        Some(name) => {
+            let fold = Fold::load(name);
+            if fold.is_empty() {
+                return Err(Failure::Unresolved {
+                    path: name.to_string(),
+                    subject: "CLDR transform".to_string(),
+                    note:
+                        "pass --fold with an embedded transform, such as Han-Latin or Latin-ASCII",
+                });
+            }
+            Some(fold)
+        }
+        None => None,
     };
 
-    let (patterns, inputs) =
-        resolve_positionals(args.pattern.as_deref(), &args.extra, &args.inputs)
-            .map_err(|message| reject(&message))?;
-    let queries: Vec<Query> = patterns
-        .into_iter()
-        .map(|pattern| Query::new(pattern, args.ignore_case))
-        .collect();
-
-    let cfg = MatchConfig {
-        ignore_case: args.ignore_case,
-        word: args.match_against == Some(Match::Word),
-        cost_is_edit,
+    let config = SearchConfig {
         max_distance: args.max_distance.unwrap_or(1),
-        min_similarity: args.min_similarity,
+        alphabet: cost.alphabet(),
+        case_sensitivity: if args.ignore_case {
+            CaseSensitivity::Uncased
+        } else {
+            CaseSensitivity::Cased
+        },
         utf8: args.utf8 || args.ignore_case,
+        dictionary: if args.dictionary {
+            Dictionary::Known
+        } else {
+            Dictionary::Ignored
+        },
+        floor: args.min_score.unwrap_or(0.0),
+        top: args.top_k,
     };
+    let engine = Engine::build(&patterns, &config, &keyboard, fold.as_ref(), device)?;
+
     let output_config = OutputConfig {
         line_numbers: args.fields.contains(&Field::LineNumbers),
-        count: args.show == Some(Show::Count),
+        scores: args.fields.contains(&Field::Scores) || args.top_k.is_some(),
+        show: args.show.unwrap_or_default(),
+        format: args.format.unwrap_or_default(),
         prefix: inputs.len() > 1,
-        json: args.format == Some(Format::Json),
         summary: args.summary,
         terminator: Terminator::from_null(args.null),
     };
@@ -909,16 +816,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     let opened = inputs
         .iter()
         .map(|path| (path.as_str(), get_input(Some(path))));
-    let outcome = search_inputs(
-        writer,
-        notes,
-        opened,
-        &queries,
-        &engines,
-        &cfg,
-        &output_config,
-    )
-    .at("-")?;
+    let outcome = search_inputs(writer, notes, opened, &engine, &config, &output_config)?;
 
     output.flush().at("-")?;
     if outcome.readable == 0 {
@@ -933,7 +831,6 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
 struct Outcome {
     total: usize,
     readable: usize,
-    malformed: usize,
 }
 
 /// The queries and the input paths, once the positional has been assigned to whichever
@@ -964,11 +861,10 @@ fn search_inputs<'a>(
     output: &mut dyn Write,
     notes: &mut dyn Write,
     inputs: impl IntoIterator<Item = (&'a str, io::Result<InputSource>)>,
-    queries: &[Query],
-    engines: &Engines,
-    cfg: &MatchConfig,
+    engine: &Engine,
+    config: &SearchConfig,
     out_cfg: &OutputConfig,
-) -> io::Result<Outcome> {
+) -> Result<Outcome, Failure> {
     let mut outcome = Outcome::default();
     let mut seen = 0;
     for (path, input) in inputs {
@@ -981,27 +877,66 @@ fn search_inputs<'a>(
             }
         };
         outcome.readable += 1;
-        let found = search_lines(input.as_bytes(), queries, engines, cfg);
-        outcome.malformed += found.malformed;
+        let found = search_lines(input.as_bytes(), engine, config)?;
 
-        let mut count = 0usize;
-        for (index, line) in found.lines.iter().enumerate() {
-            if !found.matched[index] {
-                continue;
-            }
-            count += 1;
-            if !out_cfg.count {
-                write_match(output, out_cfg, path, index + 1, line)?;
-            }
+        // The scored pass already said which lines matched, so the survivors are gathered once and
+        // every output mode reads from them rather than re-testing.
+        let mut survivors: Vec<(usize, &[u8], f32)> = found
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| found.matched(*index, config.floor))
+            .map(|(index, line)| (index, *line, found.scores[index]))
+            .collect();
+
+        // Ranking is the only place order stops being the file's own, so it is applied once here
+        // and every mode below reads the same list.
+        if let Some(top) = config.top {
+            survivors.sort_by(|left, right| {
+                right
+                    .2
+                    .partial_cmp(&left.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(left.0.cmp(&right.0))
+            });
+            survivors.truncate(top);
         }
-        if out_cfg.count {
-            write_count(output, out_cfg, path, count)?;
+        let count = survivors.len();
+
+        match out_cfg.show {
+            Show::Count => write_count(output, out_cfg, path, count).at(path)?,
+            Show::Files => {
+                if count > 0 {
+                    write_path(output, out_cfg, path).at(path)?;
+                }
+            }
+            Show::FilesWithout => {
+                if count == 0 {
+                    write_path(output, out_cfg, path).at(path)?;
+                }
+            }
+            Show::Lines => {
+                for (index, line, score) in &survivors {
+                    write_match(output, out_cfg, path, index + 1, line, *score).at(path)?;
+                }
+            }
+            // Spans cost a second walk, so they are located only here, and only over the handful of
+            // lines that already scored rather than over the whole corpus.
+            Show::Matches => {
+                let lines: Vec<&[u8]> = survivors.iter().map(|(_, line, _)| *line).collect();
+                for located in engine.locate(&lines)? {
+                    let (index, line, score) = survivors[located.haystack_index];
+                    let span = &line[located.byte_offset
+                        ..located.byte_offset.saturating_add(located.byte_length)];
+                    write_match(output, out_cfg, path, index + 1, span, score).at(path)?;
+                }
+            }
         }
         outcome.total += count;
     }
 
     if out_cfg.summary {
-        write_summary(output, notes, out_cfg, &outcome, seen)?;
+        write_summary(output, notes, out_cfg, &outcome, seen).at("-")?;
     }
     Ok(outcome)
 }
@@ -1015,17 +950,17 @@ fn write_summary(
     outcome: &Outcome,
     inputs: usize,
 ) -> io::Result<()> {
-    if cfg.json {
+    if cfg.format == Format::Json {
         return writeln!(
             output,
-            r#"{{"type":"summary","data":{{"matched_lines":{},"readable_inputs":{},"total_inputs":{},"malformed_lines":{}}}}}"#,
-            outcome.total, outcome.readable, inputs, outcome.malformed
+            r#"{{"type":"summary","data":{{"matched_lines":{},"readable_inputs":{},"total_inputs":{}}}}}"#,
+            outcome.total, outcome.readable, inputs
         );
     }
     writeln!(
         notes,
-        "matched {} lines in {} of {} inputs, skipping {} malformed lines",
-        outcome.total, outcome.readable, inputs, outcome.malformed
+        "matched {} lines in {} of {} inputs",
+        outcome.total, outcome.readable, inputs
     )
 }
 
@@ -1036,7 +971,7 @@ fn write_count(
     path: &str,
     count: usize,
 ) -> io::Result<()> {
-    if cfg.json {
+    if cfg.format == Format::Json {
         output.write_all(br#"{"type":"count","data":{"path":"#)?;
         json_text_field_to(output, path.as_bytes())?;
         write!(output, r#","count":{}}}}}"#, count)?;
@@ -1049,20 +984,37 @@ fn write_count(
     output.write_all(&[cfg.terminator.as_byte()])
 }
 
+/// One path record, for the two modes that report inputs rather than lines.
+fn write_path(output: &mut dyn Write, cfg: &OutputConfig, path: &str) -> io::Result<()> {
+    if cfg.format == Format::Json {
+        output.write_all(br#"{"type":"path","data":{"path":"#)?;
+        json_text_field_to(output, path.as_bytes())?;
+        output.write_all(b"}}")?;
+        return output.write_all(b"\n");
+    }
+    output.write_all(path.as_bytes())?;
+    output.write_all(&[cfg.terminator.as_byte()])
+}
+
 fn write_match(
     output: &mut dyn Write,
     cfg: &OutputConfig,
     path: &str,
     line_no: usize,
     line: &[u8],
+    score: f32,
 ) -> io::Result<()> {
-    if cfg.json {
+    if cfg.format == Format::Json {
         // Ripgrep's schema, minus `submatches`: fuzzy matching has no exact span.
         output.write_all(br#"{"type":"match","data":{"path":"#)?;
         json_text_field_to(output, path.as_bytes())?;
         output.write_all(br#","lines":"#)?;
         json_text_field_to(output, line)?;
-        write!(output, r#","line_number":{},"submatches":[]}}}}"#, line_no)?;
+        write!(output, r#","line_number":{}"#, line_no)?;
+        if cfg.scores {
+            write!(output, r#","score":{:.4}"#, score)?;
+        }
+        output.write_all(br#","submatches":[]}}"#)?;
         return output.write_all(b"\n");
     }
     if cfg.prefix {
@@ -1070,6 +1022,9 @@ fn write_match(
     }
     if cfg.line_numbers {
         write!(output, "{}:", line_no)?;
+    }
+    if cfg.scores {
+        write!(output, "{:.4}:", score)?;
     }
     output.write_all(line)?;
     output.write_all(&[cfg.terminator.as_byte()])
@@ -1104,10 +1059,12 @@ mod tests {
             [
                 "pattern",
                 "max-distance",
-                "min-similarity",
                 "cost",
-                "cost-matrix",
-                "match",
+                "layout",
+                "fold",
+                "dictionary",
+                "top-k",
+                "min-score",
                 "device",
                 "threads",
                 "gpu-id",
@@ -1136,7 +1093,6 @@ mod tests {
         let (patterns, inputs) = positionals(&["sz-fuzzy-find", "--pattern", "abc", "file.txt"]);
         assert_eq!(patterns, ["abc"]);
         assert_eq!(inputs, ["file.txt"]);
-
         // With no positional at all, stdin is still the input.
         assert_eq!(positionals(&["sz-fuzzy-find", "--pattern", "abc"]).1, ["-"]);
     }
@@ -1144,21 +1100,10 @@ mod tests {
     #[test]
     fn rejects_settings_that_used_to_be_ignored() {
         for argv in [
-            ["sz-fuzzy-find", "--min-similarity", "2.0", "a"].as_slice(),
-            ["sz-fuzzy-find", "--min-similarity", "nan", "a"].as_slice(),
             ["sz-fuzzy-find", "--device", "banana", "a"].as_slice(),
             ["sz-fuzzy-find", "--device", "GPU", "a"].as_slice(),
             ["sz-fuzzy-find", "--gpu-id", "1", "a"].as_slice(),
-            ["sz-fuzzy-find", "--cost", "edit", "--cost-matrix", "f", "a"].as_slice(),
-            [
-                "sz-fuzzy-find",
-                "--min-similarity",
-                "0.5",
-                "--max-distance",
-                "1",
-                "a",
-            ]
-            .as_slice(),
+            ["sz-fuzzy-find", "--cost", "phonetic", "a"].as_slice(),
         ] {
             assert!(
                 Args::try_parse_from(argv).is_err(),
@@ -1194,7 +1139,7 @@ mod tests {
                 .map(|names| names[0].to_string())
         };
         assert_eq!(placeholder("pattern_flag").as_deref(), Some("PATTERN"));
-        assert_eq!(placeholder("match_against").as_deref(), Some("MATCH"));
+        assert_eq!(placeholder("layout").as_deref(), Some("LAYOUT"));
     }
 
     #[test]
@@ -1203,13 +1148,13 @@ mod tests {
         let outcome = Outcome {
             total: 9,
             readable: 1,
-            malformed: 0,
         };
         let mut cfg = OutputConfig {
             line_numbers: false,
-            count: false,
+            scores: false,
+            show: Show::Lines,
+            format: Format::Json,
             prefix: false,
-            json: true,
             summary: true,
             terminator: Terminator::Newline,
         };
@@ -1225,7 +1170,7 @@ mod tests {
         assert!(notes.is_empty(), "a record belongs to the stream it closes");
 
         // In text it is prose about the run, so it leaves the record stream alone.
-        cfg.json = false;
+        cfg.format = Format::Text;
         let (mut written, mut notes) = (Vec::new(), Vec::new());
         write_summary(&mut written, &mut notes, &cfg, &outcome, 1).unwrap();
         assert!(written.is_empty(), "prose is not a match");
@@ -1234,22 +1179,218 @@ mod tests {
             .starts_with("matched 9 lines"));
     }
 
+    // region: Vocabulary
+
+    fn us() -> Keyboard {
+        Keyboard::load("us")
+    }
+
+    fn ball(pattern: &str, max_distance: usize, alphabet: Alphabet) -> Vocabulary {
+        Vocabulary::build(
+            &[pattern.to_string()],
+            max_distance,
+            alphabet,
+            &us(),
+            Dictionary::Ignored,
+        )
+    }
+
+    #[test]
+    fn embeds_a_keyboard_for_every_script_it_claims() {
+        for layout in ["us", "de", "fr", "ru"] {
+            assert!(
+                !Keyboard::load(layout).is_empty(),
+                "{layout} must be in the embedded table"
+            );
+        }
+        assert!(Keyboard::load("no-such-layout").is_empty());
+    }
+
+    #[test]
+    fn never_admits_an_empty_needle() {
+        // `Substrings::new` rejects an entire dictionary over one empty needle, and deleting the
+        // only character of a one-character query produces exactly that.
+        for pattern in ["a", "ab", "color"] {
+            let vocabulary = ball(pattern, 2, Alphabet::Keyboard);
+            assert!(
+                vocabulary.needles.iter().all(|needle| !needle.is_empty()),
+                "{pattern} produced an empty needle"
+            );
+        }
+    }
+
+    #[test]
+    fn weights_every_variant_strictly_positive() {
+        // A positive score is the match test, so a zero weight would make a matched line
+        // indistinguishable from an untouched one.
+        let vocabulary = ball("color", 2, Alphabet::Keyboard);
+        assert!(vocabulary.weights.iter().all(|weight| *weight > 0.0));
+        assert_eq!(vocabulary.needles.len(), vocabulary.weights.len());
+    }
+
+    #[test]
+    fn scores_the_query_itself_above_its_variants() {
+        let vocabulary = ball("color", 1, Alphabet::Keyboard);
+        let exact = vocabulary
+            .needles
+            .iter()
+            .position(|needle| needle == "color")
+            .expect("the query is its own first variant");
+        let best_variant = vocabulary
+            .weights
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != exact)
+            .map(|(_, weight)| *weight)
+            .fold(0.0f32, f32::max);
+        assert!(vocabulary.weights[exact] > best_variant);
+    }
+
+    #[test]
+    fn narrows_the_ball_to_adjacent_keys() {
+        // The whole reason `--cost keyboard` exists: it is what keeps a two-edit ball affordable.
+        let script = ball("washington", 2, Alphabet::Script).needles.len();
+        let keyboard = ball("washington", 2, Alphabet::Keyboard).needles.len();
+        assert!(
+            keyboard * 5 < script,
+            "keyboard ball {keyboard} should be far under the script ball {script}"
+        );
+    }
+
+    #[test]
+    fn pools_every_query_into_one_dictionary() {
+        // Several queries share one automaton, and `origins` is what maps a variant back.
+        let patterns = vec!["color".to_string(), "flavour".to_string()];
+        let pooled =
+            Vocabulary::build(&patterns, 1, Alphabet::Keyboard, &us(), Dictionary::Ignored);
+        assert!(pooled.needles.iter().any(|needle| needle == "color"));
+        assert!(pooled.needles.iter().any(|needle| needle == "flavour"));
+
+        // Pooling is what makes one walk enough, so the dictionary must be the union rather than
+        // whichever query happened to be built last.
+        let alone = |pattern: &str| {
+            Vocabulary::build(
+                &[pattern.to_string()],
+                1,
+                Alphabet::Keyboard,
+                &us(),
+                Dictionary::Ignored,
+            )
+            .needles
+            .len()
+        };
+        assert!(pooled.needles.len() > alone("color").max(alone("flavour")));
+    }
+
+    #[test]
+    fn detects_a_layout_from_the_pattern_script() {
+        assert_eq!(Keyboard::detect("washington"), "us");
+        // A Cyrillic needle must not land on a Latin keyboard, where it has no neighbours at all.
+        let detected = Keyboard::detect("правительство");
+        assert!(
+            Keyboard::load(&detected).near('п').len() > 0,
+            "detected {detected} carries no Cyrillic"
+        );
+    }
+
+    // endregion: Vocabulary
+
+    // region: Searching
+
+    fn cpu() -> DeviceScope {
+        DeviceScope::cpu_cores(1).expect("a CPU scope is always available")
+    }
+
+    fn config(max_distance: usize) -> SearchConfig {
+        SearchConfig {
+            max_distance,
+            alphabet: Alphabet::Script,
+            case_sensitivity: CaseSensitivity::Cased,
+            utf8: false,
+            dictionary: Dictionary::Ignored,
+            floor: 0.0,
+            top: None,
+        }
+    }
+
+    fn matching_lines(patterns: &[&str], data: &[u8], config: &SearchConfig) -> Vec<String> {
+        let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+        let engine = Engine::build(&patterns, config, &us(), None, cpu()).expect("engine builds");
+        let found = search_lines(data, &engine, config).expect("search runs");
+        found
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| found.matched(*index, 0.0))
+            .map(|(_, line)| String::from_utf8_lossy(line).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn finds_a_one_edit_typo() {
+        // The defect the matrix era could not fix: a real one-edit miss under whole-line scoring.
+        let data = b"Washington\nWashigton\nunrelated\n";
+        let matched = matching_lines(&["Washington"], data, &config(1));
+        assert_eq!(matched, ["Washington", "Washigton"]);
+    }
+
+    #[test]
+    fn keeps_digits_apart() {
+        // All ten digits used to share one scoring class, so `--max-distance 0 2024` returned 1999.
+        let data = b"in 2024\nin 1999\n";
+        let matched = matching_lines(&["2024"], data, &config(0));
+        assert_eq!(matched, ["in 2024"]);
+    }
+
+    #[test]
+    fn matches_any_of_several_queries_in_one_walk() {
+        let data = b"the color red\nthe flavour blue\nneither\n";
+        let matched = matching_lines(&["color", "flavour"], data, &config(0));
+        assert_eq!(matched, ["the color red", "the flavour blue"]);
+    }
+
+    #[test]
+    fn folds_case_when_asked() {
+        let data = b"COLOR\ncolor\n";
+        let mut folded = config(0);
+        folded.case_sensitivity = CaseSensitivity::Uncased;
+        folded.utf8 = true;
+        assert_eq!(matching_lines(&["color"], data, &folded).len(), 2);
+        assert_eq!(matching_lines(&["color"], data, &config(0)), ["color"]);
+    }
+
+    #[test]
+    fn locates_spans_inside_the_lines_that_scored() {
+        let data = b"the color red\nnothing here\n";
+        let patterns = vec!["color".to_string()];
+        let config = config(0);
+        let engine = Engine::build(&patterns, &config, &us(), None, cpu()).unwrap();
+        let found = search_lines(data, &engine, &config).unwrap();
+        let survivors: Vec<&[u8]> = found
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| found.matched(*index, 0.0))
+            .map(|(_, line)| *line)
+            .collect();
+        let located = engine.locate(&survivors).unwrap();
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].haystack_index, 0);
+        assert_eq!(located[0].byte_offset, 4);
+        assert_eq!(located[0].byte_length, 5);
+    }
+
     #[test]
     fn keeps_matches_when_one_input_is_missing() {
-        let engines = engines_for(edit_scheme());
-        let cfg = MatchConfig {
-            ignore_case: false,
-            word: false,
-            cost_is_edit: true,
-            max_distance: 1,
-            min_similarity: None,
-            utf8: false,
-        };
+        let patterns = vec!["color".to_string()];
+        let config = config(1);
+        let engine = Engine::build(&patterns, &config, &us(), None, cpu()).unwrap();
         let out_cfg = OutputConfig {
             line_numbers: false,
-            count: false,
+            scores: false,
+            show: Show::Lines,
+            format: Format::Text,
             prefix: false,
-            json: false,
             summary: false,
             terminator: Terminator::Newline,
         };
@@ -1257,16 +1398,13 @@ mod tests {
             ("missing.txt", Err(io::Error::from(io::ErrorKind::NotFound))),
             ("present.txt", Ok(InputSource::Buffer(b"colour\n".to_vec()))),
         ];
-        let queries = vec![Query::new("color".to_string(), false)];
-
         let mut written = Vec::new();
         let outcome = search_inputs(
             &mut written,
             &mut io::sink(),
             inputs,
-            &queries,
-            &engines,
-            &cfg,
+            &engine,
+            &config,
             &out_cfg,
         )
         .unwrap();
@@ -1275,180 +1413,7 @@ mod tests {
         assert_eq!(written, b"colour\n");
     }
 
-    #[test]
-    fn folds_case_on_the_levenshtein_path() {
-        // `--match word --cost edit --ignore-case` used to compare unfolded tokens.
-        let engines = engines_for(edit_scheme());
-        let cfg = |ignore_case: bool| MatchConfig {
-            ignore_case,
-            word: true,
-            cost_is_edit: true,
-            max_distance: 0,
-            min_similarity: None,
-            utf8: true,
-        };
-        let data = "COLOUR\n".as_bytes();
-        let folded = vec![Query::new("colour".to_string(), true)];
-        let literal = vec![Query::new("colour".to_string(), false)];
-        assert!(search_lines(data, &folded, &engines, &cfg(true)).matched[0]);
-        assert!(!search_lines(data, &literal, &engines, &cfg(false)).matched[0]);
-    }
-
-    #[test]
-    fn counts_lines_skipped_as_malformed_under_utf8() {
-        let engines = engines_for(edit_scheme());
-        let cfg = MatchConfig {
-            ignore_case: false,
-            word: true,
-            cost_is_edit: true,
-            max_distance: 1,
-            min_similarity: None,
-            utf8: true,
-        };
-        let data = b"colour\n\xff\xfe bad\n";
-        let queries = vec![Query::new("color".to_string(), false)];
-        assert_eq!(search_lines(data, &queries, &engines, &cfg).malformed, 1);
-    }
-
-    #[test]
-    fn spends_min_similarity_as_an_edit_budget() {
-        // In word+edit mode `--min-similarity` used to be dropped entirely.
-        let cfg = MatchConfig {
-            ignore_case: false,
-            word: true,
-            cost_is_edit: true,
-            max_distance: 9,
-            min_similarity: Some(0.8),
-            utf8: false,
-        };
-        let query = Query::new("colour".to_string(), false);
-        assert_eq!(cfg.budget(&query), 1);
-    }
-
-    fn engines_for(scheme: Scheme) -> Engines {
-        let device = cpu();
-        let sw = SmithWatermanScores::new(
-            &device,
-            &scheme.byte_to_class,
-            &scheme.costs,
-            scheme.gap_open,
-            scheme.gap_extend,
-        )
-        .unwrap();
-        let lev = LevenshteinDistances::new(&device, 0, 1, 1, 1).unwrap();
-        let lev_utf8 = LevenshteinDistancesUtf8::new(&device, 0, 1, 1, 1).unwrap();
-        Engines {
-            device,
-            sw,
-            lev,
-            lev_utf8,
-        }
-    }
-
-    #[test]
-    fn scores_keyboard_neighbors_above_distant_keys() {
-        let s = keyboard_scheme();
-        let near = s.costs[letter(b't')][letter(b'y')]; // adjacent
-        let far = s.costs[letter(b't')][letter(b'p')]; // far
-        assert!(near > far, "adjacent {} should beat distant {}", near, far);
-        assert_eq!(s.costs[letter(b't')][letter(b't')], MATCH);
-    }
-
-    #[test]
-    fn scores_phonetic_cognates_above_unrelated() {
-        let s = phonetic_scheme();
-        let cognate = s.costs[letter(b'b')][letter(b'p')]; // voiced/unvoiced pair
-        let unrelated = s.costs[letter(b'b')][letter(b'z')];
-        assert!(cognate > unrelated);
-        assert_eq!(s.costs[letter(b's')][letter(b'z')], 4);
-    }
-
-    #[test]
-    fn folds_case_in_byte_to_class_map() {
-        let map = default_byte_to_class();
-        assert_eq!(map[b'A' as usize], map[b'a' as usize]);
-        assert_eq!(map[b'Z' as usize], map[b'z' as usize]);
-        assert_eq!(map[b'5' as usize] as usize, CLASS_DIGIT);
-        assert_eq!(map[b' ' as usize] as usize, CLASS_SPACE);
-    }
-
-    #[test]
-    fn tokenizes_on_punctuation() {
-        let tokens: Vec<&[u8]> = tokenize(b"the colour, red!").collect();
-        assert_eq!(tokens, vec![b"the".as_slice(), b"colour", b"red"]);
-    }
-
-    #[test]
-    fn tokenizes_unicode_words_whole() {
-        let tokens: Vec<&str> = tokenize_utf8("café, naïve! 42").collect();
-        assert_eq!(tokens, vec!["café", "naïve", "42"]);
-        // The byte tokenizer stops at the first non-ASCII byte instead.
-        let ascii: Vec<&[u8]> = tokenize("café".as_bytes()).collect();
-        assert_eq!(ascii, vec![b"caf".as_slice()]);
-    }
-
-    #[test]
-    fn computes_score_threshold_from_length_and_ratio() {
-        assert_eq!(score_threshold(5, None, 1), 32); // (5-1)*8
-        assert_eq!(score_threshold(5, Some(0.8), 1), 32); // ceil(0.8*8*5)
-    }
-
-    fn cpu() -> DeviceScope {
-        DeviceScope::cpu_cores(1).expect("cpu device")
-    }
-
-    #[test]
-    fn scores_fuzzy_substring_via_smith_waterman() {
-        let s = edit_scheme();
-        let device = cpu();
-        let sw = SmithWatermanScores::new(
-            &device,
-            &s.byte_to_class,
-            &s.costs,
-            s.gap_open,
-            s.gap_extend,
-        )
-        .unwrap();
-        let query = vec![b"color".as_slice()];
-        let lines = vec![b"the colour red".as_slice(), b"nothing here".as_slice()];
-        let scores = sw.compute(&device, &query, &lines).unwrap();
-        // "colour" is within ~1 edit of "color"; threshold for k=1 is (5-1)*8 = 32.
-        assert!(
-            scores[(0, 0)] >= 32,
-            "colour score {} should pass",
-            scores[(0, 0)]
-        );
-        assert!(
-            scores[(0, 1)] < 32,
-            "unrelated score {} should fail",
-            scores[(0, 1)]
-        );
-    }
-
-    #[test]
-    fn measures_word_levenshtein_distance() {
-        let device = cpu();
-        let lev = LevenshteinDistances::new(&device, 0, 1, 1, 1).unwrap();
-        let query = vec![b"colour".as_slice()];
-        let tokens = vec![b"color".as_slice(), b"zzzzz".as_slice()];
-        let dists = lev.compute(&device, &query, &tokens).unwrap();
-        assert_eq!(dists[(0, 0)], 1); // colour -> color is one deletion
-        assert!(dists[(0, 1)] >= 4);
-    }
-
-    #[test]
-    fn counts_code_points_not_bytes_in_utf8_word_mode() {
-        let device = cpu();
-        let lev_utf8 = LevenshteinDistancesUtf8::new(&device, 0, 1, 1, 1).unwrap();
-        let dists = lev_utf8.compute(&device, &["naïve"], &["naive"]).unwrap();
-        assert_eq!(dists[(0, 0)], 1); // ï -> i is one substitution, not two byte edits
-
-        let lev = LevenshteinDistances::new(&device, 0, 1, 1, 1).unwrap();
-        let byte_dists = lev
-            .compute(&device, &["naïve".as_bytes()], &[b"naive".as_slice()])
-            .unwrap();
-        assert_eq!(byte_dists[(0, 0)], 2);
-    }
+    // endregion: Searching
 }
 
 // endregion: Tests

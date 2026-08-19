@@ -14,6 +14,20 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::OnceLock;
 
+// The reference tables live beside their own parsers under `data/`, and reach every binary through
+// this crate rather than being `mod`-included once per binary.
+#[cfg(feature = "fuzzy-find")]
+#[path = "data/keyboards.rs"]
+pub mod keyboards;
+
+#[cfg(feature = "fuzzy-find")]
+#[path = "data/folds.rs"]
+pub mod folds;
+
+#[cfg(feature = "fuzzy-find")]
+#[path = "data/misspellings.rs"]
+pub mod misspellings;
+
 use memmap2::Mmap;
 use stringzilla::sz;
 use stringzilla::sz::{FindSplits, StringZillableBinary, StringZillableUnary, Utf8SplitNewlines};
@@ -1528,7 +1542,7 @@ pub fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, String> 
     patterns
         .iter()
         .map(|pattern| {
-glob::Pattern::new(pattern)
+            glob::Pattern::new(pattern)
                 .map_err(|error| format!("invalid glob '{}': {}", pattern, error))
         })
         .collect()
