@@ -106,6 +106,40 @@ enum Format {
     Json,
 }
 
+impl Format {
+    /// Whether a chunk's line tally is ever read. Only JSON reports one, and counting the
+    /// lines of a chunk nobody counts is a second pass over the whole input.
+    #[inline]
+    fn line_tally(self) -> LineTally {
+        match self {
+            Format::Json => LineTally::Count,
+            Format::None | Format::Paths => LineTally::Skip,
+        }
+    }
+}
+
+/// Whether the lines a chunk holds are counted at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineTally {
+    /// Leave the tally at zero, which no announcement will read.
+    Skip,
+    /// Walk the span and report what it holds.
+    Count,
+}
+
+impl LineTally {
+    /// Lines in `span`, counting an unterminated last line as one, exactly as
+    /// [`span_filling_chunk`] does for the mode that counts as it goes. [`LineTally::Skip`]
+    /// answers zero without walking, which is the tally no announcement goes on to read.
+    #[inline]
+    fn count(self, span: &[u8], newlines: Newlines) -> usize {
+        match self {
+            LineTally::Skip => 0,
+            LineTally::Count => LineSpans::new(span, newlines).count(),
+        }
+    }
+}
+
 /// Widest suffix a chunk name can carry: `NAME_MAX`, past which no filesystem here would
 /// create the file anyway.
 const MAX_SUFFIX_LENGTH: usize = 255;
@@ -233,7 +267,13 @@ impl SplitMode<'_> {
     /// The prefix of `rest` that belongs in a chunk already holding `filled`. Never both an
     /// empty span and `closes == false`: the caller's loop makes progress on every turn by
     /// writing bytes, closing a chunk, or both.
-    fn fill<'d>(&self, rest: &'d [u8], filled: Filled, newlines: Newlines) -> Fill<'d> {
+    fn fill<'d>(
+        &self,
+        rest: &'d [u8],
+        filled: Filled,
+        newlines: Newlines,
+        tally: LineTally,
+    ) -> Fill<'d> {
         match *self {
             SplitMode::Lines(per_file) => {
                 let wanted = per_file.get() - filled.lines;
@@ -249,7 +289,7 @@ impl SplitMode<'_> {
                 let span = span_within_budget(rest, room, filled.fresh, newlines);
                 Fill {
                     span,
-                    lines: count_lines(span, newlines),
+                    lines: tally.count(span, newlines),
                     // A chunk that took everything offered may still have room, and the
                     // next window can fill it; one that stopped short stopped at its limit.
                     closes: span.len() < rest.len(),
@@ -266,13 +306,13 @@ impl SplitMode<'_> {
                         let span = &rest[..cut];
                         Fill {
                             span,
-                            lines: count_lines(span, newlines),
+                            lines: tally.count(span, newlines),
                             closes: true,
                         }
                     }
                     None => Fill {
                         span: rest,
-                        lines: count_lines(rest, newlines),
+                        lines: tally.count(rest, newlines),
                         closes: false,
                     },
                 }
@@ -484,12 +524,6 @@ fn span_filling_chunk(data: &[u8], wanted: usize, newlines: Newlines) -> (&[u8],
     (&data[..end], seen)
 }
 
-/// Lines in `span`, counting an unterminated last line as one, exactly as
-/// [`span_filling_chunk`] does for the mode that counts as it goes.
-fn count_lines(span: &[u8], newlines: Newlines) -> usize {
-    LineSpans::new(span, newlines).count()
-}
-
 /// The longest prefix of `data` that ends on a line boundary within `room` bytes.
 ///
 /// Empty when the first line alone exceeds the budget and the chunk already holds
@@ -533,12 +567,15 @@ fn split_by_ranges(
     manifest: &mut dyn Write,
 ) -> Result<(), Failure> {
     let mut rest = data;
+    let tally = config.format.line_tally();
     while !rest.is_empty() {
         // The borrow of the open chunk ends with this block, so `close_chunk` can take
         // `state` again below.
         let closes = {
             let chunk = open_chunk(state, config)?;
-            let fill = config.mode.fill(rest, chunk.filled(), config.newlines);
+            let fill = config
+                .mode
+                .fill(rest, chunk.filled(), config.newlines, tally);
             debug_assert!(
                 !fill.span.is_empty() || fill.closes,
                 "a turn that writes nothing has to close a chunk, or the loop stalls"
@@ -577,30 +614,29 @@ fn plan_equal_chunks(
     data: &[u8],
     wanted: NonZeroUsize,
     newlines: Newlines,
-) -> Result<Vec<usize>, Failure> {
+) -> Result<impl Iterator<Item = usize> + '_, Failure> {
     let total = data.len();
     if wanted.get() > total {
         return Err(chunk_count_exceeds_input(wanted, total));
     }
-    let mut cuts = Vec::with_capacity(wanted.get() - 1);
-    let mut previous = 0;
-    for index in 1..wanted.get() {
+    let cuts = (1..wanted.get()).map(move |index| {
         // Multiplying first keeps the boundaries evenly spaced, where dividing first would
         // truncate each one; the widening is what keeps `total * index` from overflowing.
         let ideal = (total as u128 * index as u128 / wanted.get() as u128) as usize;
-        let cut = ideal + first_line_end(&data[ideal..], newlines);
-        // Boundaries never move backwards, so a chunk is never handed a negative span.
-        previous = cut.max(previous);
-        cuts.push(previous);
-    }
-    Ok(cuts)
+        ideal + first_line_end(&data[ideal..], newlines)
+    });
+    // Boundaries never move backwards, so a chunk is never handed a negative span.
+    Ok(cuts.scan(0usize, |highest, cut| {
+        *highest = cut.max(*highest);
+        Some(*highest)
+    }))
 }
 
 /// Write `data` as the ranges `cuts` describes, then the tail. Used by `--chunk-count`,
 /// whose boundaries are known before any byte is written, so nothing is searched per chunk.
 fn split_at_offsets(
     data: &[u8],
-    cuts: &[usize],
+    cuts: impl Iterator<Item = usize>,
     config: &SplitConfig,
     manifest: &mut dyn Write,
 ) -> Result<usize, Failure> {
@@ -611,15 +647,16 @@ fn split_at_offsets(
 
 fn write_ranges(
     data: &[u8],
-    cuts: &[usize],
+    cuts: impl Iterator<Item = usize>,
     state: &mut SplitState,
     config: &SplitConfig,
     manifest: &mut dyn Write,
 ) -> Result<(), Failure> {
     let mut start = 0;
-    for end in cuts.iter().copied().chain([data.len()]) {
+    let tally = config.format.line_tally();
+    for end in cuts.chain([data.len()]) {
         let span = &data[start.min(data.len())..end.min(data.len())];
-        let lines = count_lines(span, config.newlines);
+        let lines = tally.count(span, config.newlines);
         write_span(open_chunk(state, config)?, span, lines)?;
         close_chunk(state, config, manifest)?;
         start = end;
@@ -841,7 +878,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     let input = get_input_streaming(args.input.as_deref()).at(path)?;
 
     // The delimiter outlives the config that borrows it.
-    let pattern = args.chunk_pattern.clone().unwrap_or_default();
+    let pattern = args.chunk_pattern.as_deref().unwrap_or_default();
     let delimiter = Delimiter {
         needle: Literal::new(pattern.as_bytes(), args.ignore_case),
     };
@@ -910,7 +947,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
             (Some(data), Some(wanted)) => {
                 let data = &data[taken..];
                 plan_equal_chunks(data, wanted, newlines)
-                    .and_then(|cuts| split_at_offsets(data, &cuts, &config, manifest))
+                    .and_then(|cuts| split_at_offsets(data, cuts, &config, manifest))
             }
             // Only a genuine pipe lands here: a `< file` redirect is mapped above.
             (None, Some(_)) => Err(reject(
@@ -1146,7 +1183,7 @@ mod tests {
             };
             let cuts =
                 plan_equal_chunks(data, NonZeroUsize::new(wanted).unwrap(), Newlines::Lf).unwrap();
-            split_at_offsets(data, &cuts, &config, &mut io::sink()).unwrap();
+            split_at_offsets(data, cuts, &config, &mut io::sink()).unwrap();
             let chunks = read_chunks(&prefix);
             // Asking for more chunks than there are lines still yields that many files,
             // so a downstream loop over the count is safe; the surplus are empty.
@@ -1154,10 +1191,11 @@ mod tests {
             assert_eq!(chunks.concat().as_bytes(), data, "asked for {}", wanted);
         }
 
-        // Past one chunk per byte the request is unmeetable, and used to allocate and loop
-        // `wanted` times before writing anything.
-        let error =
-            plan_equal_chunks(data, NonZeroUsize::new(1 << 40).unwrap(), Newlines::Lf).unwrap_err();
+        // Past one chunk per byte the request is unmeetable.
+        let Err(error) = plan_equal_chunks(data, NonZeroUsize::new(1 << 40).unwrap(), Newlines::Lf)
+        else {
+            panic!("a count past one chunk per byte must be rejected");
+        };
         assert!(error.to_string().contains("--chunk-count"), "{}", error);
     }
 
@@ -1219,7 +1257,12 @@ mod tests {
             bytes: header.len(),
             fresh: true,
         };
-        let fill = SplitMode::Bytes(budget).fill(b"1,a\n2,b\n3,c\n", filled, Newlines::Lf);
+        let fill = SplitMode::Bytes(budget).fill(
+            b"1,a\n2,b\n3,c\n",
+            filled,
+            Newlines::Lf,
+            LineTally::Count,
+        );
         assert_eq!(fill.span, b"1,a\n2,b\n", "8 header bytes leave 8 of the 16");
 
         // A line budget counts data, so the same header costs it nothing.
@@ -1227,6 +1270,7 @@ mod tests {
             b"1,a\n2,b\n3,c\n",
             Filled::default(),
             Newlines::Lf,
+            LineTally::Count,
         );
         assert_eq!(fill.span, b"1,a\n2,b\n");
     }
@@ -1599,7 +1643,7 @@ mod tests {
             let config = utf8_config(&prefix, SplitMode::Lines(NonZeroUsize::MIN));
             let wanted = NonZeroUsize::new(data.len().clamp(1, 2)).unwrap();
             let cuts = plan_equal_chunks(data, wanted, Newlines::Unicode).unwrap();
-            split_at_offsets(data, &cuts, &config, &mut io::sink()).unwrap();
+            split_at_offsets(data, cuts, &config, &mut io::sink()).unwrap();
             assert_eq!(read_chunks(&prefix).concat().as_bytes(), data, "{}", which);
         }
     }

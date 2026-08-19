@@ -87,6 +87,23 @@ enum Field {
     FileHash,
 }
 
+impl Field {
+    /// The bit this field takes in [`OutputConfig::fields`].
+    #[inline]
+    fn bit(self) -> u8 {
+        match self {
+            Field::LineNumbers => 1,
+            Field::LineHashes => 2,
+            Field::FileHash => 4,
+        }
+    }
+
+    /// The bits of every named field, which is the whole `--fields` set in one word.
+    fn bits(fields: &[Field]) -> u8 {
+        fields.iter().fold(0, |bits, field| bits | field.bit())
+    }
+}
+
 /// How records are rendered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Format {
@@ -147,10 +164,8 @@ enum RowSelector {
 
 /// The rows a forward pass picks out, in the order the lines arrive.
 enum ForwardSelector {
-    /// Specific zero-based row indices, sorted and deduplicated.
-    Indices(Vec<usize>),
-    /// An inclusive zero-based row range.
-    Range(usize, usize),
+    /// Inclusive zero-based row ranges, sorted by start and merged so that no two touch.
+    Ranges(Vec<(usize, usize)>),
     /// Every Nth row (1 = all, 2 = every other, and so on).
     Every(NonZeroUsize),
 }
@@ -171,27 +186,12 @@ fn parse_row(token: &str) -> Result<usize, String> {
     Ok(row - 1)
 }
 
-/// Parse row specification into a RowSelector
+/// Parse a row specification — a number, a comma list, or a range — into a selector.
 fn parse_rows(spec: &str) -> Result<RowSelector, String> {
     if spec.trim().is_empty() {
         return Err("no rows given; pass a row, a list, or a range".into());
     }
-    // Check if it's a simple range (no commas)
-    if !spec.contains(',') && spec.contains('-') {
-        let parts: Vec<&str> = spec.split('-').collect();
-        if parts.len() == 2 {
-            let (start, end) = (parse_row(parts[0])?, parse_row(parts[1])?);
-            if start > end {
-                return Err(format!(
-                    "`{spec}` runs backwards; a range reads low to high"
-                ));
-            }
-            return Ok(RowSelector::Forward(ForwardSelector::Range(start, end)));
-        }
-    }
-
-    // Parse as list of indices (possibly with ranges)
-    let mut indices = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
 
     for part in spec.split(',') {
         let part = part.trim();
@@ -207,22 +207,30 @@ fn parse_rows(spec: &str) -> Result<RowSelector, String> {
                     "`{part}` runs backwards; a range reads low to high"
                 ));
             }
-            indices.extend(start..=end);
+            ranges.push((start, end));
         } else {
-            indices.push(parse_row(part)?);
+            let row = parse_row(part)?;
+            ranges.push((row, row));
         }
     }
 
-    if indices.is_empty() {
+    if ranges.is_empty() {
         return Err("no rows given; pass a row, a list, or a range".into());
     }
 
-    // Rows arrive in order, so the walk reads a sorted list with a cursor rather than
-    // hashing every line against a set that is usually one to three elements wide.
-    indices.sort_unstable();
-    indices.dedup();
+    // Rows arrive in order, so the walk reads sorted ranges with a cursor rather than
+    // hashing every line against a set. Overlapping ranges are folded together, or a row
+    // named twice would be written twice.
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
 
-    Ok(RowSelector::Forward(ForwardSelector::Indices(indices)))
+    Ok(RowSelector::Forward(ForwardSelector::Ranges(merged)))
 }
 
 /// How one extracted row is written out: behind the fields the record carries and closed by
@@ -236,18 +244,34 @@ enum Rendering {
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig<'a> {
+    /// How one row is written out.
     rendering: Rendering,
-    /// Which columns each record carries; `Field::FileHash` costs the run the whole input.
-    fields: &'a [Field],
+    /// The `--fields` columns each record carries, packed by [`Field::bits`].
+    fields: u8,
+    /// How many characters of a line hash are printed.
     hash_width: usize,
     /// The input's path, carried into the JSON envelope.
     path: &'a str,
 }
 
-impl OutputConfig<'_> {
+impl<'a> OutputConfig<'a> {
+    /// Resolve the requested fields once, so no row re-reads the list they came from.
+    fn from_args(args: &Args, path: &'a str) -> Self {
+        OutputConfig {
+            rendering: match args.format {
+                Format::Json => Rendering::Json,
+                Format::Text => Rendering::Terminated(Terminator::from_null(args.null)),
+            },
+            fields: Field::bits(&args.fields),
+            hash_width: args.hash_width.unwrap_or(DEFAULT_HASH_WIDTH),
+            path,
+        }
+    }
+
+    /// Whether the named `--fields` column is printed.
     #[inline]
     fn carries(&self, field: Field) -> bool {
-        self.fields.contains(&field)
+        self.fields & field.bit() != 0
     }
 
     /// The hash naming a line, when a record was asked to carry one. Taken from the whole
@@ -348,23 +372,28 @@ fn tail_start_lf(data: &[u8], wanted: NonZeroUsize) -> (usize, usize) {
 struct RowsState {
     /// Absolute zero-based index of the next line to arrive.
     next_index: usize,
-    /// How far into a sorted index list the walk has come.
+    /// How far into the sorted ranges the walk has come.
     cursor: usize,
     /// Rows written so far, which the run returns as its row count.
     emitted: usize,
 }
 
 impl ForwardSelector {
-    /// Whether the row at `index` is wanted, stepping the cursor over it. Rows arrive in
-    /// order and the indices are sorted, so the cursor only ever moves forward.
+    /// Whether the row at `index` is wanted, stepping the cursor over the ranges it has
+    /// passed. Rows arrive in order and the ranges are sorted, so the cursor only ever
+    /// moves forward.
     fn takes(&self, index: usize, state: &mut RowsState) -> bool {
         match self {
-            ForwardSelector::Indices(indices) => {
-                let wanted = indices.get(state.cursor) == Some(&index);
-                state.cursor += usize::from(wanted);
-                wanted
+            ForwardSelector::Ranges(ranges) => {
+                let Some(&(start, end)) = ranges.get(state.cursor) else {
+                    return false;
+                };
+                // Retired on its last row, so `exhausted` stops the walk on the row it wanted.
+                if index == end {
+                    state.cursor += 1;
+                }
+                (start..=end).contains(&index)
             }
-            ForwardSelector::Range(start, end) => (*start..=*end).contains(&index),
             ForwardSelector::Every(stride) => (index + 1).is_multiple_of(stride.get()),
         }
     }
@@ -373,8 +402,7 @@ impl ForwardSelector {
     /// reading rather than drain the rest of its input.
     fn exhausted(&self, state: &RowsState) -> bool {
         match self {
-            ForwardSelector::Indices(indices) => state.cursor == indices.len(),
-            ForwardSelector::Range(_, end) => state.next_index > *end,
+            ForwardSelector::Ranges(ranges) => state.cursor == ranges.len(),
             // A stride keeps matching for as long as lines keep arriving.
             ForwardSelector::Every(_) => false,
         }
@@ -620,15 +648,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     }
     .at(path)?;
 
-    let config = OutputConfig {
-        rendering: match args.format {
-            Format::Json => Rendering::Json,
-            Format::Text => Rendering::Terminated(Terminator::from_null(args.null)),
-        },
-        fields: &args.fields,
-        hash_width: args.hash_width.unwrap_or(DEFAULT_HASH_WIDTH),
-        path,
-    };
+    let config = OutputConfig::from_args(args, path);
 
     // A quiet run still extracts, so the row count that answers it stays honest.
     let destination = if args.quiet {
@@ -686,7 +706,7 @@ mod tests {
     fn text_config() -> OutputConfig<'static> {
         OutputConfig {
             rendering: Rendering::Terminated(Terminator::Newline),
-            fields: &[],
+            fields: 0,
             hash_width: DEFAULT_HASH_WIDTH,
             path: "-",
         }
@@ -762,11 +782,13 @@ mod tests {
     }
 
     fn indices(rows: &[usize]) -> RowSelector {
-        RowSelector::Forward(ForwardSelector::Indices(rows.to_vec()))
+        RowSelector::Forward(ForwardSelector::Ranges(
+            rows.iter().map(|&row| (row, row)).collect(),
+        ))
     }
 
     fn range(start: usize, end: usize) -> RowSelector {
-        RowSelector::Forward(ForwardSelector::Range(start, end))
+        RowSelector::Forward(ForwardSelector::Ranges(vec![(start, end)]))
     }
 
     fn every(stride: usize) -> RowSelector {
@@ -1034,8 +1056,8 @@ mod tests {
     #[test]
     fn parses_single_row_index() {
         match parse_rows("5").unwrap() {
-            RowSelector::Forward(ForwardSelector::Indices(rows)) => assert_eq!(rows, vec![4]),
-            _ => panic!("Expected Indices"),
+            RowSelector::Forward(ForwardSelector::Ranges(rows)) => assert_eq!(rows, vec![(4, 4)]),
+            _ => panic!("Expected Ranges"),
         }
     }
 
@@ -1043,19 +1065,34 @@ mod tests {
     fn parses_comma_separated_row_list() {
         // Sorted and deduplicated, whatever order the spec named them in.
         match parse_rows("10,1,5,1").unwrap() {
-            RowSelector::Forward(ForwardSelector::Indices(rows)) => assert_eq!(rows, vec![0, 4, 9]),
-            _ => panic!("Expected Indices"),
+            RowSelector::Forward(ForwardSelector::Ranges(rows)) => {
+                assert_eq!(rows, vec![(0, 0), (4, 4), (9, 9)])
+            }
+            _ => panic!("Expected Ranges"),
         }
     }
 
     #[test]
     fn parses_row_range() {
         match parse_rows("5-10").unwrap() {
-            RowSelector::Forward(ForwardSelector::Range(start, end)) => {
-                assert_eq!(start, 4); // 0-based
-                assert_eq!(end, 9);
+            RowSelector::Forward(ForwardSelector::Ranges(rows)) => assert_eq!(rows, vec![(4, 9)]),
+            _ => panic!("Expected Ranges"),
+        }
+
+        // A range is one entry however wide, so the spec never sizes an allocation.
+        match parse_rows("1-100000000,3").unwrap() {
+            RowSelector::Forward(ForwardSelector::Ranges(rows)) => {
+                assert_eq!(rows, vec![(0, 99_999_999)])
             }
-            _ => panic!("Expected Range"),
+            _ => panic!("Expected Ranges"),
+        }
+
+        // Overlapping and touching ranges fold together, so no row is written twice.
+        match parse_rows("1-5,3-7,9,10-11").unwrap() {
+            RowSelector::Forward(ForwardSelector::Ranges(rows)) => {
+                assert_eq!(rows, vec![(0, 6), (8, 10)])
+            }
+            _ => panic!("Expected Ranges"),
         }
     }
 
@@ -1129,7 +1166,7 @@ mod tests {
 
         let selector = range(0, 1); // lines 1-2
         let mut config = text_config();
-        config.fields = &[Field::LineNumbers];
+        config.fields = Field::bits(&[Field::LineNumbers]);
 
         extract_data(data, &selector, Newlines::Lf, &config, &mut output).unwrap();
 
@@ -1242,7 +1279,7 @@ mod tests {
         let data = b"line1\nline2\nline3\nline4\n";
         let mut output = Vec::new();
         let mut config = text_config();
-        config.fields = &[Field::LineNumbers];
+        config.fields = Field::bits(&[Field::LineNumbers]);
 
         extract_data(data, &tail(2), Newlines::Lf, &config, &mut output).unwrap();
 
@@ -1306,7 +1343,7 @@ mod tests {
             every(5),
         ];
         let mut numbered = text_config();
-        numbered.fields = &[Field::LineNumbers];
+        numbered.fields = Field::bits(&[Field::LineNumbers]);
         let mut json = text_config();
         json.rendering = Rendering::Json;
 
@@ -1358,7 +1395,7 @@ mod tests {
     fn streams_tail_with_absolute_line_numbers() {
         let data = b"line1\nline2\nline3\nline4\n";
         let mut config = text_config();
-        config.fields = &[Field::LineNumbers];
+        config.fields = Field::bits(&[Field::LineNumbers]);
 
         let (output, count) = extract_streamed(data, 7, &tail(2), Newlines::Lf, &config);
 

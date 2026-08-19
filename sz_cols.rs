@@ -11,6 +11,7 @@
 //! requested column still yields an empty field, so a narrow file exits 0, not 1.
 
 use std::io::{self, Write};
+use std::ops::RangeInclusive;
 
 use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
 use stringzilla::sz::{FindSplits, MatcherType};
@@ -115,8 +116,9 @@ fn parse_column(token: &str) -> Result<usize, String> {
     Ok(column - 1)
 }
 
-/// Parse a column specification — a number, a comma list, or a range — into 0-based indices.
-fn parse_columns(spec: &str) -> Result<Vec<usize>, String> {
+/// Parse a column specification — a number, a comma list, or a range — into 0-based terms,
+/// each kept as the inclusive range it names rather than as every index between its ends.
+fn parse_columns(spec: &str) -> Result<Vec<RangeInclusive<usize>>, String> {
     if spec.trim().is_empty() {
         return Err("no columns given; pass a column, a list, or a range".into());
     }
@@ -136,57 +138,94 @@ fn parse_columns(spec: &str) -> Result<Vec<usize>, String> {
                     "`{part}` runs backwards; a range reads low to high"
                 ));
             }
-            columns.extend(start..=end);
+            columns.push(start..=end);
         } else {
-            columns.push(parse_column(part)?);
+            let index = parse_column(part)?;
+            columns.push(index..=index);
         }
     }
 
     Ok(columns)
 }
 
+/// How far past the selection a line is read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldTally {
+    /// Stop at the fields the selection names.
+    Prefix,
+    /// Walk to the end of the line, and drop it below this many fields.
+    AtLeast(usize),
+}
+
 /// Split a line into `out` on the delimiter (SIMD `FindSplits`), as offsets into the line so
-/// that one buffer serves every window. `limit` stops the scan once that many fields are in
-/// hand; an empty line has no fields, matching `cut`.
-fn split_fields(line: &[u8], delimiter: &[u8], limit: Option<usize>, out: &mut Vec<Span>) {
+/// that one buffer serves every window, and answer how many fields the line holds. Only the
+/// first `needed` are kept; `tally` decides whether the rest are counted or left unread. An
+/// empty line has no fields, matching `cut`.
+fn split_fields(
+    line: &[u8],
+    delimiter: &[u8],
+    needed: usize,
+    tally: FieldTally,
+    out: &mut Vec<Span>,
+) -> usize {
     out.clear();
     if line.is_empty() {
-        return;
+        return 0;
     }
-    let splits = FindSplits::new(line, MatcherType::Find(delimiter)).map(|field| Span {
+    let mut splits = FindSplits::new(line, MatcherType::Find(delimiter)).map(|field| Span {
         offset: offset_within(line, field),
         length: field.len(),
     });
-    match limit {
-        Some(limit) => out.extend(splits.take(limit)),
-        None => out.extend(splits),
+    out.extend(splits.by_ref().take(needed));
+    match tally {
+        FieldTally::Prefix => out.len(),
+        FieldTally::AtLeast(_) => out.len() + splits.count(),
     }
 }
 
 /// Which fields to extract and how far each line has to be split, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct ColumnSelection<'a> {
-    /// Zero-based field indices, in output order.
-    indices: &'a [usize],
-    /// How many leading fields to split out, or `None` for the whole line.
-    limit: Option<usize>,
+    /// The specification's terms, in output order.
+    parts: &'a [RangeInclusive<usize>],
+    /// How many leading fields to split out.
+    needed: usize,
+    /// How far past those the line is read.
+    tally: FieldTally,
     /// Separates fields within an input line.
     delimiter: &'a [u8],
-    /// Drop lines carrying fewer fields than this.
-    min_columns: Option<usize>,
 }
 
 impl<'a> ColumnSelection<'a> {
-    /// Select `indices`, splitting only as far as the furthest of them reaches.
-    /// `--min-columns` tests the total column count, so it forfeits that early stop.
-    fn new(indices: &'a [usize], delimiter: &'a [u8], min_columns: Option<usize>) -> Self {
+    /// Select `parts`, splitting only as far as the furthest of them reaches.
+    /// `--min-columns` tests the total column count, so it counts the rest as well.
+    fn new(
+        parts: &'a [RangeInclusive<usize>],
+        delimiter: &'a [u8],
+        min_columns: Option<usize>,
+    ) -> Self {
         ColumnSelection {
-            indices,
-            limit: min_columns
-                .is_none()
-                .then(|| indices.iter().copied().max().map_or(0, |index| index + 1)),
+            parts,
+            needed: parts
+                .iter()
+                .map(|part| *part.end())
+                .max()
+                .map_or(0, |end| end + 1),
+            tally: match min_columns {
+                Some(minimum) => FieldTally::AtLeast(minimum),
+                None => FieldTally::Prefix,
+            },
             delimiter,
-            min_columns,
+        }
+    }
+
+    /// Split `line` into `out` and answer whether the line is written.
+    #[inline]
+    fn takes(&self, line: &[u8], out: &mut Vec<Span>) -> bool {
+        let total = split_fields(line, self.delimiter, self.needed, self.tally, out);
+        match self.tally {
+            FieldTally::Prefix => true,
+            FieldTally::AtLeast(minimum) => total >= minimum,
         }
     }
 }
@@ -199,7 +238,8 @@ struct ColsState {
     line_number: usize,
     /// Records written so far, which decides whether the run found anything.
     emitted: usize,
-    /// Fields of the line being written, as offsets into it.
+    /// Fields of the line being written, as offsets into it, kept only as far as the
+    /// selection reaches.
     fields: Vec<Span>,
 }
 
@@ -238,7 +278,7 @@ fn write_record(
     config: &OutputConfig,
     line: &[u8],
     fields: &[Span],
-    column_indices: &[usize],
+    parts: &[RangeInclusive<usize>],
     line_number: usize,
 ) -> io::Result<()> {
     match config.rendering {
@@ -246,7 +286,7 @@ fn write_record(
             delimiter,
             terminator,
         } => {
-            for (position, &index) in column_indices.iter().enumerate() {
+            for (position, index) in parts.iter().cloned().flatten().enumerate() {
                 if position > 0 {
                     output.write_all(delimiter)?;
                 }
@@ -258,7 +298,7 @@ fn write_record(
             output.write_all(br#"{"type":"line","data":{"path":"#)?;
             json_text_field_to(output, config.path.as_bytes())?;
             output.write_all(br#","columns":["#)?;
-            for (position, &index) in column_indices.iter().enumerate() {
+            for (position, index) in parts.iter().cloned().flatten().enumerate() {
                 if position > 0 {
                     output.write_all(b",")?;
                 }
@@ -281,17 +321,7 @@ fn extract_data(
 ) -> io::Result<()> {
     for line in LineIter::new(data, newlines) {
         state.line_number += 1;
-        split_fields(
-            line,
-            selection.delimiter,
-            selection.limit,
-            &mut state.fields,
-        );
-
-        if selection
-            .min_columns
-            .is_some_and(|min| state.fields.len() < min)
-        {
+        if !selection.takes(line, &mut state.fields) {
             continue;
         }
 
@@ -300,7 +330,7 @@ fn extract_data(
             config,
             line,
             &state.fields,
-            selection.indices,
+            selection.parts,
             state.line_number,
         )?;
         state.emitted += 1;
@@ -312,7 +342,7 @@ fn extract_data(
 fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
     validate(args)?;
 
-    let column_indices = parse_columns(&args.columns)
+    let columns = parse_columns(&args.columns)
         .map_err(|message| Args::command().error(ErrorKind::ValueValidation, message))?;
 
     let path = args.input.as_deref().unwrap_or("-");
@@ -325,7 +355,7 @@ fn run(args: &Args, output: &mut dyn Write) -> Result<Status, Failure> {
         .map(|delimiter| delimiter.as_bytes())
         .unwrap_or(delimiter);
 
-    let selection = ColumnSelection::new(&column_indices, delimiter, args.min_columns);
+    let selection = ColumnSelection::new(&columns, delimiter, args.min_columns);
 
     let config = OutputConfig {
         rendering: match args.format {
@@ -391,7 +421,7 @@ mod tests {
     fn counts_records_a_quiet_run_never_writes() {
         // `--quiet` extracts into a sink, so the count that becomes the exit status
         // is the same one a printing run would report.
-        let selection = ColumnSelection::new(&[0], b"\t", None);
+        let selection = ColumnSelection::new(&[0..=0], b"\t", None);
         let config = text_config(b"\t");
 
         let mut state = ColsState::default();
@@ -547,25 +577,33 @@ mod tests {
 
     #[test]
     fn parses_single_column_index() {
-        assert_eq!(parse_columns("2").unwrap(), vec![1]); // 0-based
-        assert_eq!(parse_columns("1").unwrap(), vec![0]);
+        assert_eq!(expanded("2"), vec![1]); // 0-based
+        assert_eq!(expanded("1"), vec![0]);
     }
 
     #[test]
     fn parses_comma_separated_column_list() {
-        assert_eq!(parse_columns("1,3,5").unwrap(), vec![0, 2, 4]);
-        assert_eq!(parse_columns("2, 4").unwrap(), vec![1, 3]); // with spaces
+        assert_eq!(expanded("1,3,5"), vec![0, 2, 4]);
+        assert_eq!(expanded("2, 4"), vec![1, 3]); // with spaces
     }
 
     #[test]
     fn parses_column_range() {
-        assert_eq!(parse_columns("2-5").unwrap(), vec![1, 2, 3, 4]);
-        assert_eq!(parse_columns("1-3").unwrap(), vec![0, 1, 2]);
+        assert_eq!(expanded("2-5"), vec![1, 2, 3, 4]);
+        assert_eq!(expanded("1-3"), vec![0, 1, 2]);
     }
 
     #[test]
     fn parses_mixed_column_list_and_range() {
-        assert_eq!(parse_columns("1,3-5,7").unwrap(), vec![0, 2, 3, 4, 6]);
+        assert_eq!(expanded("1,3-5,7"), vec![0, 2, 3, 4, 6]);
+        // Order and duplicates are the flag's point, so neither is normalized away.
+        assert_eq!(expanded("3,1"), vec![2, 0]);
+        assert_eq!(expanded("1,1"), vec![0, 0]);
+        // A range is one term however wide, so the spec never sizes an allocation.
+        assert_eq!(
+            parse_columns("1-4000000000").unwrap(),
+            vec![0..=3_999_999_999]
+        );
     }
 
     #[test]
@@ -575,9 +613,25 @@ mod tests {
         assert!(parse_columns("abc").is_err()); // not a number
     }
 
+    /// The indices a specification names, in the order it names them.
+    fn expanded(spec: &str) -> Vec<usize> {
+        parse_columns(spec)
+            .unwrap()
+            .iter()
+            .cloned()
+            .flatten()
+            .collect()
+    }
+
     fn fields<'a>(line: &'a [u8], delimiter: &'a [u8]) -> Vec<&'a [u8]> {
         let mut spans = Vec::new();
-        split_fields(line, delimiter, None, &mut spans);
+        split_fields(
+            line,
+            delimiter,
+            usize::MAX,
+            FieldTally::AtLeast(0),
+            &mut spans,
+        );
         (0..spans.len())
             .map(|index| field_at(line, &spans, index))
             .collect()
@@ -677,7 +731,7 @@ mod tests {
 
         let (output, count) = extract(
             data,
-            &ColumnSelection::new(&[1], b"\t", None),
+            &ColumnSelection::new(&[1..=1], b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );
@@ -692,7 +746,7 @@ mod tests {
 
         let (output, _) = extract(
             data,
-            &ColumnSelection::new(&[0, 2], b"\t", None),
+            &ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
             Newlines::Lf,
             &text_config(b","),
         );
@@ -706,7 +760,7 @@ mod tests {
 
         let (output, _) = extract(
             data,
-            &ColumnSelection::new(&[0, 2], b"\t", None),
+            &ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );
@@ -721,7 +775,7 @@ mod tests {
 
         let (output, count) = extract(
             data,
-            &ColumnSelection::new(&[1], b"\t", Some(3)),
+            &ColumnSelection::new(&[1..=1], b"\t", Some(3)),
             Newlines::Lf,
             &text_config(b"\t"),
         );
@@ -742,7 +796,7 @@ mod tests {
 
         let (output, _) = extract(
             data,
-            &ColumnSelection::new(&[0], b"\t", None),
+            &ColumnSelection::new(&[0..=0], b"\t", None),
             Newlines::Lf,
             &config,
         );
@@ -758,7 +812,7 @@ mod tests {
 
         let (output, _) = extract(
             data,
-            &ColumnSelection::new(&[0, 2], b"\t", None),
+            &ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
             Newlines::Lf,
             &config,
         );
@@ -787,24 +841,26 @@ mod tests {
 
         let early = extract(
             &wide,
-            &ColumnSelection::new(&[0, 2], b"\t", None),
+            &ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );
         let whole = extract(
             &wide,
             &ColumnSelection {
-                indices: &[0, 2],
-                limit: None,
+                parts: &[0..=0, 2..=2],
+                needed: usize::MAX,
+                tally: FieldTally::AtLeast(0),
                 delimiter: b"\t",
-                min_columns: None,
             },
             Newlines::Lf,
             &text_config(b"\t"),
         );
 
-        assert_eq!(ColumnSelection::new(&[0, 2], b"\t", None).limit, Some(3));
-        assert_eq!(ColumnSelection::new(&[0, 2], b"\t", Some(4)).limit, None);
+        let selection = ColumnSelection::new(&[0..=0, 2..=2], b"\t", None);
+        assert_eq!((selection.needed, selection.tally), (3, FieldTally::Prefix));
+        let counted = ColumnSelection::new(&[0..=0, 2..=2], b"\t", Some(4));
+        assert_eq!((counted.needed, counted.tally), (3, FieldTally::AtLeast(4)));
         assert_eq!(early, whole);
         assert_eq!(early.0, b"c0\tc2\n");
     }
@@ -813,7 +869,7 @@ mod tests {
     fn splits_rows_on_unicode_newlines_under_utf8() {
         // Line separators, which only the Unicode newline set breaks on.
         let data = "a\tb\u{2028}c\td\n".as_bytes();
-        let selection = ColumnSelection::new(&[1], b"\t", None);
+        let selection = ColumnSelection::new(&[1..=1], b"\t", None);
 
         let (output, count) = extract(data, &selection, Newlines::Unicode, &text_config(b"\t"));
         assert_eq!(count, 2);
@@ -836,9 +892,9 @@ mod tests {
 
         for (newline_set, newlines) in [("lf", Newlines::Lf), ("unicode", Newlines::Unicode)] {
             for selection in [
-                ColumnSelection::new(&[1], b"\t", None),
-                ColumnSelection::new(&[0, 2], b"\t", None),
-                ColumnSelection::new(&[1], b"\t", Some(3)),
+                ColumnSelection::new(&[1..=1], b"\t", None),
+                ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
+                ColumnSelection::new(&[1..=1], b"\t", Some(3)),
             ] {
                 for config in [text_config(b"\t"), text_config(b","), json] {
                     let whole = extract(data, &selection, newlines, &config);
@@ -861,7 +917,7 @@ mod tests {
         let (output, count) = extract_streamed(
             b"",
             7,
-            &ColumnSelection::new(&[0], b"\t", None),
+            &ColumnSelection::new(&[0..=0], b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );
