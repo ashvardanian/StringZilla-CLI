@@ -32,6 +32,9 @@ default = []
 # Pre-production, opt-in: `sz-fuzzy-find` is being reimplemented. It is the only binary
 # that reaches for the multicore `szs` kernels, so the `cpus` feature — and the allocator,
 # tape and fork-union crates behind it — comes in with the binary rather than with the suite.
+# The reference tables it embeds are not separately switchable: they total under a megabyte, every
+# flag that reads one is useless without it, and a Cargo feature cannot be subtracted from a feature
+# that enables it, so a knob here could never have been turned.
 fuzzy-find = ["stringzilla/cpus"]
 outline = []    # Pre-production, opt-in: `sz-outline` is being reimplemented
 

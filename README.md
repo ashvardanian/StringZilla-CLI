@@ -629,65 +629,77 @@ Function signatures are normalized (whitespace collapsed) and categorized as dec
 ### `sz-fuzzy-find`: Fuzzy Substring Search
 
 > [!WARNING]
-> This one is being reimplemented and is excluded from the default build.
+> Pre-production and excluded from the default build.
 > Enable it with `cargo build --release --features fuzzy-find`.
 
-`sz-find` matches literally; `sz-fuzzy-find` adds typo tolerance, built on StringZilla's `szs` similarity kernels, multicore by default and GPU-capable.
-Exact hits are claimed first with StringZilla's `find`, so only the remainder reaches the kernel.
+`sz-find` matches literally; `sz-fuzzy-find` adds typo tolerance.
+Each query is expanded into every string within an edit budget of it, and those variants are matched exactly by one Aho-Corasick automaton scored by BM25.
+The edit model therefore lives in the vocabulary and its weights rather than in a substitution matrix, so `--max-distance` is an edit budget in every mode and digits never share a scoring class.
 
-Three behaviours are known to be wrong today and are what the rewrite fixes.
-`--max-distance` is an edit budget only under `--match word`; elsewhere it becomes a Smith-Waterman score floor, so `Washigton` at one edit is missed while `WaShInGtOn` at four matches.
-All ten digits share one scoring class, so `--max-distance 0 2024` also returns `1999`.
-And every non-exact line reaches the kernel, which is why a 50 MB corpus takes 180 ms where `ugrep -Z1` takes 3 ms.
+Every query's variants pool into a single dictionary, so the corpus is walked once however many `--pattern` flags are given.
 
 ```bash
-# Find "color" allowing up to 1 edit — also matches "colour", "colur", "kolor"
-$ sz-fuzzy-find --max-distance 1 color file.txt
+# Find "color" allowing one edit — also matches "colour", "kolor"
+$ sz-fuzzy-find color file.txt
 
-# Several queries at once (a line matches if ANY query matches)
-$ sz-fuzzy-find --max-distance 1 --pattern foo --pattern bar file.txt
+# Several queries at once, still one pass over the corpus
+$ sz-fuzzy-find --pattern foo --pattern bar file.txt
 
-# Word mode: match the needle against each token (Levenshtein), not the whole line
-$ sz-fuzzy-find --match word --max-distance 1 colour file.txt
-
-# Count matching lines only
-$ sz-fuzzy-find --show count --max-distance 1 needle file.txt
+# Rank by BM25 instead of filtering
+$ sz-fuzzy-find --top-k 20 --fields scores color file.txt
 ```
 
-Word mode carries the edit-distance semantics, and agrees with `agrep` line for line.
-Over 50 MB of multilingual news, one query, 225 matching lines:
+#### How Hard to Look (`--effort`)
 
-| Tool                                          |       Time | Semantics                                        |
-| --------------------------------------------- | ---------: | ------------------------------------------------ |
-| `tre-agrep -E 1`                              |     2.90 s | edit distance                                    |
-| `fzf --filter`                                |     0.43 s | subsequence — 3,508 lines, not the same question |
-| `sz-fuzzy-find --match word --max-distance 1` | __0.21 s__ | edit distance                                    |
+`--effort` names the kind of difference to tolerate, and picks the edit budget, the alphabet, the dictionary and the fold to deliver it.
+Each rung matches everything the rung below it matched.
 
-`fzf` is there for scale rather than parity: it matches characters in order with gaps, so it finds `W-a-s-h-i-n-g-t-o-n` and misses `Washigton`.
+| `--effort` | Tolerates | Example |
+| :--------- | :-------- | :------ |
+| `exact` | nothing | `2024` never matches `1999` |
+| `typos` | fat-finger slips, adjacent keys only | `xolor` reaches `color` |
+| `spelling` | any single edit, plus recorded misspellings | `definately` reaches `definitely` |
+| `accents` | diacritics and compatibility forms | `resume` reaches `résumé` |
+| `sounds` | pronunciation | `Gaddafi` reaches `Qaddafi` and `Kadafi` |
+| `scripts` | writing system | `北京大穴` reaches `北京大学` through pinyin |
+| `deep` | two edits | the widest ball, GPU territory |
 
-#### Scoring models (`--cost`)
+The fold follows from the query's own script, so `--effort scripts` means the right thing without naming a transform:
+a Cyrillic query gets `Cyrillic-Latin`, a Han query gets `Han-Latin`, and each is then carried through the Latin chain.
 
-Beyond uniform edit distance, scoring can reflect _how_ characters get confused.
-These route through Smith-Waterman with a `byte_to_class[256]` + `class_substitution_costs[32][32]` matrix, and use a normalized `--min-similarity` (0..1, where 1.0 is exact) instead of `--max-distance`:
+`--max-distance`, `--cost`, `--dictionary` and `--fold` remain as overrides, and each means the same thing at any `--effort`.
 
 ```bash
-# Keyboard proximity: fat-finger typos (adjacent keys cost less) — "xolor" matches "color"
-$ sz-fuzzy-find --cost keyboard --min-similarity 0.8 color file.txt
+# Name a transform explicitly; --fold is repeatable and the stages feed each other
+$ sz-fuzzy-find --fold Cyrillic-Latin --fold Latin-Phonetic Горбачёв archive/
 
-# Phonetic: sounds-alike (Editex-style articulatory groups) — "fonetik" matches "phonetic"
-$ sz-fuzzy-find --cost phonetic --min-similarity 0.75 phonetic file.txt
-
-# Custom 256→class map + 32×32 score matrix
-$ sz-fuzzy-find --cost-matrix my_costs.txt --min-similarity 0.8 needle file.txt
+# Alternative phonetic models, for German and for Slavic surnames
+$ sz-fuzzy-find --fold Cologne-Phonetic Schmidt names.txt
+$ sz-fuzzy-find --fold Daitch-Mokotoff Rabinowitz names.txt
 ```
 
-The keyboard matrix uses staggered-QWERTY Euclidean key distance; the phonetic matrix is seeded by voiced/unvoiced cognates (`b/p`, `d/t`, …) and Editex letter groups. Smith-Waterman fuzzy matching folds ASCII case (the 32-class budget leaves no room to distinguish case per letter).
+Matched spans are reported in the original bytes even when a fold rewrote the corpus, so `--show matches` stays usable at every rung.
+A run that folds nothing builds no offset map and pays nothing for the feature.
 
-#### Execution device (`--device`)
+#### Case (`--ignore-case`)
+
+Case-insensitive with full Unicode folding is the __default__ here, unlike the rest of the suite, because a fuzzy search that respected case would refuse the first thing anyone tries.
 
 ```bash
-$ sz-fuzzy-find --device cpu --threads 8 --max-distance 1 needle big.txt # CPU, 8 threads
-$ sz-fuzzy-find --device gpu --max-distance 1 needle big.txt             # GPU (see build note)
+$ sz-fuzzy-find --ignore-case=0 Color file.txt   # opt back into byte-exact case
+```
+
+#### Reference Tables
+
+Three standardized sources ship inside the binary, since no operating system provides them:
+88 keyboard layouts from xkeyboard-config, fold rules from Unicode CLDR, and 28,086 typo pairs from `client9/misspell`.
+The phonetic tables are authored from published algorithms rather than vendored, so they carry no third-party licence.
+
+#### Execution Device (`--device`)
+
+```bash
+$ sz-fuzzy-find --device cpu --threads 8 needle big.txt # CPU, 8 threads
+$ sz-fuzzy-find --device gpu needle big.txt             # GPU (see build note)
 ```
 
 Every core is used unless `--threads` says otherwise. The GPU path requires a CUDA build:

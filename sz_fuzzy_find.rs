@@ -29,6 +29,264 @@ use shared::keyboards::Keyboard;
 use shared::misspellings;
 use shared::*;
 
+// region: Effort
+
+/// How hard the search tries, as an ordered ladder where each rung matches everything the rung
+/// below it matched.
+///
+/// This is the product surface: it fills in what `--max-distance`, `--cost`, `--dictionary` and
+/// `--fold` would otherwise each have to be given separately, and those survive as overrides for
+/// somebody who already knows what they cost. Declaration order is the ladder, so `Ord` derives it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, ValueEnum)]
+enum Effort {
+    /// The query itself, and nothing else.
+    Exact,
+    /// One fat-finger edit, drawn from physically adjacent keys.
+    #[default]
+    Typos,
+    /// One edit from the whole layout, plus the recorded misspellings.
+    Spelling,
+    /// Also matches through diacritics and compatibility forms.
+    Accents,
+    /// Also matches letters that sound alike: `Gaddafi` reaches `Qaddafi`.
+    Sounds,
+    /// Also carries a non-Latin query onto Latin, so a Han needle reaches a Han corpus.
+    Scripts,
+    /// Two edits from the whole layout, on top of every fold above.
+    Deep,
+}
+
+impl Effort {
+    fn max_distance(self) -> usize {
+        match self {
+            Effort::Exact => 0,
+            Effort::Deep => 2,
+            _ => 1,
+        }
+    }
+
+    /// Only `Typos` narrows to adjacent keys; every other rung draws from the whole layout, which
+    /// is what makes each rung a superset of the one below it.
+    fn alphabet(self) -> Alphabet {
+        match self {
+            Effort::Typos => Alphabet::Keyboard,
+            _ => Alphabet::Script,
+        }
+    }
+
+    fn dictionary(self) -> Dictionary {
+        match self {
+            Effort::Exact | Effort::Typos => Dictionary::Ignored,
+            _ => Dictionary::Known,
+        }
+    }
+
+    fn folding(self) -> Folding {
+        match self {
+            Effort::Exact | Effort::Typos | Effort::Spelling => Folding::Untouched,
+            Effort::Accents => Folding::Accents,
+            Effort::Sounds => Folding::Sounds,
+            Effort::Scripts | Effort::Deep => Folding::Scripts,
+        }
+    }
+}
+
+// endregion: Effort
+
+// region: Folding
+
+/// The writing system the queries are written in.
+///
+/// One detection serves two decisions that were previously taken separately and could disagree: a
+/// Cyrillic query picked a Cyrillic keyboard but was never offered `Cyrillic-Latin`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Script {
+    Latin,
+    Cyrillic,
+    Greek,
+    Armenian,
+    Hebrew,
+    Arabic,
+    Han,
+    Hangul,
+    Kana,
+}
+
+impl Script {
+    /// The script one codepoint belongs to, or `None` for digits, punctuation and spacing.
+    ///
+    /// Ranges rather than a table: the nine scripts a layout or a transform exists for are worth
+    /// naming, and everything else is noise a query carries rather than a script it is in.
+    fn of_codepoint(codepoint: char) -> Option<Script> {
+        match codepoint as u32 {
+            0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F => Some(Script::Latin),
+            0x0370..=0x03FF | 0x1F00..=0x1FFF => Some(Script::Greek),
+            0x0400..=0x04FF | 0x0500..=0x052F => Some(Script::Cyrillic),
+            0x0530..=0x058F => Some(Script::Armenian),
+            0x0590..=0x05FF => Some(Script::Hebrew),
+            0x0600..=0x06FF | 0x0750..=0x077F => Some(Script::Arabic),
+            0x3040..=0x30FF | 0x31F0..=0x31FF => Some(Script::Kana),
+            0x1100..=0x11FF | 0xAC00..=0xD7AF | 0x3130..=0x318F => Some(Script::Hangul),
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => Some(Script::Han),
+            _ => None,
+        }
+    }
+
+    /// The script most of the queries' letters are in, in one pass over them.
+    ///
+    /// Latin is the fallback rather than an error, since a query of digits and punctuation names no
+    /// script and the Latin layout is the one that can type it.
+    fn of(patterns: &[String]) -> Script {
+        let mut tallies = [0usize; 9];
+        for pattern in patterns {
+            for codepoint in pattern.chars() {
+                if let Some(script) = Script::of_codepoint(codepoint) {
+                    tallies[script.index()] += 1;
+                }
+            }
+        }
+        // Kana and Han mix freely in Japanese, and only one of them needs transliterating: kana
+        // already spells the sound, where a Han character does not. So any Han at all decides,
+        // however much kana surrounds it, and kana answers only when no Han appears.
+        if tallies[Script::Han.index()] > 0 {
+            return Script::Han;
+        }
+        if tallies[Script::Kana.index()] > 0 {
+            return Script::Kana;
+        }
+        Script::ALL
+            .iter()
+            .copied()
+            .max_by_key(|script| tallies[script.index()])
+            .filter(|script| tallies[script.index()] > 0)
+            .unwrap_or(Script::Latin)
+    }
+
+    /// Every script, in the order ties break: earlier wins, and Latin leads so an ASCII query never
+    /// drifts onto a lookalike.
+    const ALL: [Script; 9] = [
+        Script::Latin,
+        Script::Cyrillic,
+        Script::Greek,
+        Script::Armenian,
+        Script::Hebrew,
+        Script::Arabic,
+        Script::Han,
+        Script::Hangul,
+        Script::Kana,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Script::Latin => 0,
+            Script::Cyrillic => 1,
+            Script::Greek => 2,
+            Script::Armenian => 3,
+            Script::Hebrew => 4,
+            Script::Arabic => 5,
+            Script::Han => 6,
+            Script::Hangul => 7,
+            Script::Kana => 8,
+        }
+    }
+
+    /// The XKB layout whose keys carry this script, for `Alphabet::Keyboard`.
+    ///
+    /// Han and Hangul are typed through an input method rather than off a layout, so their edits
+    /// are drawn from the Latin keys their romanization is typed on.
+    fn layout(self) -> &'static str {
+        match self {
+            Script::Latin | Script::Han | Script::Hangul => "us",
+            Script::Cyrillic => "ru",
+            Script::Greek => "gr",
+            Script::Armenian => "am",
+            Script::Hebrew => "il",
+            Script::Arabic => "ara",
+            Script::Kana => "jp",
+        }
+    }
+
+    /// The transform that carries this script to Latin, and `None` where it already is.
+    fn transliteration(self) -> Option<&'static str> {
+        match self {
+            Script::Latin => None,
+            Script::Cyrillic => Some("Cyrillic-Latin"),
+            Script::Greek => Some("Greek-Latin"),
+            Script::Han => Some("Han-Latin"),
+            // No table ships for these yet, so naming one would fail the run rather than widen it.
+            Script::Armenian | Script::Hebrew | Script::Arabic | Script::Hangul | Script::Kana => {
+                None
+            }
+        }
+    }
+}
+
+/// What a rung asks a fold to achieve, before the query's script says which transform delivers it.
+///
+/// Each level is a superset of the one above, which is what keeps the effort ladder monotone.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+enum Folding {
+    /// Corpus and query are matched in the bytes the user typed.
+    #[default]
+    Untouched,
+    /// Diacritics and compatibility forms collapse onto their base letters.
+    Accents,
+    /// Letters that sound alike collapse onto one spelling.
+    Sounds,
+    /// A non-Latin query is carried onto Latin before either of the above.
+    Scripts,
+}
+
+impl Folding {
+    /// The transforms this level applies, in the order they feed each other.
+    ///
+    /// Transliteration leads: `Latin-Phonetic` has nothing to act on until the script transform has
+    /// produced a Latin syllable for it.
+    fn transforms(self, script: Script) -> Vec<&'static str> {
+        let mut chain = Vec::new();
+        if self == Folding::Scripts {
+            chain.extend(script.transliteration());
+        }
+        if self >= Folding::Accents {
+            chain.push("Latin-ASCII");
+        }
+        if self >= Folding::Sounds {
+            chain.push("Latin-Phonetic");
+        }
+        chain
+    }
+}
+
+/// The transforms a run folds through: the ones `--fold` named, or the ones the level implies.
+///
+/// An empty result is the zero-cost case, and it is what every effort below `Folding::Accents`
+/// produces without `--fold` naming anything.
+fn resolve_folds(named: &[String], folding: Folding, script: Script) -> Result<Vec<Fold>, Failure> {
+    let wanted: Vec<String> = match named.is_empty() {
+        false => named.to_vec(),
+        true => folding
+            .transforms(script)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    };
+    let mut folds = Vec::with_capacity(wanted.len());
+    for name in wanted {
+        let fold = Fold::load(&name);
+        if fold.is_empty() {
+            return Err(Failure::Unresolved {
+                path: name,
+                subject: "CLDR transform".to_string(),
+                note: "pass --fold with an embedded transform, such as Han-Latin or Latin-ASCII",
+            });
+        }
+        folds.push(fold);
+    }
+    Ok(folds)
+}
+
+// endregion: Folding
+
 // region: Vocabulary
 
 /// Where an edit's replacement characters come from.
@@ -240,6 +498,23 @@ struct SearchConfig {
     top: Option<usize>,
 }
 
+impl SearchConfig {
+    /// The rung's settings with every expert flag layered over it, so `--max-distance` and its
+    /// neighbours mean the same thing whatever `--effort` was, and the rung only fills the gaps.
+    fn resolve(args: &Args, effort: Effort) -> Self {
+        let case_sensitivity = args.ignore_case.unwrap_or(CaseSensitivity::Uncased);
+        Self {
+            max_distance: args.max_distance.unwrap_or(effort.max_distance()),
+            alphabet: args.cost.map_or(effort.alphabet(), Cost::alphabet),
+            dictionary: args.dictionary.unwrap_or(effort.dictionary()),
+            case_sensitivity,
+            utf8: args.utf8 || case_sensitivity == CaseSensitivity::Uncased,
+            floor: args.min_score.unwrap_or(0.0),
+            top: args.top_k,
+        }
+    }
+}
+
 /// The pooled dictionary, the automaton compiled from it, and the device that walks it.
 ///
 /// One engine serves the whole run: every `--pattern` contributes its variants to a single
@@ -258,14 +533,16 @@ impl Engine {
         patterns: &[String],
         config: &SearchConfig,
         keyboard: &Keyboard,
-        fold: Option<&Fold>,
+        folds: &[Fold],
         device: DeviceScope,
     ) -> Result<Self, Failure> {
         // The query is folded first, so the ball is built in the domain the corpus will be matched
         // in rather than in the one the user typed.
-        let folder = match fold {
-            Some(fold) => Some(Folder::new(&device, fold, config.case_sensitivity)?),
-            None => None,
+        // An empty chain is no chain: no automaton is compiled, no rewrite runs, and no offset
+        // map can exist to be consulted later.
+        let folder = match folds.is_empty() {
+            true => None,
+            false => Some(Folder::new(&device, folds, config.case_sensitivity)?),
         };
         let patterns: Vec<String> = match &folder {
             Some(folder) => {
@@ -359,12 +636,13 @@ impl Engine {
         Ok(scores)
     }
 
-    /// Locate the variants inside lines that already scored, for the output modes that show spans.
+    /// Count and find in one place, over whatever haystacks the caller hands in.
     ///
-    /// Deliberately a second, much smaller walk: sizing a match buffer needs a prior count, and
-    /// paying for both over the whole corpus would triple the work to answer a question only a few
-    /// hundred lines ever ask.
-    fn locate(&self, survivors: &[&[u8]]) -> Result<Vec<SubstringsMatch>, Failure> {
+    /// Deliberately a second, much smaller walk than scoring: sizing a match buffer needs a prior
+    /// count, and paying for both over the whole corpus would triple the work to answer a question
+    /// only a few hundred lines ever ask.
+    fn find(&self, haystacks_bytes: &[&[u8]]) -> Result<Vec<SubstringsMatch>, Failure> {
+        let survivors = haystacks_bytes;
         if survivors.is_empty() {
             return Ok(Vec::new());
         }
@@ -399,22 +677,77 @@ impl Engine {
         matches.truncate(found);
         Ok(matches)
     }
+
+    /// Locate the variants inside lines that already scored, always in the caller's own bytes.
+    ///
+    /// The domain the automaton walked is this method's business alone: an output mode receives
+    /// spans it can slice directly and never learns whether a fold ran.
+    fn locate(&self, survivors: &[&[u8]]) -> Result<Vec<Located>, Failure> {
+        match &self.folder {
+            // Matched domain and printed domain agree, so the automaton's own offsets already
+            // answer and no map exists to consult.
+            None => Ok(self
+                .find(survivors)?
+                .into_iter()
+                .map(Located::verbatim)
+                .collect()),
+            // The automaton was compiled from folded needles, so it has to be shown folded bytes.
+            // Handing it the originals is what made `--show matches` under a fold report a subset.
+            Some(folder) => {
+                let folded = folder.apply(&self.device, survivors)?;
+                let borrowed: Vec<&[u8]> = folded.iter().map(Vec::as_slice).collect();
+                let rewrites = folder.rewrites(&self.device, survivors)?;
+                Ok(self
+                    .find(&borrowed)?
+                    .into_iter()
+                    .map(|found| rewrites.located(found))
+                    .collect())
+            }
+        }
+    }
+}
+
+/// One located span, in the original bytes of the line it was found in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Located {
+    line_index: usize,
+    byte_offset: usize,
+    byte_length: usize,
+}
+
+impl Located {
+    /// A match found in the same bytes that will be printed, so its offsets already answer.
+    fn verbatim(found: SubstringsMatch) -> Self {
+        Self {
+            line_index: found.haystack_index,
+            byte_offset: found.byte_offset,
+            byte_length: found.byte_length,
+        }
+    }
 }
 
 /// Whether the embedded misspelling table contributes variants.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Dictionary {
+    /// The embedded misspellings contribute nothing.
     Ignored,
+    /// A recorded misspelling of the query becomes a variant of it.
     Known,
 }
 
-/// A CLDR transform compiled into a rewrite, applied to corpus and query alike.
-///
-/// Folding is what lets a Han needle reach a Han corpus through pinyin, and it is a rewrite rather
-/// than a comparison so the automaton downstream never learns the transform exists.
-struct Folder {
+/// One transform compiled into a rewrite.
+struct Stage {
     automaton: Substrings,
     targets: Vec<String>,
+}
+
+/// The transforms a run folds through, in order, applied to corpus and query alike.
+///
+/// A sequence rather than one merged dictionary, because the transforms feed each other:
+/// `Latin-Phonetic` has nothing to act on until `Han-Latin` has produced a Latin syllable for it,
+/// and a merged automaton would let only one of them fire at each position.
+struct Folder {
+    stages: Vec<Stage>,
 }
 
 impl Folder {
@@ -424,19 +757,50 @@ impl Folder {
     /// inserted verbatim, which puts both spellings in one place.
     fn new(
         device: &DeviceScope,
-        fold: &Fold,
+        folds: &[Fold],
         case_sensitivity: CaseSensitivity,
     ) -> Result<Self, Failure> {
-        let automaton = Substrings::new(device, &fold.sources, case_sensitivity)
-            .map_err(|error| engine_failure("fold", error))?;
-        Ok(Self {
-            automaton,
-            targets: fold.targets.clone(),
-        })
+        let mut stages = Vec::with_capacity(folds.len());
+        for fold in folds {
+            stages.push(Stage {
+                automaton: Substrings::new(device, &fold.sources, case_sensitivity)
+                    .map_err(|error| engine_failure("fold", error))?,
+                targets: fold.targets.clone(),
+            });
+        }
+        Ok(Self { stages })
     }
 
-    /// Rewrite every haystack, returning owned bytes since the product is a new tape.
+    /// Rewrite every haystack through every stage in turn, returning owned bytes since the product
+    /// of a rewrite is a new tape.
     fn apply(&self, device: &DeviceScope, lines: &[&[u8]]) -> Result<Vec<Vec<u8>>, Failure> {
+        let mut carried: Vec<Vec<u8>> = lines.iter().map(|line| line.to_vec()).collect();
+        for stage in &self.stages {
+            let borrowed: Vec<&[u8]> = carried.iter().map(Vec::as_slice).collect();
+            carried = stage.rewrite(device, &borrowed)?;
+        }
+        Ok(carried)
+    }
+
+    /// Where every stage rewrote these lines, as the map from the folded bytes back to the caller's.
+    ///
+    /// Built only when an output mode asks for spans, and only over the lines that already scored -
+    /// a corpus-wide map of `Han-Latin` would run several times the size of the corpus itself.
+    fn rewrites(&self, device: &DeviceScope, lines: &[&[u8]]) -> Result<Rewrites, Failure> {
+        let mut stages = Vec::with_capacity(self.stages.len());
+        let mut carried: Vec<Vec<u8>> = lines.iter().map(|line| line.to_vec()).collect();
+        for stage in &self.stages {
+            let borrowed: Vec<&[u8]> = carried.iter().map(Vec::as_slice).collect();
+            stages.push(stage.sites(device, &borrowed)?);
+            carried = stage.rewrite(device, &borrowed)?;
+        }
+        Ok(Rewrites { stages })
+    }
+}
+
+impl Stage {
+    /// This stage's rewrite of every haystack.
+    fn rewrite(&self, device: &DeviceScope, lines: &[&[u8]]) -> Result<Vec<Vec<u8>>, Failure> {
         if lines.is_empty() {
             return Ok(Vec::new());
         }
@@ -464,6 +828,155 @@ impl Folder {
         Ok((0..lines.len())
             .map(|index| data[offsets[index]..offsets[index + 1]].to_vec())
             .collect())
+    }
+
+    /// Where this stage fires, in the coordinates of the bytes handed to it.
+    ///
+    /// The same `LeftmostLongest` cover the rewrite uses, so the sites found here are exactly the
+    /// substitutions that happened.
+    fn sites(&self, device: &DeviceScope, lines: &[&[u8]]) -> Result<StageMap, Failure> {
+        let mut sites = Vec::new();
+        let mut starts = vec![0usize; lines.len() + 1];
+        if lines.is_empty() {
+            return Ok(StageMap { sites, starts });
+        }
+
+        let haystacks = AnyBytesTape::from_sequences(lines)
+            .map_err(|error| engine_failure("fold staging", error))?;
+        let mut counts = vec![0usize; lines.len()];
+        let total = self
+            .automaton
+            .count_into(
+                device,
+                &haystacks,
+                OverlapPolicy::LeftmostLongest,
+                &mut counts,
+            )
+            .map_err(|error| engine_failure("fold counting", error))?;
+        let mut found = vec![SubstringsMatch::default(); total];
+        let written = self
+            .automaton
+            .find_into(
+                device,
+                &haystacks,
+                OverlapPolicy::LeftmostLongest,
+                &mut found,
+            )
+            .map_err(|error| engine_failure("fold locating", error))?;
+        found.truncate(written);
+        // The walk emits in order of match ends and interleaves haystacks, so the ascending order
+        // the drift arithmetic needs has to be asked for.
+        found.sort_unstable_by_key(|one| (one.haystack_index, one.byte_offset));
+
+        let mut line = 0usize;
+        let mut drift: i64 = 0;
+        for one in found {
+            while line < one.haystack_index {
+                starts[line + 1] = sites.len();
+                line += 1;
+                drift = 0;
+            }
+            // Under case folding a needle's own length is not the match's - a one-byte needle
+            // matches a three-byte Kelvin sign - so the consumed length comes from the match and the
+            // produced length from the replacement.
+            let produced = self.targets[one.needle_index].len();
+            sites.push(Site {
+                folded_offset: (one.byte_offset as i64 + drift) as usize,
+                folded_length: produced,
+                original_offset: one.byte_offset,
+                original_length: one.byte_length,
+            });
+            drift += produced as i64 - one.byte_length as i64;
+        }
+        for tail in line..lines.len() {
+            starts[tail + 1] = sites.len();
+        }
+        Ok(StageMap { sites, starts })
+    }
+}
+
+/// One place a stage rewrote, as the two spans that define the map there.
+#[derive(Clone, Copy)]
+struct Site {
+    folded_offset: usize,
+    folded_length: usize,
+    original_offset: usize,
+    original_length: usize,
+}
+
+/// Which end of a span an offset is, since a boundary landing inside a rewrite widens outward.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Edge {
+    Start,
+    End,
+}
+
+/// One stage's sites, grouped by line.
+struct StageMap {
+    sites: Vec<Site>,
+    /// `sites[starts[line]..starts[line + 1]]` are one line's, in ascending offset order.
+    starts: Vec<usize>,
+}
+
+impl StageMap {
+    /// Where an offset in this stage's output sits in its input.
+    ///
+    /// Between rewrites the two domains advance in lockstep and the drift alone answers. Strictly
+    /// inside one, the offset names a byte of a replacement that no input byte corresponds to, so
+    /// the region is claimed whole: a start falls back to its first input byte and an end runs past
+    /// its last. Snapping outward is what keeps `end >= start` and keeps a reported span from
+    /// naming half a syllable that was never in the file.
+    fn backward(&self, line: usize, folded: usize, edge: Edge) -> usize {
+        let sites = &self.sites[self.starts[line]..self.starts[line + 1]];
+        let above = sites.partition_point(|site| site.folded_offset <= folded);
+        let Some(index) = above.checked_sub(1) else {
+            return folded;
+        };
+        let site = sites[index];
+        let folded_end = site.folded_offset + site.folded_length;
+        let original_end = site.original_offset + site.original_length;
+        if folded < folded_end {
+            return match edge {
+                Edge::Start => site.original_offset,
+                Edge::End => original_end,
+            };
+        }
+        if folded == folded_end && site.folded_length == 0 {
+            // A deleting rule leaves a zero-width mark, so the offset is both on the site and after
+            // it, and only the edge says which of its input boundaries it names.
+            return match edge {
+                Edge::Start => site.original_offset,
+                Edge::End => original_end,
+            };
+        }
+        original_end + (folded - folded_end)
+    }
+}
+
+/// The whole chain's map, from the bytes the automaton walked back to the caller's own.
+struct Rewrites {
+    stages: Vec<StageMap>,
+}
+
+impl Rewrites {
+    /// Carry one offset back through every stage, last applied first.
+    fn backward(&self, line: usize, folded: usize, edge: Edge) -> usize {
+        self.stages
+            .iter()
+            .rev()
+            .fold(folded, |offset, stage| stage.backward(line, offset, edge))
+    }
+
+    /// Carry a whole match back, so the caller receives a span it can slice directly.
+    fn located(&self, found: SubstringsMatch) -> Located {
+        let line = found.haystack_index;
+        let start = self.backward(line, found.byte_offset, Edge::Start);
+        let end = self.backward(line, found.byte_offset + found.byte_length, Edge::End);
+        Located {
+            line_index: line,
+            byte_offset: start,
+            byte_length: end.saturating_sub(start),
+        }
     }
 }
 
@@ -588,7 +1101,11 @@ struct Args {
     #[arg(id = "pattern_flag", long = "pattern", value_name = "PATTERN")]
     extra: Vec<String>,
 
-    /// Maximum edit distance, in code points under --utf8 [default: 1]
+    /// How hard to try; higher rungs match more and cost more
+    #[arg(long, value_enum)]
+    effort: Option<Effort>,
+
+    /// Maximum edit distance, in code points under --utf8; overrides --effort
     #[arg(long)]
     max_distance: Option<usize>,
 
@@ -600,13 +1117,13 @@ struct Args {
     #[arg(long, value_name = "LAYOUT")]
     layout: Option<String>,
 
-    /// Fold corpus and query through a CLDR transform first, such as Han-Latin
+    /// Fold corpus and query through a CLDR transform first, such as Han-Latin (repeatable)
     #[arg(long, value_name = "TRANSFORM")]
-    fold: Option<String>,
+    fold: Vec<String>,
 
-    /// Also match the recorded misspellings of the query
-    #[arg(long)]
-    dictionary: bool,
+    /// Also match the recorded misspellings of the query; overrides --effort
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "known", value_name = "USE")]
+    dictionary: Option<Dictionary>,
 
     /// Keep only the N best-scoring lines per input, ranked by BM25
     #[arg(long, value_name = "N")]
@@ -628,9 +1145,15 @@ struct Args {
     #[arg(long, requires = "device")]
     gpu_id: Option<usize>,
 
-    /// Case-insensitive search with full Unicode folding; implies --utf8
-    #[arg(long)]
-    ignore_case: bool,
+    /// Case-insensitive search with full Unicode folding; implies --utf8 [default: 1]
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        value_name = "ON",
+        value_parser = parse_case_sensitivity
+    )]
+    ignore_case: Option<CaseSensitivity>,
 
     /// Which columns each record carries, comma-separated; none by default
     #[arg(
@@ -664,6 +1187,17 @@ struct Args {
     /// Suppress all output; exit 0 if any match was found, 1 otherwise
     #[arg(long, conflicts_with_all = ["show", "format", "null", "fields", "summary"], help_heading = "Output Formats")]
     quiet: bool,
+}
+
+/// Read `--ignore-case`'s optional value. Named states rather than a bare `bool`, and the flag
+/// keeps the name it has in `sz-find`, `sz-replace`, `sz-dedup` and `sz-sort` while defaulting the
+/// other way here: a fuzzy search that respected case would refuse the first thing anyone tries.
+fn parse_case_sensitivity(text: &str) -> Result<CaseSensitivity, String> {
+    match text {
+        "1" | "true" | "yes" | "on" => Ok(CaseSensitivity::Uncased),
+        "0" | "false" | "no" | "off" => Ok(CaseSensitivity::Cased),
+        other => Err(format!("`{other}` is not 0 or 1")),
+    }
 }
 
 /// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
@@ -739,12 +1273,13 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
 
     // The layout decides which characters count as adjacent, so it is resolved before the ball is
     // built and named explicitly when detection would have to guess.
-    let layout = match args.layout.clone() {
-        Some(named) => named,
-        None => Keyboard::detect(&patterns.join("")),
-    };
+    let script = Script::of(&patterns);
+    let layout = args
+        .layout
+        .clone()
+        .unwrap_or_else(|| script.layout().to_string());
     let keyboard = Keyboard::load(&layout);
-    let cost = args.cost.unwrap_or(Cost::Edit);
+    let effort = args.effort.unwrap_or_default();
     if keyboard.is_empty() {
         return Err(Failure::Unresolved {
             path: layout,
@@ -760,41 +1295,10 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     )
     .map_err(|message| reject(&message))?;
 
-    // A fold rewrites both sides, so a match has no span in the original bytes to report.
-    let fold = match args.fold.as_deref() {
-        Some(name) => {
-            let fold = Fold::load(name);
-            if fold.is_empty() {
-                return Err(Failure::Unresolved {
-                    path: name.to_string(),
-                    subject: "CLDR transform".to_string(),
-                    note:
-                        "pass --fold with an embedded transform, such as Han-Latin or Latin-ASCII",
-                });
-            }
-            Some(fold)
-        }
-        None => None,
-    };
+    let folds = resolve_folds(&args.fold, effort.folding(), script)?;
 
-    let config = SearchConfig {
-        max_distance: args.max_distance.unwrap_or(1),
-        alphabet: cost.alphabet(),
-        case_sensitivity: if args.ignore_case {
-            CaseSensitivity::Uncased
-        } else {
-            CaseSensitivity::Cased
-        },
-        utf8: args.utf8 || args.ignore_case,
-        dictionary: if args.dictionary {
-            Dictionary::Known
-        } else {
-            Dictionary::Ignored
-        },
-        floor: args.min_score.unwrap_or(0.0),
-        top: args.top_k,
-    };
-    let engine = Engine::build(&patterns, &config, &keyboard, fold.as_ref(), device)?;
+    let config = SearchConfig::resolve(args, effort);
+    let engine = Engine::build(&patterns, &config, &keyboard, &folds, device)?;
 
     let output_config = OutputConfig {
         line_numbers: args.fields.contains(&Field::LineNumbers),
@@ -925,9 +1429,9 @@ fn search_inputs<'a>(
             Show::Matches => {
                 let lines: Vec<&[u8]> = survivors.iter().map(|(_, line, _)| *line).collect();
                 for located in engine.locate(&lines)? {
-                    let (index, line, score) = survivors[located.haystack_index];
-                    let span = &line[located.byte_offset
-                        ..located.byte_offset.saturating_add(located.byte_length)];
+                    let (index, line, score) = survivors[located.line_index];
+                    let span =
+                        &line[located.byte_offset..located.byte_offset + located.byte_length];
                     write_match(output, out_cfg, path, index + 1, span, score).at(path)?;
                 }
             }
@@ -1058,6 +1562,7 @@ mod tests {
             longs,
             [
                 "pattern",
+                "effort",
                 "max-distance",
                 "cost",
                 "layout",
@@ -1283,14 +1788,27 @@ mod tests {
     }
 
     #[test]
-    fn detects_a_layout_from_the_pattern_script() {
-        assert_eq!(Keyboard::detect("washington"), "us");
-        // A Cyrillic needle must not land on a Latin keyboard, where it has no neighbours at all.
-        let detected = Keyboard::detect("правительство");
-        assert!(
-            Keyboard::load(&detected).near('п').len() > 0,
-            "detected {detected} carries no Cyrillic"
-        );
+    fn detects_the_script_the_query_is_written_in() {
+        let one = |pattern: &str| Script::of(&[pattern.to_string()]);
+        assert_eq!(one("washington"), Script::Latin);
+        assert_eq!(one("правительство"), Script::Cyrillic);
+        assert_eq!(one("Հայաստան"), Script::Armenian);
+        assert_eq!(one("北京大学"), Script::Han);
+        // Kana and Han mix in Japanese, and a query carrying both wants the Han reading folded.
+        assert_eq!(one("ひらがな"), Script::Kana);
+        assert_eq!(one("日本のひらがな"), Script::Han);
+        // A query naming no script at all is typed on the layout that can type it.
+        assert_eq!(one("2024"), Script::Latin);
+
+        // Every script must name a layout the embedded table actually carries, or `--cost keyboard`
+        // would silently have no neighbours to draw on.
+        for script in Script::ALL {
+            assert!(
+                !Keyboard::load(script.layout()).is_empty(),
+                "{script:?} names layout {} which is not embedded",
+                script.layout()
+            );
+        }
     }
 
     // endregion: Vocabulary
@@ -1315,7 +1833,7 @@ mod tests {
 
     fn matching_lines(patterns: &[&str], data: &[u8], config: &SearchConfig) -> Vec<String> {
         let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
-        let engine = Engine::build(&patterns, config, &us(), None, cpu()).expect("engine builds");
+        let engine = Engine::build(&patterns, config, &us(), &[], cpu()).expect("engine builds");
         let found = search_lines(data, &engine, config).expect("search runs");
         found
             .lines
@@ -1364,7 +1882,7 @@ mod tests {
         let data = b"the color red\nnothing here\n";
         let patterns = vec!["color".to_string()];
         let config = config(0);
-        let engine = Engine::build(&patterns, &config, &us(), None, cpu()).unwrap();
+        let engine = Engine::build(&patterns, &config, &us(), &[], cpu()).unwrap();
         let found = search_lines(data, &engine, &config).unwrap();
         let survivors: Vec<&[u8]> = found
             .lines
@@ -1375,7 +1893,7 @@ mod tests {
             .collect();
         let located = engine.locate(&survivors).unwrap();
         assert_eq!(located.len(), 1);
-        assert_eq!(located[0].haystack_index, 0);
+        assert_eq!(located[0].line_index, 0);
         assert_eq!(located[0].byte_offset, 4);
         assert_eq!(located[0].byte_length, 5);
     }
@@ -1384,7 +1902,7 @@ mod tests {
     fn keeps_matches_when_one_input_is_missing() {
         let patterns = vec!["color".to_string()];
         let config = config(1);
-        let engine = Engine::build(&patterns, &config, &us(), None, cpu()).unwrap();
+        let engine = Engine::build(&patterns, &config, &us(), &[], cpu()).unwrap();
         let out_cfg = OutputConfig {
             line_numbers: false,
             scores: false,
@@ -1414,6 +1932,205 @@ mod tests {
     }
 
     // endregion: Searching
+
+    // region: Effort and Folding
+
+    #[test]
+    fn climbs_the_ladder_without_ever_narrowing() {
+        // The one property that makes the ladder a ladder: every rung must match everything the
+        // rung below it matched, so raising --effort can only ever add lines.
+        let data = "color scheme\ncolour scheme\nkolor test\nr\u{e9}sum\u{e9} draft\n\
+                    resume draft\nunrelated line\n"
+            .as_bytes();
+        let ladder = [
+            Effort::Exact,
+            Effort::Typos,
+            Effort::Spelling,
+            Effort::Accents,
+            Effort::Sounds,
+        ];
+        let mut previous: Vec<String> = Vec::new();
+        for effort in ladder {
+            let matched = matched_at(effort, "color", data);
+            for line in &previous {
+                assert!(
+                    matched.contains(line),
+                    "{effort:?} dropped {line:?}, which {:?} had matched",
+                    ladder[0]
+                );
+            }
+            previous = matched;
+        }
+    }
+
+    #[test]
+    fn spends_nothing_on_folds_below_accents() {
+        // The executable form of the zero-cost claim: no fold is resolved, so no automaton is
+        // compiled, no rewrite runs and no offset map can exist.
+        for effort in [Effort::Exact, Effort::Typos, Effort::Spelling] {
+            let folds = resolve_folds(&[], effort.folding(), Script::Latin).unwrap();
+            assert!(folds.is_empty(), "{effort:?} resolved a fold");
+        }
+        for effort in [Effort::Accents, Effort::Sounds] {
+            let folds = resolve_folds(&[], effort.folding(), Script::Latin).unwrap();
+            assert!(!folds.is_empty(), "{effort:?} resolved no fold");
+        }
+    }
+
+    #[test]
+    fn widens_the_ball_one_rung_at_a_time() {
+        let ball = |effort: Effort| {
+            Vocabulary::build(
+                &["washington".to_string()],
+                effort.max_distance(),
+                effort.alphabet(),
+                &us(),
+                effort.dictionary(),
+            )
+            .needles
+            .len()
+        };
+        // Exact is the query and nothing else; every rung above widens.
+        assert_eq!(ball(Effort::Exact), 1);
+        assert!(ball(Effort::Typos) > ball(Effort::Exact));
+        assert!(ball(Effort::Spelling) > ball(Effort::Typos));
+        assert!(ball(Effort::Deep) > ball(Effort::Spelling));
+    }
+
+    #[test]
+    fn carries_spans_back_through_a_fold() {
+        // The defect this wave repairs: `locate` used to walk original bytes against an automaton
+        // compiled from folded needles, so it reported only the lines that happened to spell the
+        // folded form already.
+        let data = "phonetic analysis\nfonetik analysis\n".as_bytes();
+        let spans = spans_at(Effort::Sounds, "phonetic", data);
+        assert_eq!(spans, ["phonetic", "fonetik"]);
+    }
+
+    #[test]
+    fn snaps_a_span_outward_when_it_lands_inside_a_rewrite() {
+        // `ph` -> `f` makes the folded span shorter than the original, so an offset inside the
+        // rewrite has no original byte of its own and must claim the whole region.
+        let site = Site {
+            folded_offset: 4,
+            folded_length: 1,
+            original_offset: 4,
+            original_length: 2,
+        };
+        let map = StageMap {
+            sites: vec![site],
+            starts: vec![0, 1],
+        };
+        assert_eq!(map.backward(0, 4, Edge::Start), 4);
+        assert_eq!(map.backward(0, 4, Edge::End), 6);
+        assert_eq!(map.backward(0, 5, Edge::Start), 6);
+        // Past the site the domains advance in lockstep again, offset by the drift.
+        assert_eq!(map.backward(0, 6, Edge::End), 7);
+    }
+
+    #[test]
+    fn maps_a_deleting_rule_to_the_bytes_it_removed() {
+        // An empty replacement leaves a zero-width mark: the offset is both on the site and after
+        // it, and only the edge says which original boundary it names.
+        let map = StageMap {
+            sites: vec![Site {
+                folded_offset: 2,
+                folded_length: 0,
+                original_offset: 2,
+                original_length: 3,
+            }],
+            starts: vec![0, 1],
+        };
+        assert_eq!(map.backward(0, 2, Edge::Start), 2);
+        assert_eq!(map.backward(0, 2, Edge::End), 5);
+    }
+
+    #[test]
+    fn chains_transliteration_before_phonetics() {
+        // `Latin-Phonetic` has nothing to act on until the script transform has produced a Latin
+        // syllable, so the order is a property of the level rather than of the caller.
+        assert_eq!(
+            Folding::Scripts.transforms(Script::Han),
+            ["Han-Latin", "Latin-ASCII", "Latin-Phonetic"]
+        );
+        assert_eq!(
+            Folding::Untouched.transforms(Script::Han),
+            Vec::<&str>::new()
+        );
+        // A Latin query has nothing to transliterate, so the chain is shorter by one.
+        assert_eq!(
+            Folding::Scripts.transforms(Script::Latin),
+            ["Latin-ASCII", "Latin-Phonetic"]
+        );
+    }
+
+    #[test]
+    fn embeds_every_transform_the_ladder_names() {
+        for script in Script::ALL {
+            for folding in [Folding::Accents, Folding::Sounds, Folding::Scripts] {
+                let resolved = resolve_folds(&[], folding, script);
+                assert!(
+                    resolved.is_ok(),
+                    "{script:?} at {folding:?} names a transform that is not embedded"
+                );
+            }
+        }
+    }
+
+    /// The lines one effort matches, as owned strings so rungs can be compared against each other.
+    fn matched_at(effort: Effort, pattern: &str, data: &[u8]) -> Vec<String> {
+        let (engine, config) = engine_at(effort, pattern);
+        let found = search_lines(data, &engine, &config).expect("search runs");
+        found
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| found.matched(*index, 0.0))
+            .map(|(_, line)| String::from_utf8_lossy(line).into_owned())
+            .collect()
+    }
+
+    /// The matched spans one effort locates, sliced from the original lines.
+    fn spans_at(effort: Effort, pattern: &str, data: &[u8]) -> Vec<String> {
+        let (engine, config) = engine_at(effort, pattern);
+        let found = search_lines(data, &engine, &config).expect("search runs");
+        let survivors: Vec<&[u8]> = found
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| found.matched(*index, 0.0))
+            .map(|(_, line)| *line)
+            .collect();
+        engine
+            .locate(&survivors)
+            .expect("locate runs")
+            .into_iter()
+            .map(|one| {
+                let line = survivors[one.line_index];
+                String::from_utf8_lossy(&line[one.byte_offset..one.byte_offset + one.byte_length])
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    fn engine_at(effort: Effort, pattern: &str) -> (Engine, SearchConfig) {
+        let config = SearchConfig {
+            max_distance: effort.max_distance(),
+            alphabet: effort.alphabet(),
+            case_sensitivity: CaseSensitivity::Uncased,
+            utf8: true,
+            dictionary: effort.dictionary(),
+            floor: 0.0,
+            top: None,
+        };
+        let folds = resolve_folds(&[], effort.folding(), Script::Latin).expect("folds resolve");
+        let patterns = vec![pattern.to_string()];
+        let engine =
+            Engine::build(&patterns, &config, &us(), &folds, cpu()).expect("engine builds");
+        (engine, config)
+    }
+
+    // endregion: Effort and Folding
 }
 
 // endregion: Tests

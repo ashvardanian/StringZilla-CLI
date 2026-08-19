@@ -4,10 +4,19 @@
 //! the Unicode CLDR transform rules at <https://github.com/unicode-org/cldr/tree/main/common/transforms>,
 //! under the Unicode License v3, which is permissive and compatible with this crate's Apache-2.0.
 //!
-//! `Latin-Phonetic` is authored here from the published Metaphone algorithm rather than extracted
-//! from any data file, so it carries no third-party licence at all. It is a context-free
-//! approximation: `c`, `q` and `g` all collapse onto `k`, which is what lets `Gaddafi` and
-//! `Qaddafi` meet and is also the lossiest step in the table.
+//! `Kana-Latin` is CLDR's `Katakana-Latin-BGN` with the hiragana half composed in: CLDR ships
+//! `Hiragana-Latin` only as a compound of two transforms, and one fold is one leftmost-longest walk
+//! that cannot feed itself, so each hiragana rule is written out against its katakana counterpart.
+//!
+//! `Latin-Phonetic`, `Pinyin-Fuzzy`, `Cologne-Phonetic` and `Daitch-Mokotoff` are authored here
+//! from published algorithms rather than extracted from any data file, so they carry no third-party
+//! licence at all. Each is a context-free approximation of a context-sensitive original.
+//!
+//! The three phonetic models are alternatives to one another, not layers: `Latin-Phonetic` follows
+//! Metaphone, `Cologne-Phonetic` follows Kölner Phonetik for German, and `Daitch-Mokotoff` is built
+//! for Slavic and Germanic surnames spelled across scripts. Stacking two of them would collapse
+//! distinctions neither drops alone, so only the first is reached by `--effort` and the other two
+//! are named explicitly with `--fold`.
 //!
 //! CLDR's rule language is context-sensitive in general - `$vowel { x } $consonant → y` - so only
 //! the context-free subset compiles into a plain replace dictionary. That subset is nearly all of

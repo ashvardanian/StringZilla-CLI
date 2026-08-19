@@ -12,7 +12,7 @@
 //! characters onto keys. That is why a table this small covers Latin, Cyrillic, Greek, Hebrew and
 //! Arabic alike.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Physical key adjacency for every layout the extractor below could resolve, as
 /// `layout<TAB>character<TAB>neighbours` rows.
@@ -58,36 +58,6 @@ impl Keyboard {
             .collect();
         names.dedup();
         names
-    }
-
-    /// Pick the layout whose alphabet covers most of `pattern`, so a Cyrillic needle reaches a
-    /// Cyrillic keyboard without the caller naming one. Ties keep the earlier name, and `us` is
-    /// tried first so a plain ASCII needle never drifts onto a lookalike layout.
-    pub fn detect(pattern: &str) -> String {
-        let wanted: BTreeSet<char> = pattern
-            .to_lowercase()
-            .chars()
-            .filter(|character| character.is_alphabetic())
-            .collect();
-        let coverage = |layout: &str| {
-            Keyboard::load(layout)
-                .neighbours
-                .keys()
-                .filter(|character| wanted.contains(character))
-                .count()
-        };
-
-        // `us` is the baseline rather than a zero, so every layout that merely ties it - which is
-        // every Latin layout on an ASCII needle - leaves the choice alone. Only a script `us` cannot
-        // type at all, such as Cyrillic or Greek, covers strictly more and takes over.
-        let mut best = ("us".to_string(), coverage("us"));
-        for layout in Keyboard::known_layouts() {
-            let covered = coverage(layout);
-            if covered > best.1 {
-                best = (layout.to_string(), covered);
-            }
-        }
-        best.0
     }
 
     pub fn is_empty(&self) -> bool {
