@@ -58,6 +58,17 @@ if [ -n "$staged_rust" ]; then
         exit 1
     fi
 
+    # `clippy::needless_collect` cannot see a `.collect()` whose result is indexed, zipped, or
+    # stored, which is every one that survives in this tree. The commit's own diff says what is
+    # new, so nothing has to be counted or kept in step.
+    if added=$(git diff --cached -U0 -- '*.rs' \
+        | grep -E '^\+' | grep -v '^+++' | grep -n '\.collect()'); then
+        echo "note: this commit adds .collect():" >&2
+        printf '%s\n' "$added" >&2
+        echo "      Materialize only for indexing, len(), a second pass, an outliving borrow," >&2
+        echo "      or a whole-set operation. Otherwise compose the iterator." >&2
+    fi
+
     # No `-D warnings` here: the `[lints.clippy]` table already says which lints block and
     # which only inform, and promoting the informative ones would overrule it.
     if ! clippy=$(cargo clippy --bins --lib 2>&1); then
