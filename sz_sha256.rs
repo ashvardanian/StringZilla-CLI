@@ -2027,14 +2027,14 @@ fn parse_check_line(line: &[u8]) -> Option<CheckLine<'_>> {
     }
 
     let mut digest = [0u8; 32];
-    for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
+    for (byte, &[high, low]) in digest.iter_mut().zip(hex.as_chunks::<2>().0) {
         let value = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
             b'A'..=b'F' => Some(byte - b'A' + 10),
             _ => None,
         };
-        digest[index] = (value(pair[0])? << 4) | value(pair[1])?;
+        *byte = (value(high)? << 4) | value(low)?;
     }
 
     // The manifest holds the name's bytes, so it is rebuilt from them: rendering it through

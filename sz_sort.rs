@@ -4,20 +4,15 @@
 //! `--utf8` decides only which terminators end a line. `--ignore-case` is the exception: it orders
 //! through `utf8_uncased_order`, full Unicode folding rather than a byte compare.
 //!
-//! Lines are held in a `BytesCowsAuto` borrowing the input buffer, which packs an offset and a
-//! length per line and sizes both from the data. A `Vec<&[u8]>` would spend 16 bytes per line on
-//! fat pointers against 5 or 6 for the packed entry, which over a large file outweighs the input
-//! itself. The v6 sorting API takes a slice, so this adapter also holds 16 bytes per line in
-//! temporary borrowed slices while computing the permutation.
+//! Lines borrow the input through the slice table consumed by StringZilla's sorting API.
+//! Sorting holds one 16-byte reference and one permutation index per line on 64-bit systems.
 //!
 //! Exit: 0 wrote a line, 1 wrote none or `--is-sorted` found the input unsorted, 2 could not run.
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::io::{self, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringtape::{BytesCowsAuto, StringTapeError};
 use stringzilla::sz;
 
 use shared::*;
@@ -71,49 +66,14 @@ impl SortOrder {
 
 /// A re-runnable view of one buffer's lines.
 ///
-/// `BytesCowsAuto::from_iter_and_data` walks its input twice — once to size the
-/// offset and length types, once to record them — so it takes a `Clone` iterable
-/// rather than a one-shot iterator. Splitting twice costs one extra SIMD pass and
-/// avoids materializing the slices at all.
-#[derive(Clone, Copy)]
-struct Lines<'a> {
-    data: &'a [u8],
-    newlines: Newlines,
+fn collect_lines(data: &[u8], newlines: Newlines) -> Vec<&[u8]> {
+    LineIter::new(data, newlines).collect()
 }
 
-impl<'a> IntoIterator for Lines<'a> {
-    type Item = &'a [u8];
-    type IntoIter = LineIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        LineIter::new(self.data, self.newlines)
-    }
-}
-
-/// Collect the input's lines into packed (offset, length) entries borrowing `data`.
-fn collect_lines(data: &[u8], newlines: Newlines) -> Result<BytesCowsAuto<'_>, StringTapeError> {
-    BytesCowsAuto::from_iter_and_data(Lines { data, newlines }, Cow::Borrowed(data))
-}
-
-/// The line at `index`. Indices come from a permutation as long as `lines`, so an
-/// index outside it is a bug here rather than a bad input.
-#[inline]
-fn line_at<'a>(lines: &'a BytesCowsAuto<'a>, index: usize) -> &'a [u8] {
-    lines.get(index).expect("permutation index within lines")
-}
-
-/// Compute the sorted permutation directly via StringZilla's `argsort`, which folds
-/// case and reverses inside the kernel — so the case-insensitive path never
-/// materializes a folded key per line.
-fn sorted_order(
-    lines: &BytesCowsAuto<'_>,
-    order: SortOrder,
-) -> Result<Vec<sz::SortedIdx>, sz::Status> {
+/// Fold case and reverse inside the kernel without materializing keys.
+fn sorted_order(lines: &[&[u8]], order: SortOrder) -> Result<Vec<sz::SortedIdx>, sz::Status> {
     let mut permutation = vec![0usize; lines.len()];
-    let borrowed: Vec<&[u8]> = (0..lines.len())
-        .map(|index| line_at(lines, index))
-        .collect();
-    sz::argsort(&borrowed, &mut permutation, order.argsort_options())?;
+    sz::argsort(lines, &mut permutation, order.argsort_options())?;
     Ok(permutation)
 }
 
@@ -161,7 +121,7 @@ fn write_summary_json(
 /// Write the lines in permutation order, dropping adjacent equals under `--unique`.
 /// Returns how many lines were written.
 fn write_sorted(
-    lines: &BytesCowsAuto<'_>,
+    lines: &[&[u8]],
     permutation: &[sz::SortedIdx],
     order: SortOrder,
     config: &OutputConfig,
@@ -170,7 +130,7 @@ fn write_sorted(
     let mut previous: Option<&[u8]> = None;
     let mut emitted = 0;
     for &index in permutation {
-        let line = line_at(lines, index);
+        let line = lines[index];
         if config.unique
             && previous.is_some_and(|kept| order.compare(kept, line) == Ordering::Equal)
         {
@@ -332,9 +292,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         });
     }
 
-    let lines = collect_lines(data, newlines)
-        .map_err(|error| io::Error::other(format!("indexing lines: {:?}", error)))
-        .at(path)?;
+    let lines = collect_lines(data, newlines);
 
     let permutation = sorted_order(&lines, order)
         .map_err(|status| io::Error::other(format!("sorting: {:?}", status)))
@@ -393,8 +351,8 @@ mod tests {
         }
     }
 
-    fn lines_of(data: &[u8]) -> BytesCowsAuto<'_> {
-        collect_lines(data, Newlines::Lf).unwrap()
+    fn lines_of(data: &[u8]) -> Vec<&[u8]> {
+        collect_lines(data, Newlines::Lf)
     }
 
     fn sort_to_string(data: &[u8], reverse: bool, unique: bool, ignore_case: bool) -> String {

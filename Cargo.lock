@@ -423,15 +423,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "stringtape"
-version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c2ad8ddd435760c2439d6548e52bca5097890f3af26b3c417af3a87ed28e0fa"
-dependencies = [
- "allocator-api2",
-]
-
-[[package]]
 name = "stringzilla"
 version = "5.1.2"
 source = "git+https://github.com/ashvardanian/StringZilla?branch=main-v6#7826f358a51df3871fba5cc825ebab3e1163174a"
@@ -451,7 +442,6 @@ dependencies = [
  "io-uring",
  "libc",
  "memmap2",
- "stringtape",
  "stringzilla",
  "tempfile",
 ]

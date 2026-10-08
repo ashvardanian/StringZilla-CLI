@@ -41,7 +41,6 @@ forkunion = { git = "https://github.com/ashvardanian/ForkUnion", branch = "main-
 glob = "0.3" # Glob pattern matching
 ignore = "0.4" # .gitignore support
 memmap2 = "0.9" # Memory-mapped file I/O
-stringtape = "2.4" # Compact (offset, length) storage for line collections
 stringzilla = { git = "https://github.com/ashvardanian/StringZilla", branch = "main-v6" } # SIMD string ops and collection kernels
 
 [dev-dependencies]

@@ -626,8 +626,11 @@ impl<'a, 'stream> Corpus<'a, 'stream> {
         lines: impl Iterator<Item = &'b [u8]> + Clone,
     ) -> Result<Self, Failure> {
         // The first pass sizes the buffer and the second fills it without a temporary slice list.
-        let mut data = Vec::with_capacity(lines.clone().map(|line| line.len()).sum());
-        let mut offsets = Vec::with_capacity(lines.clone().count() + 1);
+        let (bytes, entries) = lines.clone().fold((0, 0), |(bytes, entries), line| {
+            (bytes + line.len(), entries + 1)
+        });
+        let mut data = Vec::with_capacity(bytes);
+        let mut offsets = Vec::with_capacity(entries + 1);
         for line in lines {
             offsets.push(data.len());
             data.extend_from_slice(line);
@@ -648,7 +651,7 @@ impl<'a, 'stream> Corpus<'a, 'stream> {
         // GPU kernels require v6's canonical tape. Keep it for all verbs on this corpus,
         // and keep host views for scoring lengths and output without per-line stream joins.
         // Rewritten buffers remain reusable after their staged copy is no longer needed.
-        let lines: Vec<&[u8]> = (0..self.len()).map(|index| self.line(index)).collect();
+        let lines: Vec<&[u8]> = self.iter().collect();
         let sequence = Sequence::copy(&lines, &UnifiedAllocator::new(stream), stream)
             .map_err(|error| engine_failure("corpus staging", error))?;
         stream
@@ -704,6 +707,13 @@ impl<'a, 'stream> Corpus<'a, 'stream> {
         }
     }
 
+    fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        let Lines { data, offsets } = self.host_lines();
+        offsets
+            .windows(2)
+            .map(move |bounds| &data[bounds[0]..bounds[1]])
+    }
+
     fn reclaimed(self) -> Option<Rewrite<'stream>> {
         match self {
             Self::Rewritten { slot, .. } => Some(slot),
@@ -716,22 +726,76 @@ fn is_gpu(stream: &Stream) -> bool {
     stream.capabilities().contains(Capability::Cuda)
 }
 
+struct Automaton {
+    engine: SubstringsEngine,
+    gpu: Option<GpuVocabulary>,
+}
+
+// The pinned API rebuilds arenas from needles when a device budget grows.
+struct GpuVocabulary {
+    needles: Vec<Vec<u8>>,
+    casing: CaseSensitivity,
+    haystacks: usize,
+    matches: usize,
+}
+
+impl Automaton {
+    fn reserve(
+        &mut self,
+        stream: &Stream,
+        haystacks: usize,
+        matches: usize,
+    ) -> Result<(), Failure> {
+        let Some(plan) = &mut self.gpu else {
+            return Ok(());
+        };
+        if haystacks <= plan.haystacks && matches <= plan.matches {
+            return Ok(());
+        }
+        let haystacks = haystacks.max(plan.haystacks);
+        let matches = matches.max(plan.matches);
+        self.engine = SubstringsEngine::new(
+            &plan.needles,
+            plan.casing,
+            SubstringsOverlapPolicy::LeftmostLongest,
+            SUBSTRINGS_HOT_STATES_AUTO,
+            matches,
+            haystacks,
+            stream,
+        )
+        .map_err(|error| engine_failure("search capacity", error))?;
+        plan.haystacks = haystacks;
+        plan.matches = matches;
+        Ok(())
+    }
+}
+
 fn automaton(
     stream: &Stream,
-    needles: &[String],
+    needles: &[impl AsRef<[u8]>],
     case_sensitivity: CaseSensitivity,
-) -> Result<RefCell<SubstringsEngine>, Failure> {
-    SubstringsEngine::new(
+) -> Result<Automaton, Failure> {
+    let gpu = is_gpu(stream).then(|| GpuVocabulary {
+        needles: needles
+            .iter()
+            .map(|needle| needle.as_ref().to_vec())
+            .collect(),
+        casing: case_sensitivity,
+        haystacks: 1 << 20,
+        matches: 1 << 20,
+    });
+    let engine = SubstringsEngine::new(
         needles,
         case_sensitivity,
         SubstringsOverlapPolicy::LeftmostLongest,
         SUBSTRINGS_HOT_STATES_AUTO,
-        SUBSTRINGS_MATCHES_BUDGET_AUTO,
-        0,
+        gpu.as_ref()
+            .map_or(SUBSTRINGS_MATCHES_BUDGET_AUTO, |plan| plan.matches),
+        gpu.as_ref().map_or(0, |plan| plan.haystacks),
         stream,
     )
-    .map(RefCell::new)
-    .map_err(|error| engine_failure("multi-pattern search", error))
+    .map_err(|error| engine_failure("multi-pattern search", error))?;
+    Ok(Automaton { engine, gpu })
 }
 
 /// An entry without whatever separated it from the next one.
@@ -776,7 +840,7 @@ impl SearchConfig {
 ///
 /// A sizing call with no match storage reports the required capacity; the second fills it.
 fn cover(
-    automaton: &RefCell<SubstringsEngine>,
+    automaton: &RefCell<Automaton>,
     stream: &Stream,
     corpus: &Corpus,
     counting: &'static str,
@@ -790,20 +854,31 @@ fn cover(
     offsets.resize(corpus.len() + 1, 0);
     let mut matches = Vec::new_in(allocator);
     let mut engine = automaton.borrow_mut();
+    engine.reserve(stream, corpus.len(), 0)?;
     stream
-        .scope(|scope| engine.find(scope, corpus, &mut matches, &mut offsets))
+        .scope(|scope| {
+            engine
+                .engine
+                .find(scope, corpus, &mut matches, &mut offsets)
+        })
         .map_err(|error| engine_failure(counting, error))?;
-    matches.resize(engine.report().matches_emitted, SubstringsMatch::default());
+    let needed = engine.engine.report().matches_emitted;
+    engine.reserve(stream, corpus.len(), needed)?;
+    matches.resize(needed, SubstringsMatch::default());
     stream
-        .scope(|scope| engine.find(scope, corpus, &mut matches, &mut offsets))
+        .scope(|scope| {
+            engine
+                .engine
+                .find(scope, corpus, &mut matches, &mut offsets)
+        })
         .map_err(|error| engine_failure(locating, error))?;
-    if engine.report().shortfall != 0 {
+    if engine.engine.report().shortfall != 0 {
         return Err(engine_failure(
             locating,
             "the device match budget is too small",
         ));
     }
-    matches.truncate(engine.report().matches_stored);
+    matches.truncate(engine.engine.report().matches_stored);
     Ok(matches.to_vec())
 }
 
@@ -811,7 +886,7 @@ fn cover(
 
 /// A CPU-only engine with one owner at a time. Device engines never enter this wrapper.
 struct CpuWorker {
-    engine: SubstringsEngine,
+    engine: Automaton,
     #[cfg(test)]
     last_thread: Option<std::thread::ThreadId>,
 }
@@ -825,7 +900,7 @@ impl CpuWorker {
     fn new(needles: &[String], case_sensitivity: CaseSensitivity) -> Result<Self, Failure> {
         let stream = Stream::default(Capabilities::cpu_enabled());
         Ok(Self {
-            engine: automaton(&stream, needles, case_sensitivity)?.into_inner(),
+            engine: automaton(&stream, needles, case_sensitivity)?,
             #[cfg(test)]
             last_thread: None,
         })
@@ -847,6 +922,7 @@ impl CpuWorker {
         let stream = Stream::default(capabilities);
         stream.scope(|scope| {
             self.engine
+                .engine
                 .bm25_scores(scope, lines, None, parameters, weights, scores, 1)
         })
     }
@@ -859,11 +935,11 @@ struct ScoreJob<'a> {
     result: Result<(), stringzilla::sz::Status>,
 }
 
-/// CPU search states survive across files; the pool only lives while scoring so its idle
-/// workers do not spin while the caller reads input, folds text, or writes output.
+/// Reuse CPU search states and put the retained pool to sleep between files.
 struct CpuScoring {
     threads: usize,
     workers: Vec<CpuWorker>,
+    pool: Option<forkunion::ThreadPool>,
 }
 
 impl CpuScoring {
@@ -873,6 +949,7 @@ impl CpuScoring {
                 .filter(|count| *count != 0)
                 .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from)),
             workers: Vec::new(),
+            pool: None,
         }
     }
 
@@ -895,7 +972,14 @@ impl CpuScoring {
         let mut remaining = scores;
         let mut first = 0;
         for (index, worker) in self.workers.iter_mut().take(threads).enumerate() {
-            let count = remaining.len().div_ceil(threads - index);
+            let jobs_left = threads - index;
+            let limit = remaining.len() - (jobs_left - 1);
+            let target = lines.offsets[first]
+                + (lines.offsets.last().unwrap() - lines.offsets[first]).div_ceil(jobs_left);
+            let count = (lines.offsets[first + 1..=first + limit]
+                .partition_point(|&offset| offset < target)
+                + 1)
+            .min(limit);
             let (scores, rest) = remaining.split_at_mut(count);
             remaining = rest;
             jobs.push(ScoreJob {
@@ -909,18 +993,28 @@ impl CpuScoring {
             });
             first += count;
         }
-        let topology =
-            forkunion::Topology::new().map_err(|error| engine_failure("CPU topology", error))?;
-        let mut pool = forkunion::ThreadPool::spawn(&topology, threads)
-            .map_err(|error| engine_failure("CPU workers", error))?;
-        pool.for_slices_mut(&mut jobs, |jobs, _thread| {
+        if self
+            .pool
+            .as_ref()
+            .is_none_or(|pool| pool.threads_count() < threads)
+        {
+            let topology = forkunion::Topology::new()
+                .map_err(|error| engine_failure("CPU topology", error))?;
+            self.pool = Some(
+                forkunion::ThreadPool::spawn(&topology, threads)
+                    .map_err(|error| engine_failure("CPU workers", error))?,
+            );
+        }
+        let pool = self.pool.as_mut().unwrap();
+        let scored = pool.for_slices_mut(&mut jobs, |jobs, _thread| {
             for job in jobs {
                 job.result =
                     job.worker
                         .score(&job.lines, parameters, &vocabulary.weights, job.scores);
             }
-        })
-        .map_err(|error| engine_failure("CPU scoring", error))?;
+        });
+        pool.sleep(1_000);
+        scored.map_err(|error| engine_failure("CPU scoring", error))?;
         for job in jobs {
             job.result
                 .map_err(|error| engine_failure("BM25 scoring", error))?;
@@ -937,7 +1031,7 @@ impl CpuScoring {
 /// dictionary, so the corpus is walked once rather than once per query.
 struct Engine<'stream> {
     device: &'stream Stream,
-    automaton: RefCell<SubstringsEngine>,
+    automaton: RefCell<Automaton>,
     vocabulary: Vocabulary,
     /// Applied to corpus and query alike before anything is matched.
     folder: Option<Folder<'stream>>,
@@ -967,8 +1061,9 @@ impl<'stream> Engine<'stream> {
             Some(folder) => {
                 let sources = patterns.iter().map(|one| one.as_bytes());
                 let folded = folder.apply(device, &Corpus::gathered(device, sources)?)?;
-                (0..folded.len())
-                    .map(|index| String::from_utf8_lossy(folded.line(index)).into_owned())
+                folded
+                    .iter()
+                    .map(|line| String::from_utf8_lossy(line).into_owned())
                     .collect()
             }
             None => patterns.to_vec(),
@@ -990,7 +1085,7 @@ impl<'stream> Engine<'stream> {
         let automaton = automaton(device, &vocabulary.needles, config.case_sensitivity)?;
         Ok(Self {
             device,
-            automaton,
+            automaton: RefCell::new(automaton),
             vocabulary,
             folder,
             cpu: RefCell::new(CpuScoring::new(threads)),
@@ -1027,6 +1122,7 @@ impl<'stream> Engine<'stream> {
 
         if is_gpu(self.device) {
             let mut automaton = self.automaton.borrow_mut();
+            automaton.reserve(self.device, corpus.len(), 0)?;
             let allocator = UnifiedAllocator::new(self.device);
             let mut weights = Vec::new_in(allocator);
             weights.extend_from_slice(&self.vocabulary.weights);
@@ -1034,7 +1130,7 @@ impl<'stream> Engine<'stream> {
             staged_scores.resize(corpus.len(), 0.0);
             self.device
                 .scope(|scope| {
-                    automaton.bm25_scores(
+                    automaton.engine.bm25_scores(
                         scope,
                         corpus,
                         None,
@@ -1046,7 +1142,10 @@ impl<'stream> Engine<'stream> {
                 })
                 .map_err(|error| engine_failure("BM25 scoring", error))?;
             scores.copy_from_slice(&staged_scores);
-        } else if self.cpu.borrow().threads > 1 && corpus.len() > 1 {
+        } else if self.cpu.borrow().threads > 1
+            && corpus.len() > 1
+            && corpus.bytes().len() >= 64 * 1024
+        {
             self.cpu.borrow_mut().score(
                 &self.vocabulary,
                 self.case_sensitivity,
@@ -1058,7 +1157,7 @@ impl<'stream> Engine<'stream> {
             let mut automaton = self.automaton.borrow_mut();
             self.device
                 .scope(|scope| {
-                    automaton.bm25_scores(
+                    automaton.engine.bm25_scores(
                         scope,
                         corpus,
                         None,
@@ -1152,7 +1251,7 @@ enum Dictionary {
 
 /// One or more transforms compiled into a single rewrite.
 struct Layer<'stream> {
-    automaton: RefCell<SubstringsEngine>,
+    automaton: RefCell<Automaton>,
     targets: Corpus<'static, 'stream>,
 }
 
@@ -1215,15 +1314,16 @@ impl<'stream> Layer<'stream> {
         folds: &[&Fold],
         case_sensitivity: CaseSensitivity,
     ) -> Result<Self, Failure> {
-        let mut sources = Vec::new();
-        let mut targets = Vec::new();
-        for fold in folds {
-            sources.extend(fold.sources.iter().cloned());
-            targets.extend(fold.targets.iter().cloned());
-        }
+        let sources: Vec<&[u8]> = folds
+            .iter()
+            .flat_map(|fold| fold.sources.iter().map(String::as_bytes))
+            .collect();
+        let targets = folds
+            .iter()
+            .flat_map(|fold| fold.targets.iter().map(String::as_bytes));
         Ok(Self {
-            automaton: automaton(device, &sources, case_sensitivity)?,
-            targets: Corpus::gathered(device, targets.iter().map(|target| target.as_bytes()))?,
+            automaton: RefCell::new(automaton(device, &sources, case_sensitivity)?),
+            targets: Corpus::gathered(device, targets)?,
         })
     }
 }
@@ -1373,22 +1473,47 @@ impl<'stream> Layer<'stream> {
         let mut slot = spare.unwrap_or_else(|| Rewrite::allocate(device, corpus.bytes().len(), 0));
         slot.grown_to(corpus.bytes().len(), lines + 1);
         let mut engine = self.automaton.borrow_mut();
+        engine.reserve(device, lines, 0)?;
         let capacity = slot.written_capacity();
         {
             let (data, offsets) = slot.parts_upto(capacity, lines + 1);
             device
-                .scope(|scope| engine.replace(scope, corpus, &self.targets, data, offsets))
+                .scope(|scope| {
+                    engine
+                        .engine
+                        .replace(scope, corpus, &self.targets, data, offsets)
+                })
                 .map_err(|error| engine_failure("fold", error))?;
         }
-        let needed = engine.report().target_length;
+        let emitted = engine.engine.report().matches_emitted;
+        if engine
+            .gpu
+            .as_ref()
+            .is_some_and(|plan| emitted > plan.matches)
+        {
+            engine.reserve(device, lines, emitted)?;
+            let (data, offsets) = slot.parts_upto(capacity, lines + 1);
+            device
+                .scope(|scope| {
+                    engine
+                        .engine
+                        .replace(scope, corpus, &self.targets, data, offsets)
+                })
+                .map_err(|error| engine_failure("fold", error))?;
+        }
+        let needed = engine.engine.report().target_length;
         if needed > capacity {
             slot.grown_to(needed, lines + 1);
             let (data, offsets) = slot.parts_upto(needed, lines + 1);
             device
-                .scope(|scope| engine.replace(scope, corpus, &self.targets, data, offsets))
+                .scope(|scope| {
+                    engine
+                        .engine
+                        .replace(scope, corpus, &self.targets, data, offsets)
+                })
                 .map_err(|error| engine_failure("fold", error))?;
         }
-        if engine.report().shortfall != 0 {
+        if engine.engine.report().shortfall != 0 {
             return Err(engine_failure(
                 "fold",
                 "the device match budget is too small",
@@ -1444,9 +1569,7 @@ impl<'stream> Layer<'stream> {
             });
             drift += produced as i64 - one.byte_length as i64;
         }
-        for tail in line..corpus.len() {
-            starts[tail + 1] = sites.len();
-        }
+        starts[line + 1..].fill(sites.len());
         Ok(LayerMap { sites, starts })
     }
 }
@@ -1556,10 +1679,14 @@ struct Searched<'a, 'stream> {
 }
 
 impl Searched<'_, '_> {
-    /// A line matched when it clears the floor, which defaults to any positive score - and a
-    /// positive score means "matched" only because every weight is strictly positive.
-    fn matched(&self, index: usize, floor: f32) -> bool {
-        self.scores[index] > 0.0 && self.scores[index] >= floor
+    /// Positions and scores of lines that clear the floor, which defaults to any positive score.
+    /// A positive score means "matched" only because every weight is strictly positive.
+    fn matching_scores(&self, floor: f32) -> impl Iterator<Item = (usize, f32)> + '_ {
+        self.scores
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(move |(_, score)| *score > 0.0 && *score >= floor)
     }
 
     /// How many lines matched, without gathering them.
@@ -1568,9 +1695,7 @@ impl Searched<'_, '_> {
     /// line, so on a corpus that mostly matches they would otherwise build a list per input only
     /// to ask for its length.
     fn matched_count(&self, floor: f32, top: Option<usize>) -> usize {
-        let matched = (0..self.corpus.len())
-            .filter(|index| self.matched(*index, floor))
-            .count();
+        let matched = self.matching_scores(floor).count();
         top.map_or(matched, |top| matched.min(top))
     }
 
@@ -1579,15 +1704,8 @@ impl Searched<'_, '_> {
     /// The scored pass already said which lines these are, so they are gathered once here and
     /// every output mode reads from the list rather than re-testing the corpus.
     fn survivors(&self, floor: f32, newlines: Newlines) -> Vec<(usize, &[u8], f32)> {
-        (0..self.corpus.len())
-            .filter(|index| self.matched(*index, floor))
-            .map(|index| {
-                (
-                    index,
-                    trimmed(self.corpus.line(index), newlines),
-                    self.scores[index],
-                )
-            })
+        self.matching_scores(floor)
+            .map(|(index, score)| (index, trimmed(self.corpus.line(index), newlines), score))
             .collect()
     }
 }
@@ -2441,12 +2559,11 @@ mod tests {
             for (index, line) in lines.iter().enumerate() {
                 assert_eq!(corpus.line(index), *line);
             }
-            let mut engine = automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased)
-                .unwrap()
-                .into_inner();
+            let mut engine =
+                automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased).unwrap();
             let mut counts = vec![0; lines.len()];
             stream
-                .scope(|scope| engine.counts(scope, &corpus, &mut counts, 1))
+                .scope(|scope| engine.engine.counts(scope, &corpus, &mut counts, 1))
                 .unwrap();
             for (count, line) in counts.iter().zip(lines) {
                 assert_eq!(*count, usize::from(line == b"needle"));
@@ -2471,7 +2588,7 @@ mod tests {
         config.case_sensitivity = CaseSensitivity::Uncased;
         config.utf8 = true;
         let folds = resolve_folds(&[], Folding::Sounds).unwrap();
-        let data = "color\n\nCOLOUR in a much longer line than the other matches\nkolor\n\nphonetic\nfunetik\nmissing\ncolor color color\nlast";
+        let data = "color\n\nCOLOUR in a much longer line than the other matches\nkolor\n\nphonetic\nfunetik\nmissing\ncolor color color\nlast".repeat(2048);
         let serial = Engine::build(&patterns, &config, &us(), &folds, &stream, Some(1)).unwrap();
         let expected = search_lines(data.as_bytes(), &serial, &config).unwrap();
         assert!(
@@ -2482,6 +2599,7 @@ mod tests {
             let parallel =
                 Engine::build(&patterns, &config, &us(), &folds, &stream, Some(threads)).unwrap();
             let actual = search_lines(data.as_bytes(), &parallel, &config).unwrap();
+            assert_eq!(parallel.cpu.borrow().workers.len(), threads);
             assert_eq!(
                 actual.scores, expected.scores,
                 "--threads {threads} changed scores"
@@ -2511,7 +2629,7 @@ mod tests {
                 Some(count),
             )
             .unwrap();
-            let data = "needle\n".repeat(count + 2);
+            let data = "needle\n".repeat(16_384 + count);
             assert!(search_lines(data.as_bytes(), &engine, &config).is_ok());
             let states = engine.cpu.borrow();
             assert_eq!(states.workers.len(), count);
@@ -2584,7 +2702,27 @@ mod tests {
         );
         assert!(engine.cpu.borrow().workers.is_empty());
         search_lines(b"needle\nmissing", &engine, &config).unwrap();
-        assert_eq!(engine.cpu.borrow().workers.len(), 2);
+        assert!(engine.cpu.borrow().workers.is_empty());
+        let data = "needle\n".repeat(16_384);
+        search_lines(data.as_bytes(), &engine, &config).unwrap();
+        let first_threads: Vec<_> = engine
+            .cpu
+            .borrow()
+            .workers
+            .iter()
+            .map(|worker| worker.last_thread)
+            .collect();
+        search_lines(data.as_bytes(), &engine, &config).unwrap();
+        assert_eq!(
+            engine
+                .cpu
+                .borrow()
+                .workers
+                .iter()
+                .map(|worker| worker.last_thread)
+                .collect::<Vec<_>>(),
+            first_threads
+        );
     }
 
     #[test]
@@ -2594,7 +2732,7 @@ mod tests {
         let second = directory.path().join("second.txt");
         std::fs::write(
             &first,
-            "color\ncolour\nkolor\ncolor color\nmissing\n\nphonetic\nfunetik\n",
+            "color\ncolour\nkolor\ncolor color\nmissing\n\nphonetic\nfunetik\n".repeat(2048),
         )
         .unwrap();
         std::fs::write(
@@ -2649,6 +2787,26 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn gpu_grows_beyond_default_budgets() {
+        let stream = build_device(Device::Gpu, None).unwrap();
+        let config = config(0);
+        let engine = Engine::build(&["needle".into()], &config, &us(), &[], &stream, None).unwrap();
+        let count = (1 << 20) + 1;
+        let lines = "needle\n".repeat(count);
+        assert_eq!(
+            search_lines(lines.as_bytes(), &engine, &config)
+                .unwrap()
+                .matched_count(0.0, None),
+            count
+        );
+        let line = "needle ".repeat(count);
+        let corpus = Corpus::lines_of(&stream, line.as_bytes(), Newlines::Lf).unwrap();
+        assert_eq!(engine.locate(&corpus).unwrap().len(), count);
+    }
+
     #[test]
     fn compact_lines_keep_empty_entries_and_nonzero_offsets() {
         let stream = cpu();
@@ -2659,12 +2817,11 @@ mod tests {
             data: lines.data,
             offsets: &lines.offsets[1..],
         };
-        let mut engine = automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased)
-            .unwrap()
-            .into_inner();
+        let mut engine =
+            automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased).unwrap();
         let mut counts = [0usize; 2];
         stream
-            .scope(|scope| engine.counts(scope, &suffix, &mut counts, 1))
+            .scope(|scope| engine.engine.counts(scope, &suffix, &mut counts, 1))
             .unwrap();
         assert_eq!(counts, [0, 1]);
     }

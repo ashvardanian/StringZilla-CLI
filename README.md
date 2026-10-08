@@ -426,7 +426,7 @@ $ sz-sort file.txt --output sorted.txt # to a file (replaces: sort -o)
 $ sz-sort --is-sorted file.txt          # exit 1 unless already sorted (replaces: sort -c)
 ```
 
-Lines are held as packed offset and length pairs borrowing the input rather than copies of it.
+Lines borrow the input through the slice table consumed by StringZilla, with one reference and one permutation index per line.
 Sorting rewards short records, so the corpus is first split into one word per line:
 
 ```bash
@@ -725,6 +725,7 @@ $ sz-fuzzy-find --device gpu needle big.txt             # GPU (see build note)
 CPU execution is the default, and `--threads` controls CPU scoring through ForkUnion v4.
 The count includes the calling thread: `--threads 8` uses it and up to seven additional workers.
 Omitting `--threads` or passing `--threads 0` uses the available CPU count, bounded by the number of lines to score; `--threads 1` keeps scoring on the caller.
+Inputs smaller than 64 KiB stay on the caller, and larger inputs reuse sleeping workers between files.
 For CPU execution, folding and output run on the caller, and changing the thread count preserves scores and result order.
 Larger query dictionaries and more workers use more memory; use a lower thread count when memory is limited.
 
