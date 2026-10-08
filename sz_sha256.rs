@@ -2201,22 +2201,24 @@ fn hash_stdin(chunk_bytes: usize) -> Outcome {
 ///
 /// Files go to the fleet together, so one pass still fills every lane; the standard input is
 /// spliced back into its own position afterwards.
-fn hash_sources(sources: &[(Input, u64)], plan: &HashPlan) -> Vec<Option<Outcome>> {
+fn hash_sources<'a>(
+    sources: impl ExactSizeIterator<Item = (&'a Path, u64)> + Clone,
+    plan: &HashPlan,
+) -> Vec<Option<Outcome>> {
+    let mut outcomes: Vec<Option<Outcome>> = (0..sources.len()).map(|_| None).collect();
     let mut files = Vec::with_capacity(sources.len());
     let mut positions = Vec::with_capacity(sources.len());
-    for (position, (input, size)) in sources.iter().enumerate() {
-        if matches!(input, Input::File(_)) {
-            files.push((input.path(), *size));
+    for (position, (path, size)) in sources.clone().enumerate() {
+        if path != Path::new("-") {
+            files.push((path, size));
             positions.push(position);
         }
     }
-
-    let mut outcomes: Vec<Option<Outcome>> = (0..sources.len()).map(|_| None).collect();
-    for (index, outcome) in hash_paths(&files, plan).into_iter().enumerate() {
-        outcomes[positions[index]] = outcome;
+    for (position, outcome) in positions.into_iter().zip(hash_paths(&files, plan)) {
+        outcomes[position] = outcome;
     }
-    for (position, (input, _)) in sources.iter().enumerate() {
-        if matches!(input, Input::Stdin) {
+    for (position, (path, _)) in sources.enumerate() {
+        if path == Path::new("-") {
             outcomes[position] = Some(hash_stdin(plan.chunk_bytes));
         }
     }
@@ -2245,8 +2247,21 @@ fn run_check(
     output: &mut dyn Write,
     notes: &mut dyn Write,
 ) -> Result<Status, Failure> {
-    let mut text = fs::read(list).at(list.to_string_lossy())?;
-    let (lines, unreadable) = read_check_list(&mut text);
+    let from_standard_input = list == Path::new("-");
+    let mut text = if from_standard_input {
+        let mut text = Vec::new();
+        io::stdin().lock().read_to_end(&mut text).at("-")?;
+        text
+    } else {
+        fs::read(list).at(list.to_string_lossy())?
+    };
+    let (mut lines, mut unreadable) = read_check_list(&mut text);
+    if from_standard_input {
+        // The manifest consumes stdin, so it cannot also supply a data stream to verify.
+        let total = lines.len();
+        lines.retain(|line| line.path.as_ref() != Path::new("-"));
+        unreadable += total - lines.len();
+    }
     if lines.is_empty() {
         eprintln!("sz-sha256: {}: no checksum lines found", list.display());
         return Ok(Status::Error);
@@ -2264,7 +2279,7 @@ fn run_check(
         .collect();
     let plan = HashPlan::from_args(args, files.len(), files.iter().map(|(_, size)| size).sum());
     let started = std::time::Instant::now();
-    let outcomes = hash_paths(&files, &plan);
+    let outcomes = hash_sources(files.iter().copied(), &plan);
     let elapsed = started.elapsed();
 
     let total_bytes: u64 = outcomes
@@ -2384,7 +2399,10 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         .map(|(_, size)| *size);
     let plan = HashPlan::from_args(args, sources.len(), sized.sum());
     let started = std::time::Instant::now();
-    let outcomes = hash_sources(&sources, &plan);
+    let outcomes = hash_sources(
+        sources.iter().map(|(input, size)| (input.path(), *size)),
+        &plan,
+    );
     let elapsed = started.elapsed();
 
     // Naming happens here rather than in a worker, where the path is already at hand.
