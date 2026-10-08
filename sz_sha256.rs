@@ -2235,8 +2235,15 @@ fn run_check(
         .iter()
         .filter(|verdict| **verdict != Verdict::Skipped)
         .count();
-    let failed = write_check_report_to(output, &lines, &verdicts, args.quiet).at("-")?;
-    output.flush().at("-")?;
+    let destination = match args.output.as_deref().filter(|path| *path != "-") {
+        Some(path) => Destination::Creating(path),
+        None => Destination::Stdout,
+    };
+    let failed = destination.write("sz-sha256", output, |file| {
+        let failed = write_check_report_to(file, &lines, &verdicts, args.quiet)?;
+        file.flush()?;
+        Ok(failed)
+    })?;
 
     if unreadable > 0 {
         eprintln!(
@@ -2880,6 +2887,54 @@ mod tests {
                 "version",
             ]
         );
+    }
+
+    #[test]
+    fn check_writes_to_the_requested_output() {
+        let (directory, paths) = scratch_files(&[7]);
+        let manifest = directory.path().join("checksums");
+        let digest = hex(&sz::Sha256::hash(&fs::read(&paths[0]).unwrap()));
+        fs::write(&manifest, format!("{digest}  {}\n", paths[0].display())).unwrap();
+        let report = directory.path().join("report");
+        let args = Args::try_parse_from([
+            "sz-sha256",
+            "--check",
+            manifest.to_str().unwrap(),
+            "--output",
+            report.to_str().unwrap(),
+            "--threads",
+            "1",
+        ])
+        .unwrap();
+        let mut output = Vec::new();
+        assert!(matches!(
+            run(&args, &mut output, &mut Vec::new()).unwrap(),
+            Status::Success
+        ));
+        assert!(output.is_empty());
+        assert_eq!(
+            fs::read_to_string(&report).unwrap(),
+            format!("{}: OK\n", paths[0].display())
+        );
+    }
+
+    #[test]
+    fn check_propagates_output_creation_errors() {
+        let (directory, paths) = scratch_files(&[7]);
+        let manifest = directory.path().join("checksums");
+        let digest = hex(&sz::Sha256::hash(&fs::read(&paths[0]).unwrap()));
+        fs::write(&manifest, format!("{digest}  {}\n", paths[0].display())).unwrap();
+        let args = Args::try_parse_from([
+            "sz-sha256",
+            "--check",
+            manifest.to_str().unwrap(),
+            "--output",
+            directory.path().to_str().unwrap(),
+            "--threads",
+            "1",
+        ])
+        .unwrap();
+        assert!(run(&args, &mut Vec::new(), &mut Vec::new()).is_err());
     }
 
     #[test]
