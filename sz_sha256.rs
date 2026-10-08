@@ -1895,6 +1895,20 @@ fn path_bytes(path: &Path) -> &[u8] {
     }
 }
 
+/// Write GNU escapes, copying unchanged runs directly to the writer.
+fn write_checksum_path(output: &mut dyn Write, mut path: &[u8]) -> io::Result<()> {
+    while let Some(at) = sz::find_byteset(path, b"\\\n\r".into()) {
+        output.write_all(&path[..at])?;
+        output.write_all(match path[at] {
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            _ => b"\\r",
+        })?;
+        path = &path[at + 1..];
+    }
+    output.write_all(path)
+}
+
 /// Render every record, reporting how many were written.
 fn write_digests_to<'a>(
     output: &mut dyn Write,
@@ -1907,18 +1921,32 @@ fn write_digests_to<'a>(
         // filename that is not valid UTF-8. JSON cannot: a string there has to be UTF-8, so
         // it keeps the lossy rendering.
         let path_bytes = path_bytes(path);
+        let escaped = config.terminator == Terminator::Newline
+            && matches!(config.format, Format::Coreutils | Format::Bsd)
+            && sz::find_byteset(path_bytes, b"\\\n\r".into()).is_some();
+        if escaped {
+            output.write_all(b"\\")?;
+        }
         match config.format {
             // Two spaces between digest and path is what `sha256sum` writes and what its own
             // `--check` expects back, so this stays byte-for-byte rather than merely similar.
             Format::Coreutils => {
                 write_digest_to(output, &hashed.digest)?;
                 output.write_all(b"  ")?;
-                output.write_all(path_bytes)?;
+                if escaped {
+                    write_checksum_path(output, path_bytes)?;
+                } else {
+                    output.write_all(path_bytes)?;
+                }
             }
             // What `sha256sum --tag` writes, and what its `--check` reads back.
             Format::Bsd => {
                 output.write_all(b"SHA256 (")?;
-                output.write_all(path_bytes)?;
+                if escaped {
+                    write_checksum_path(output, path_bytes)?;
+                } else {
+                    output.write_all(path_bytes)?;
+                }
                 output.write_all(b") = ")?;
                 write_digest_to(output, &hashed.digest)?;
             }
@@ -1995,15 +2023,17 @@ struct CheckLine<'a> {
 /// Both spacings the reference tool writes are accepted: two spaces for text mode, and a space
 /// then `*` for the binary mode `-b` produces. Anything else is not a checksum line, and the
 /// caller counts it rather than failing the run — a list may carry comments or blank lines.
-fn parse_check_line(line: &[u8]) -> Option<CheckLine<'_>> {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
+fn parse_check_line(line: &mut [u8]) -> Option<CheckLine<'_>> {
+    let end = line.len() - usize::from(line.ends_with(b"\n"));
+    let end = end - usize::from(line[..end].ends_with(b"\r"));
+    let escaped = line.starts_with(b"\\");
+    let line = &mut line[usize::from(escaped)..end];
 
     // A BSD line names its algorithm first, so it is recognised by that prefix rather than by
     // a digest at column zero, and the two layouts cannot be confused.
     let (hex, path) = match line.strip_prefix(b"SHA256 (") {
         Some(tagged) => {
-            let closing = tagged.windows(4).rposition(|window| window == b") = ")?;
+            let closing = sz::rfind(tagged, b") = ")?;
             let (path, rest) = tagged.split_at(closing);
             (rest.get(4..)?, path)
         }
@@ -2023,19 +2053,25 @@ fn parse_check_line(line: &[u8]) -> Option<CheckLine<'_>> {
     }
 
     let mut digest = [0u8; 32];
-    for (index, pair) in hex.chunks_exact(2).enumerate() {
+    for (byte, &[high, low]) in digest.iter_mut().zip(hex.as_chunks::<2>().0) {
         let value = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
             b'A'..=b'F' => Some(byte - b'A' + 10),
             _ => None,
         };
-        digest[index] = (value(pair[0])? << 4) | value(pair[1])?;
+        *byte = (value(high)? << 4) | value(low)?;
     }
 
-    // The manifest holds the name's bytes, so it is rebuilt from them: rendering it through
-    // `from_utf8_lossy` first would substitute U+FFFD and then fail to open a file that is
-    // sitting right there.
+    let start = offset_within(line, path);
+    let end = start + path.len();
+    let path = &mut line[start..end];
+    let length = if escaped {
+        unescape_checksum_path(path)?
+    } else {
+        path.len()
+    };
+    let path = &path[..length];
     #[cfg(unix)]
     let path = Cow::Borrowed(Path::new(
         <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
@@ -2045,11 +2081,34 @@ fn parse_check_line(line: &[u8]) -> Option<CheckLine<'_>> {
     Some(CheckLine { digest, path })
 }
 
+/// GNU escapes only shrink, so the manifest itself holds every decoded name.
+fn unescape_checksum_path(path: &mut [u8]) -> Option<usize> {
+    let (mut read, mut written) = (0, 0);
+    while read < path.len() {
+        let byte = path[read];
+        read += 1;
+        path[written] = if byte == b'\\' {
+            let escaped = *path.get(read)?;
+            read += 1;
+            match escaped {
+                b'\\' => b'\\',
+                b'n' => b'\n',
+                b'r' => b'\r',
+                _ => return None,
+            }
+        } else {
+            byte
+        };
+        written += 1;
+    }
+    Some(written)
+}
+
 /// Read a checksum list, keeping only the lines that are checksum lines.
-fn read_check_list(text: &[u8]) -> (Vec<CheckLine<'_>>, usize) {
+fn read_check_list(text: &mut [u8]) -> (Vec<CheckLine<'_>>, usize) {
     let mut lines = Vec::new();
     let mut unreadable = 0;
-    for line in text.split(|byte| *byte == b'\n') {
+    for line in text.split_mut(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
         }
@@ -2186,8 +2245,8 @@ fn run_check(
     output: &mut dyn Write,
     notes: &mut dyn Write,
 ) -> Result<Status, Failure> {
-    let text = fs::read(list).at(list.to_string_lossy())?;
-    let (lines, unreadable) = read_check_list(&text);
+    let mut text = fs::read(list).at(list.to_string_lossy())?;
+    let (lines, unreadable) = read_check_list(&mut text);
     if lines.is_empty() {
         eprintln!("sz-sha256: {}: no checksum lines found", list.display());
         return Ok(Status::Error);
@@ -2439,6 +2498,60 @@ mod tests {
             .iter()
             .map(|path| sz::Sha256::hash(&fs::read(path).unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn checksum_escaping_round_trips_special_names() {
+        let hashed = Hashed {
+            digest: [0x11; 32],
+            bytes: 7,
+        };
+        for name in ["line\nbreak", "back\\slash", "carriage\r", "mixed\\\n\r é"] {
+            for format in [Format::Coreutils, Format::Bsd] {
+                let path = Path::new(name);
+                let mut output = Vec::new();
+                write_digests_to(
+                    &mut output,
+                    std::iter::once((path, &hashed)),
+                    &OutputConfig {
+                        format,
+                        terminator: Terminator::Newline,
+                    },
+                )
+                .unwrap();
+                assert_eq!(output.first(), Some(&b'\\'));
+                assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                #[cfg(unix)]
+                let storage = output.as_ptr_range();
+                let parsed = parse_check_line(&mut output).unwrap();
+                #[cfg(unix)]
+                assert!(storage.contains(&path_bytes(&parsed.path).as_ptr()));
+                assert_eq!(parsed.path, path);
+                assert_eq!(parsed.digest, hashed.digest);
+            }
+            let mut output = Vec::new();
+            write_digests_to(
+                &mut output,
+                std::iter::once((Path::new(name), &hashed)),
+                &OutputConfig {
+                    format: Format::Coreutils,
+                    terminator: Terminator::Null,
+                },
+            )
+            .unwrap();
+            let mut expected = format!("{}  ", "11".repeat(32)).into_bytes();
+            expected.extend_from_slice(name.as_bytes());
+            expected.push(0);
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_and_unfinished_checksum_escapes() {
+        for name in ["bad\\q", "bad\\"] {
+            let line = format!("\\{}  {name}", "11".repeat(32));
+            assert!(parse_check_line(&mut line.into_bytes()).is_none());
+        }
     }
 
     #[test]
@@ -2706,7 +2819,8 @@ mod tests {
         // Text mode writes two spaces; `sha256sum -b` writes one space and a star.
         for separator in ["  ", " *"] {
             let line = format!("{}{}some/file.bin", text, separator);
-            let parsed = parse_check_line(line.as_bytes()).unwrap();
+            let mut line = line.into_bytes();
+            let parsed = parse_check_line(&mut line).unwrap();
             assert_eq!(parsed.digest, digest);
             assert_eq!(parsed.path, PathBuf::from("some/file.bin"));
         }
@@ -2721,7 +2835,7 @@ mod tests {
             b"not-hex-at-all  file.bin",
             b"abcd  short-digest",
         ] {
-            assert!(parse_check_line(line).is_none());
+            assert!(parse_check_line(&mut line.to_vec()).is_none());
         }
     }
 
@@ -2783,7 +2897,8 @@ mod tests {
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.starts_with("SHA256 ("), "{}", text);
         for (line, digest) in text.lines().zip(&digests) {
-            let parsed = parse_check_line(line.as_bytes()).expect("a BSD line is a checksum line");
+            let mut line = line.as_bytes().to_vec();
+            let parsed = parse_check_line(&mut line).expect("a BSD line is a checksum line");
             assert_eq!(&parsed.digest, digest);
         }
     }
@@ -2793,7 +2908,8 @@ mod tests {
         // `) = ` inside a name is legal, so the parser must split on the last one rather than
         // the first, or the digest is read out of the middle of the path.
         let line = b"SHA256 (od d) = ity) = 0000000000000000000000000000000000000000000000000000000000000000";
-        let parsed = parse_check_line(line).expect("a name may hold the separator");
+        let mut line = line.to_vec();
+        let parsed = parse_check_line(&mut line).expect("a name may hold the separator");
         assert_eq!(parsed.path, PathBuf::from("od d) = ity"));
         assert_eq!(parsed.digest, [0u8; 32]);
     }
@@ -2936,7 +3052,7 @@ mod tests {
         line.extend_from_slice(b"  ");
         line.extend_from_slice(path_bytes(&path));
 
-        let parsed = parse_check_line(&line).expect("a manifest line");
+        let parsed = parse_check_line(&mut line).expect("a manifest line");
         assert_eq!(parsed.path, path, "the manifest lost the name's bytes");
         assert_eq!(parsed.digest, [0x11; 32]);
     }
