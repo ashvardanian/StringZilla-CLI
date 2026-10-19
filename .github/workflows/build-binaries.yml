@@ -85,8 +85,9 @@ jobs:
           "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          toolchain: nightly-2026-10-08
           targets: ${{ matrix.target }}
 
       - name: Install musl toolchain
@@ -99,7 +100,7 @@ jobs:
         run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
       # No `--features`: `sz-outline` and `sz-fuzzy-find` carry `required-features`, so a
-      # default build skips them and `stringzilla/cpus` never reaches a release artifact.
+      # default build skips them. The archive count below checks the selected tools.
       # The count assertion in `Stage archive` is what enforces that in both directions.
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

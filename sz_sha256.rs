@@ -496,7 +496,11 @@ fn advance_group(
         let held: &dyn Fleet = fleet;
         let group = &mut staging[..count];
         if count >= LANES_WORTH_A_GROUP {
-            if sz::sha256_multistate_update_by(group, |lane| held.chunk(members[lane])).is_err() {
+            let mut chunks = [&[][..]; LANE_COUNT];
+            for (chunk, &slot) in chunks[..count].iter_mut().zip(&members[..count]) {
+                *chunk = held.chunk(slot);
+            }
+            if sz::sha256_multistate_update(group, &chunks[..count]).is_err() {
                 return Err(io::Error::from(io::ErrorKind::InvalidInput));
             }
         } else {
@@ -2023,14 +2027,14 @@ fn parse_check_line(line: &[u8]) -> Option<CheckLine<'_>> {
     }
 
     let mut digest = [0u8; 32];
-    for (index, pair) in hex.chunks_exact(2).enumerate() {
+    for (byte, &[high, low]) in digest.iter_mut().zip(hex.as_chunks::<2>().0) {
         let value = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
             b'A'..=b'F' => Some(byte - b'A' + 10),
             _ => None,
         };
-        digest[index] = (value(pair[0])? << 4) | value(pair[1])?;
+        *byte = (value(high)? << 4) | value(low)?;
     }
 
     // The manifest holds the name's bytes, so it is rebuilt from them: rendering it through

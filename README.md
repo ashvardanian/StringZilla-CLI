@@ -12,6 +12,22 @@ cargo install --git https://github.com/ashvardanian/StringZilla-CLI --locked    
 cargo install --path . --force --locked                                                   # or a local clone
 ```
 
+For v6 development, use `main-dev`, which follows StringZilla `main-v6` and ForkUnion `main-v4`.
+Install CMake and C and C++ compilers before building.
+`rust-toolchain.toml` selects the tested `nightly-2026-10-08` compiler while StringZilla v6's Rust 1.100 minimum is awaiting a stable release.
+`Cargo.lock` records the tested dependency revisions; keep `--locked` when building or comparing changes.
+
+```bash
+git clone --branch main-dev https://github.com/ashvardanian/StringZilla-CLI
+cd StringZilla-CLI
+rustup toolchain install nightly-2026-10-08 --profile minimal --component rustfmt --component clippy
+cargo build --release --locked
+
+# Include both experimental commands and run their tests as well:
+cargo build --release --locked --features outline,fuzzy-find
+cargo test --release --locked --all-targets --features outline,fuzzy-find
+```
+
 Coding agents can pull the bundled skills from the same repository, which teach them the [multi-pass editing workflow](#multi-pass-agentic-file-editing) and where Unicode folding changes an answer:
 
 ```bash
@@ -34,6 +50,7 @@ It provides the following subcommands:
 - [`sz-split`](#sz-split-split-file-into-smaller-ones): splits by lines, bytes, or a delimiter line, 5x faster than `csplit`
 - [`sz-sha256`](#sz-sha256-checksum-many-files): sixteen files hashed per instruction, 6x faster than GNU `sha256sum`
 - [`sz-outline`](#sz-outline-file-outliner-for-llms): experimental tool for sampling file sections for LLM contexts
+- [`sz-fuzzy-find`](#sz-fuzzy-find-fuzzy-substring-search): experimental typo-tolerant search with ranked results and matching spans
 
 Every release also carries prebuilt binaries for Linux, macOS and Windows on both x86-64 and arm64, so nothing has to be compiled.
 One binary per operating system and architecture covers every CPU of that architecture: StringZilla picks its SIMD tier at load time, so the same `sz-find` reaches for AVX-512 on Ice Lake, NEON on Apple silicon and SVE on Graviton.
@@ -409,7 +426,7 @@ $ sz-sort file.txt --output sorted.txt # to a file (replaces: sort -o)
 $ sz-sort --is-sorted file.txt          # exit 1 unless already sorted (replaces: sort -c)
 ```
 
-Lines are held as packed offset and length pairs borrowing the input rather than copies of it.
+Lines borrow the input through the slice table consumed by StringZilla, with one reference and one permutation index per line.
 Sorting rewards short records, so the corpus is first split into one word per line:
 
 ```bash
@@ -558,7 +575,7 @@ Two widths are tuned separately: `--io-width` is how many files a worker keeps r
 
 > [!WARNING]
 > This one is being reimplemented and is excluded from the default build.
-> Enable it with `cargo build --release --features outline`.
+> Enable it with `cargo build --release --locked --features outline`.
 > It is being designed without a prior-art reference, so expect it to change a lot even in minor releases.
 
 Extract structural outlines from source files for LLM context windows.
@@ -630,7 +647,7 @@ Function signatures are normalized (whitespace collapsed) and categorized as dec
 
 > [!WARNING]
 > Pre-production and excluded from the default build.
-> Enable it with `cargo build --release --features fuzzy-find`.
+> Enable it with `cargo build --release --locked --features fuzzy-find`.
 
 `sz-find` matches literally; `sz-fuzzy-find` adds typo tolerance.
 Each query is expanded into every string within an edit budget of it, and those variants are matched exactly by one Aho-Corasick automaton scored by BM25.
@@ -639,8 +656,8 @@ The edit model therefore lives in the vocabulary and its weights rather than in 
 Every query's variants pool into a single dictionary, so the corpus is walked once however many `--pattern` flags are given.
 
 ```bash
-# Find "color" allowing one edit — also matches "colour", "kolor"
-$ sz-fuzzy-find color file.txt
+# Allow one edit from the whole alphabet — also matches "colour", "kolor"
+$ sz-fuzzy-find --effort spelling color file.txt
 
 # Several queries at once, still one pass over the corpus
 $ sz-fuzzy-find --pattern foo --pattern bar file.txt
@@ -674,7 +691,7 @@ Only the ones that genuinely feed each other are kept apart, and there are exact
 
 ```bash
 # Name a transform explicitly; --fold is repeatable and the stages feed each other
-$ sz-fuzzy-find --fold Cyrillic-Latin --fold Latin-Phonetic Горбачёв archive/
+$ sz-fuzzy-find --fold Cyrillic-Latin --fold Latin-Phonetic Горбачёв archive.txt
 
 # Alternative phonetic models, for German and for Slavic surnames
 $ sz-fuzzy-find --fold Cologne-Phonetic Schmidt names.txt
@@ -705,11 +722,19 @@ $ sz-fuzzy-find --device cpu --threads 8 needle big.txt # CPU, 8 threads
 $ sz-fuzzy-find --device gpu needle big.txt             # GPU (see build note)
 ```
 
-Every core is used unless `--threads` says otherwise. The GPU path requires a CUDA build:
+CPU execution is the default, and `--threads` controls CPU scoring through ForkUnion v4.
+The count includes the calling thread: `--threads 8` uses it and up to seven additional workers.
+Omitting `--threads` or passing `--threads 0` uses the available CPU count, bounded by the number of lines to score; `--threads 1` keeps scoring on the caller.
+Inputs smaller than 64 KiB stay on the caller, and larger inputs reuse sleeping workers between files.
+For CPU execution, folding and output run on the caller, and changing the thread count preserves scores and result order.
+Larger query dictionaries and more workers use more memory; use a lower thread count when memory is limited.
+
+Use `--device gpu` to request GPU execution; `--threads` is a CPU setting and cannot be combined with it.
+The GPU path requires both the `fuzzy-find` and `cuda` features, plus a CUDA toolkit and a compatible host compiler for StringZilla v6:
 
 ```bash
-# On systems with gcc > 14 + CUDA 12.x, point nvcc at a supported host compiler:
-$ CUDAHOSTCXX=g++-14 cargo install --git https://github.com/ashvardanian/StringZilla-CLI --features cuda --locked
+$ cargo build --release --locked --bin sz-fuzzy-find --features fuzzy-find,cuda
+$ ./target/release/sz-fuzzy-find --device gpu needle big.txt
 ```
 
 ## Workflows

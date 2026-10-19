@@ -8,6 +8,7 @@ license = "Apache-2.0"
 name = "stringzilla-cli"
 readme = "README.md"
 repository = "https://github.com/ashvardanian/StringZilla-CLI"
+rust-version = "1.100"
 version = "0.1.0"
 
 # Lets `cargo binstall stringzilla-cli` fetch the release archive instead of compiling.
@@ -29,24 +30,18 @@ pkg-fmt = "zip"
 [features]
 cuda = ["stringzilla/cuda"]
 default = []
-# Pre-production, opt-in: `sz-fuzzy-find` is being reimplemented. It is the only binary
-# that reaches for the multicore `szs` kernels, so the `cpus` feature — and the allocator,
-# tape and fork-union crates behind it — comes in with the binary rather than with the suite.
-# The reference tables it embeds are not separately switchable: they total under a megabyte, every
-# flag that reads one is useless without it, and a Cargo feature cannot be subtracted from a feature
-# that enables it, so a knob here could never have been turned.
-fuzzy-find = ["stringzilla/cpus"]
+# Pre-production, opt-in: `sz-fuzzy-find` and `sz-outline` are being reimplemented.
+fuzzy-find = []
 outline = []    # Pre-production, opt-in: `sz-outline` is being reimplemented
 
 [dependencies]
 allocator-api2 = "0.4"
 clap = { version = "4.5", features = ["derive"] } # CLI argument parsing 
-forkunion = "3.0.2" # Thread pool behind `sz-sha256`; unrelated to `stringzilla/cpus`
+forkunion = { git = "https://github.com/ashvardanian/ForkUnion", branch = "main-v4" } # CLI-owned CPU workers
 glob = "0.3" # Glob pattern matching
 ignore = "0.4" # .gitignore support
 memmap2 = "0.9" # Memory-mapped file I/O
-stringtape = "2.4" # Compact (offset, length) storage for line collections
-stringzilla = "~5.1" # SIMD string ops; `szs` multicore kernels arrive with `fuzzy-find`
+stringzilla = { git = "https://github.com/ashvardanian/StringZilla", branch = "main-v6" } # SIMD string ops and collection kernels
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -189,7 +189,7 @@ impl AppendOnlyFlatHashSet {
 
 /// Compute hash for a line, using case-folding if ignore_case is true.
 #[inline]
-fn compute_hash(line: &[u8], ignore_case: bool, scratch: &mut Vec<u8>) -> u64 {
+fn compute_hash(line: &[u8], ignore_case: bool, scratch: &mut Vec<u8>) -> io::Result<u64> {
     if ignore_case {
         // Folding can expand a character threefold (ß → ss), and only ever grows the buffer:
         // re-zeroing what the fold overwrites would memset three times the line, per line.
@@ -197,10 +197,10 @@ fn compute_hash(line: &[u8], ignore_case: bool, scratch: &mut Vec<u8>) -> u64 {
         if scratch.len() < needed {
             scratch.resize(needed, 0);
         }
-        let folded_len = sz::utf8_uncased_fold(line, &mut scratch[..]);
-        sz::hash(&scratch[..folded_len])
+        let folded_len = sz::utf8_uncased_fold(line, &mut scratch[..]).map_err(io::Error::other)?;
+        Ok(sz::hash(&scratch[..folded_len]))
     } else {
-        sz::hash(line)
+        Ok(sz::hash(line))
     }
 }
 
@@ -325,7 +325,7 @@ fn dedup_to_writer(
     for (line, span) in TerminatedLines::new(data, Newlines::from_utf8(utf8)) {
         counts.total += 1;
         let line_offset = offset_within(data, line);
-        let hash = compute_hash(line, ignore_case, &mut scratch);
+        let hash = compute_hash(line, ignore_case, &mut scratch)?;
 
         if seen.insert_if_absent(hash, line, data, ignore_case, line_offset as u64) {
             write_line(output, config, line, span, counts.unique)?;
