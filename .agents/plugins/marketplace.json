@@ -1,0 +1,19 @@
+{
+    "name": "stringzilla",
+    "interface": {
+        "displayName": "StringZilla"
+    },
+    "plugins": [
+        {
+            "name": "stringzilla-cli",
+            "source": {
+                "source": "local",
+                "path": "./"
+            },
+            "policy": {
+                "installation": "AVAILABLE"
+            },
+            "category": "Productivity"
+        }
+    ]
+}

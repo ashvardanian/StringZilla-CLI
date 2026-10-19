@@ -10,22 +10,51 @@ readme = "README.md"
 repository = "https://github.com/ashvardanian/StringZilla-CLI"
 version = "0.1.0"
 
+# Lets `cargo binstall stringzilla-cli` fetch the release archive instead of compiling.
+# `{ target }` is the full triple, which is why the archives are named after triples rather
+# than friendlier labels: one template then covers every platform.
+# Takes effect only once the crate is on crates.io, since binstall reads this table from the
+# published manifest rather than from the repository.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [features]
 cuda = ["stringzilla/cuda"]
 default = []
+# Pre-production, opt-in: `sz-fuzzy-find` is being reimplemented. It is the only binary
+# that reaches for the multicore `szs` kernels, so the `cpus` feature — and the allocator,
+# tape and fork-union crates behind it — comes in with the binary rather than with the suite.
+# The reference tables it embeds are not separately switchable: they total under a megabyte, every
+# flag that reads one is useless without it, and a Cargo feature cannot be subtracted from a feature
+# that enables it, so a knob here could never have been turned.
+fuzzy-find = ["stringzilla/cpus"]
+outline = []    # Pre-production, opt-in: `sz-outline` is being reimplemented
 
 [dependencies]
+allocator-api2 = "0.4"
 clap = { version = "4.5", features = ["derive"] } # CLI argument parsing 
+forkunion = "3.0.2" # Thread pool behind `sz-sha256`; unrelated to `stringzilla/cpus`
 glob = "0.3" # Glob pattern matching
 ignore = "0.4" # .gitignore support
 memmap2 = "0.9" # Memory-mapped file I/O
 stringtape = "2.4" # Compact (offset, length) storage for line collections
-stringzilla = { version = "5", features = [
-    "cpus",
-] } # SIMD string ops + szs multicore kernels
+stringzilla = "~5.1" # SIMD string ops; `szs` multicore kernels arrive with `fuzzy-find`
 
 [dev-dependencies]
 tempfile = "3.10"
+
+# Compiled once and linked into every binary, rather than `mod shared;`-included eleven times.
+[lib]
+name = "shared"
+path = "shared.rs"
 
 [profile.release]
 codegen-units = 1 # Better optimization, slower compile
@@ -64,6 +93,7 @@ path = "sz_rows.rs"
 [[bin]]
 name = "sz-outline"
 path = "sz_outline.rs"
+required-features = ["outline"]
 
 [[bin]]
 name = "sz-sort"
@@ -72,7 +102,33 @@ path = "sz_sort.rs"
 [[bin]]
 name = "sz-fuzzy-find"
 path = "sz_fuzzy_find.rs"
+required-features = ["fuzzy-find"]
 
 [[bin]]
-name = "sz-segment"
-path = "sz_segment.rs"
+name = "sz-segment-utf8"
+path = "sz_segment_utf8.rs"
+
+[[bin]]
+name = "sz-sha256"
+path = "sz_sha256.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+
+# Static checks for the shapes this suite keeps re-growing: deep nesting, bool soup, eager
+# collection, and needless copies. Every lint below is at zero hits today, so a hit is a
+# regression rather than a backlog. Enforced by `.githooks/pre-commit`.
+[lints.clippy]
+cognitive_complexity = "deny"      # deep nesting and tangled conditionals
+too_many_arguments = "deny"        # a missing config struct
+fn_params_excessive_bools = "deny" # a bool that should name its states
+needless_collect = "deny"          # materializing what a lazy iterator would serve
+redundant_clone = "deny"
+unnecessary_to_owned = "deny"
+inefficient_to_string = "deny"
+large_stack_arrays = "deny"
+
+# Informative rather than blocking: each has a small, known backlog.
+too_many_lines = "warn"
+needless_pass_by_value = "warn"

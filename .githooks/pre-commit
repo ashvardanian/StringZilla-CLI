@@ -22,7 +22,10 @@ while IFS= read -r -d '' file; do
     case "$file" in
         *.png|*.jpg|*.jpeg|*.gif|*.ico|Cargo.lock) continue ;;
     esac
-    if hits=$(grep -nEH "$pattern" -- "$file" 2>/dev/null); then
+    # A Markdown table rule (`| --- | ---: |`) opens with `-` runs that the `--` lead-in
+    # matches, and the header above says those are not comments. Dropped by shape rather
+    # than by file type, so a real banner inside a fenced code block still fires.
+    if hits=$(grep -nEH "$pattern" -- "$file" 2>/dev/null | grep -vE '^[^:]*:[0-9]+:[[:space:]]*\|'); then
         violations+="$hits"$'\n'
     fi
 done < <(git diff --cached --name-only --diff-filter=ACM -z)
@@ -31,4 +34,46 @@ if [ -n "${violations//[$'\n']/}" ]; then
     echo "error: banner-style comment separators are banned; use '// region:' / '// endregion:' instead." >&2
     echo "$violations" >&2
     exit 1
+fi
+
+# Static analysis, on the Rust files this commit actually touches. `[lints.clippy]` in
+# Cargo.toml carries the rules; this is what makes them bite before review rather than after.
+staged_rust=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)
+if [ -n "$staged_rust" ]; then
+    # Cheapest rule first. A tally counted through an out-parameter is the shape this suite
+    # keeps re-growing: a quantity carried beside the control flow instead of returned by it.
+    # A counter is the shape that goes wrong; a `&mut bool` latch is ordinary state.
+    if tallies=$(printf '%s\n' "$staged_rust" | xargs grep -nE ':[[:space:]]*&mut (usize|u64)[,)]' 2>/dev/null \
+        | grep -vE 'state|scratch|buffer|refill|counts|index|offset'); then
+        echo "error: a counter passed as an out-parameter; return it, or fold it into a Tally." >&2
+        printf '%s\n' "$tallies" >&2
+        exit 1
+    fi
+
+    # Scoped to the staged files rather than the tree: a commit is not the place to answer
+    # for formatting in a file it does not touch, which another session may still be editing.
+    if ! printf '%s\n' "$staged_rust" | xargs rustfmt --check --edition 2021 >/dev/null 2>&1; then
+        echo "error: rustfmt would change staged files; run 'cargo fmt'." >&2
+        printf '%s\n' "$staged_rust" | xargs rustfmt --check --edition 2021 2>&1 | head -20 >&2
+        exit 1
+    fi
+
+    # `clippy::needless_collect` cannot see a `.collect()` whose result is indexed, zipped, or
+    # stored, which is every one that survives in this tree. The commit's own diff says what is
+    # new, so nothing has to be counted or kept in step.
+    if added=$(git diff --cached -U0 -- '*.rs' \
+        | grep -E '^\+' | grep -v '^+++' | grep -n '\.collect()'); then
+        echo "note: this commit adds .collect():" >&2
+        printf '%s\n' "$added" >&2
+        echo "      Materialize only for indexing, len(), a second pass, an outliving borrow," >&2
+        echo "      or a whole-set operation. Otherwise compose the iterator." >&2
+    fi
+
+    # No `-D warnings` here: the `[lints.clippy]` table already says which lints block and
+    # which only inform, and promoting the informative ones would overrule it.
+    if ! clippy=$(cargo clippy --bins --lib 2>&1); then
+        echo "error: clippy rejected the staged tree." >&2
+        printf '%s\n' "$clippy" | grep -E '^(error|warning)' | head -20 >&2
+        exit 1
+    fi
 fi

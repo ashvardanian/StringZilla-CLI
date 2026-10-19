@@ -1,0 +1,16 @@
+Package: stringzilla-cli
+Version: ${VERSION}
+Section: utils
+Priority: optional
+Architecture: ${ARCH}
+Installed-Size: ${INSTALLED_SIZE}
+Maintainer: Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>
+Homepage: https://github.com/ashvardanian/StringZilla-CLI
+Description: SIMD-accelerated command-line text processing utilities
+ Drop-in accelerated replacements for common text tools: sz-find, sz-replace,
+ sz-sort, sz-count, sz-dedup, sz-rows, sz-cols, sz-split, sz-segment-utf8 and
+ sz-sha256.
+ Each binary dispatches at load time to the widest SIMD tier the running CPU
+ supports, so one package serves every machine of this architecture.
+ .
+ Statically linked against musl, so it depends on no system library.

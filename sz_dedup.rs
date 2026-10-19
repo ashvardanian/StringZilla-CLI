@@ -1,90 +1,36 @@
-//! SIMD-accelerated line deduplication utility
+//! Drop repeated lines, keeping the first of each, without sorting.
 //!
-//! Remove duplicate lines from files, keeping the first occurrence of each unique line.
-//! Uses StringZilla's SIMD hash for fast deduplication with minimal memory overhead.
+//! `uniq` collapses only adjacent duplicates and so needs sorted input, and `sort -u` gets there
+//! by discarding the original order. The idiom that preserves it is `awk '!seen[$0]++'`, and this
+//! is that, with a SIMD hash under it.
 //!
 //! # Algorithm
 //!
-//! This implementation uses an open-addressed flat hash set with linear probing:
+//! An open-addressed flat set holds one 24-byte entry per __distinct__ line, so memory follows the
+//! number of unique lines rather than the length of the input. Insert and lookup both mask the
+//! hash to a slot and probe forward; an empty slot is marked by `offset = u64::MAX`, which no real
+//! file can produce. The table starts at 1024 slots and doubles past a 60% load factor.
 //!
 //! ```text
-//! AppendOnlyFlatHashSet: Vec<LineEntry>
-//!     slot[0]: { hash: 0x1234,    offset: 0,         length: 10       }
-//!     slot[1]: { hash: 0,         offset: u64::MAX,  length: u64::MAX }  ← empty
-//!     slot[2]: { hash: 0xABCD,    offset: 15,        length: 8        }
-//!     ...
-//!
-//! LineEntry = 24 bytes (hash: u64, offset: u64, length: u64)
+//! slot[0]: { hash: 0x1234, offset: 0,        length: 10       }
+//! slot[1]: { hash: 0,      offset: u64::MAX, length: u64::MAX }  ← empty
+//! slot[2]: { hash: 0xABCD, offset: 15,       length: 8        }
 //! ```
 //!
-//! ## Open Addressing with Linear Probing
+//! `--ignore-case` folds each line into a scratch buffer and hashes the folded form, then settles
+//! collisions with `utf8_uncased_order` on the originals, so no line is folded twice.
 //!
-//! - Insert: `slot = hash & mask`, probe forward until empty slot
-//! - Lookup: `slot = hash & mask`, probe forward checking hash matches
-//! - Empty slots marked by `offset = u64::MAX` (impossible for real files)
+//! Every line keeps the terminator it arrived with, so nothing but the duplicates changes.
 //!
-//! ## Growth Strategy
-//!
-//! - Start with 1024 slots (24 KB)
-//! - Grow 2x when load factor exceeds 60%
-//! - Rehash all entries into new larger array
-//!
-//! ## In-Place Compaction
-//!
-//! When modifying a file in-place, the algorithm uses two pointers:
-//!
-//! ```text
-//! read_pos ────────────────────────────►
-//!     ┌────────┬────────┬────────┬────────┬────────┐
-//!     │ line A │ line B │ line A │ line C │ line B │  (input)
-//!     └────────┴────────┴────────┴────────┴────────┘
-//!
-//! write_pos ───────────────►
-//!     ┌────────┬────────┬────────┐
-//!     │ line A │ line B │ line C │  (compacted output)
-//!     └────────┴────────┴────────┘
-//! ```
-//!
-//! **Invariant**: `write_pos ≤ read_pos` always holds, ensuring we never overwrite
-//! unread data. After compaction, the file is truncated to the new length.
-//!
-//! ## Case-Insensitive Mode
-//!
-//! For `-i` mode, uses proper Unicode case folding via `utf8_uncased_fold()`:
-//!
-//! 1. **Hashing**: Case-fold line into scratch buffer, then hash the folded form
-//! 2. **Collision check**: Use `utf8_uncased_order()` directly on original
-//!    lines (no re-folding needed for comparison)
-//!
-//! # Examples
-//!
-//! ```bash
-//! # Write unique lines to stdout
-//! sz-dedup file.txt
-//!
-//! # Rewrite the file in place
-//! sz-dedup --in-place file.txt
-//!
-//! # Case-insensitive deduplication (full Unicode support)
-//! sz-dedup -i file.txt
-//!
-//! # Output to different file (streaming mode)
-//! sz-dedup file.txt -o unique.txt
-//!
-//! # From stdin to stdout
-//! cat file.txt | sz-dedup
-//!
-//! # Show count of unique lines
-//! sz-dedup -c file.txt
-//! ```
+//! Exit: 0 wrote a line, 1 wrote none, 2 could not run. `--quiet` changes what is printed,
+//! never what is reported.
 
 use std::cmp::Ordering;
 use std::io::{self, Write};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz;
 
-mod shared;
 use shared::*;
 
 // region: AppendOnlyFlatHashSet
@@ -109,12 +55,27 @@ impl LineEntry {
     fn is_empty(&self) -> bool {
         self.offset == u64::MAX
     }
+
+    /// The line this entry points at, back in the input it was taken from.
+    #[inline]
+    fn bytes_in<'a>(&self, data: &'a [u8]) -> &'a [u8] {
+        let start = self.offset as usize;
+        &data[start..start + self.length as usize]
+    }
 }
 
 impl Default for LineEntry {
     fn default() -> Self {
         Self::EMPTY
     }
+}
+
+/// Where a line sits in the table, or where it would go.
+enum Slot {
+    /// An equal line is already recorded.
+    Occupied,
+    /// The line is absent, and this empty slot is the one it takes.
+    Vacant(usize),
 }
 
 /// Open-addressed hash set with linear probing.
@@ -140,38 +101,66 @@ impl AppendOnlyFlatHashSet {
         self.slots.len() - 1
     }
 
-    /// Find all entries with the given hash.
-    /// Returns an iterator that probes from the hash's home slot until an empty slot.
+    /// The slots to consult for `hash`, from its home slot onward. The load factor stays
+    /// under 60%, so an empty slot always ends the walk before this runs out.
     #[inline]
-    fn find(&self, hash: u64) -> FindIter<'_> {
+    fn probe(&self, hash: u64) -> impl Iterator<Item = usize> + '_ {
         let mask = self.mask();
-        FindIter {
-            slots: &self.slots,
-            target_hash: hash,
-            slot: (hash as usize) & mask,
-            done: false,
-        }
+        let home = (hash as usize) & mask;
+        (0..self.slots.len()).map(move |step| (home + step) & mask)
     }
 
-    /// Insert a new entry. Grows the table if load factor > 60%.
+    /// Where an equal line already sits, or the empty slot it would take — one walk of the
+    /// chain, which is what a `contains` then `insert` pair walks twice.
     #[inline]
-    fn insert(&mut self, hash: u64, offset: u64, length: u64) {
-        // Grow if load factor > 60%
+    fn slot_for(&self, hash: u64, line: &[u8], data: &[u8], ignore_case: bool) -> Slot {
+        self.probe(hash)
+            .find_map(|slot| {
+                let entry = self.slots[slot];
+                if entry.is_empty() {
+                    Some(Slot::Vacant(slot))
+                } else if entry.hash == hash && lines_equal(entry.bytes_in(data), line, ignore_case)
+                {
+                    Some(Slot::Occupied)
+                } else {
+                    None
+                }
+            })
+            .expect("the load factor leaves an empty slot on every probe path")
+    }
+
+    /// Record `line` unless an equal one is already here, answering whether it was new.
+    #[inline]
+    fn insert_if_absent(
+        &mut self,
+        hash: u64,
+        line: &[u8],
+        data: &[u8],
+        ignore_case: bool,
+        offset: u64,
+    ) -> bool {
         if self.populated_count * 100 > self.slots.len() * 60 {
             self.grow();
         }
-
-        self.insert_no_grow(hash, offset, length);
+        match self.slot_for(hash, line, data, ignore_case) {
+            Slot::Occupied => false,
+            Slot::Vacant(slot) => {
+                self.slots[slot] = LineEntry {
+                    hash,
+                    offset,
+                    length: line.len() as u64,
+                };
+                self.populated_count += 1;
+                true
+            }
+        }
     }
 
-    /// Insert without checking load factor (used during rehash)
-    #[inline]
     fn insert_no_grow(&mut self, hash: u64, offset: u64, length: u64) {
-        let mask = self.mask();
-        let mut slot = (hash as usize) & mask;
-        while !self.slots[slot].is_empty() {
-            slot = (slot + 1) & mask;
-        }
+        let slot = self
+            .probe(hash)
+            .find(|&slot| self.slots[slot].is_empty())
+            .expect("the load factor leaves an empty slot on every probe path");
         self.slots[slot] = LineEntry {
             hash,
             offset,
@@ -194,40 +183,6 @@ impl AppendOnlyFlatHashSet {
     }
 }
 
-/// Iterator over entries matching a specific hash
-struct FindIter<'a> {
-    slots: &'a [LineEntry],
-    target_hash: u64,
-    slot: usize,
-    done: bool,
-}
-
-impl<'a> Iterator for FindIter<'a> {
-    type Item = &'a LineEntry;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        let mask = self.slots.len() - 1;
-        loop {
-            let entry = &self.slots[self.slot];
-            self.slot = (self.slot + 1) & mask;
-
-            if entry.is_empty() {
-                self.done = true;
-                return None;
-            }
-
-            if entry.hash == self.target_hash {
-                return Some(entry);
-            }
-        }
-    }
-}
-
 // endregion: AppendOnlyFlatHashSet
 
 // region: Hash and Comparison Utilities
@@ -236,9 +191,12 @@ impl<'a> Iterator for FindIter<'a> {
 #[inline]
 fn compute_hash(line: &[u8], ignore_case: bool, scratch: &mut Vec<u8>) -> u64 {
     if ignore_case {
-        // UTF-8 case folding can expand characters (e.g., ß → ss), max ~3x
-        scratch.clear();
-        scratch.resize(line.len().saturating_mul(3).max(64), 0);
+        // Folding can expand a character threefold (ß → ss), and only ever grows the buffer:
+        // re-zeroing what the fold overwrites would memset three times the line, per line.
+        let needed = line.len().saturating_mul(3).max(64);
+        if scratch.len() < needed {
+            scratch.resize(needed, 0);
+        }
         let folded_len = sz::utf8_uncased_fold(line, &mut scratch[..]);
         sz::hash(&scratch[..folded_len])
     } else {
@@ -260,74 +218,6 @@ fn lines_equal(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
 
 // region: Deduplication Functions
 
-/// Deduplicate lines in-place, compacting the buffer.
-///
-/// Returns (new_length, unique_count).
-/// When `utf8` is true, handles all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
-/// When `utf8` is false, only handles LF newlines.
-fn dedup_in_place(data: &mut [u8], ignore_case: bool, utf8: bool) -> (usize, DedupCounts) {
-    // Compaction only overwrites `[0..write_pos]`, which is always behind `line_start`,
-    // so the tail `data[line_start..]` is intact — find each newline lazily there with
-    // no up-front offset buffer.
-    let base = data.as_ptr() as usize;
-    let mut seen = AppendOnlyFlatHashSet::new();
-    let mut scratch = Vec::new();
-    let mut write_pos: usize = 0;
-    let mut unique_count: usize = 0;
-    let mut total_count: usize = 0;
-    let mut line_start: usize = 0;
-
-    while line_start < data.len() {
-        // Next newline in the untouched tail; the final line has none (len 0).
-        let (line_end, newline_len) = if utf8 {
-            // UTF-8 aware: first of the 7 Unicode newline chars, CRLF as one run.
-            match sz::Utf8Newlines::new(&data[line_start..]).next() {
-                Some(run) => (run.as_ptr() as usize - base, run.len()),
-                None => (data.len(), 0),
-            }
-        } else {
-            match sz::find(&data[line_start..], b"\n") {
-                Some(offset) => (line_start + offset, 1),
-                None => (data.len(), 0),
-            }
-        };
-
-        let line_len = line_end - line_start;
-        let hash = compute_hash(&data[line_start..line_end], ignore_case, &mut scratch);
-
-        // Check for duplicate against already-written lines in [0..write_pos].
-        let is_duplicate = seen.find(hash).any(|entry| {
-            let existing = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
-            lines_equal(existing, &data[line_start..line_end], ignore_case)
-        });
-
-        if !is_duplicate {
-            seen.insert(hash, write_pos as u64, line_len as u64);
-            if write_pos != line_start {
-                data.copy_within(line_start..line_end, write_pos);
-            }
-            write_pos += line_len;
-            // Preserve the original newline sequence.
-            if newline_len > 0 {
-                data.copy_within(line_end..line_end + newline_len, write_pos);
-                write_pos += newline_len;
-            }
-            unique_count += 1;
-        }
-
-        total_count += 1;
-        line_start = line_end + newline_len;
-    }
-
-    (
-        write_pos,
-        DedupCounts {
-            total: total_count,
-            unique: unique_count,
-        },
-    )
-}
-
 /// How many lines were read and how many survived deduplication.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct DedupCounts {
@@ -335,20 +225,58 @@ struct DedupCounts {
     unique: usize,
 }
 
-impl DedupCounts {
-    /// Whether any duplicate was dropped, which is what `-q` reports.
-    fn dropped_any(self) -> bool {
-        self.unique < self.total
+/// Lines paired with the span they occupy, terminator included, so a caller that
+/// rewrites the input can reproduce CR, CRLF, NEL, LS and PS rather than flatten them.
+struct TerminatedLines<'a> {
+    data: &'a [u8],
+    lines: LineIter<'a>,
+    pending: Option<&'a [u8]>,
+}
+
+impl<'a> TerminatedLines<'a> {
+    fn new(data: &'a [u8], newlines: Newlines) -> Self {
+        let mut lines = LineIter::new(data, newlines);
+        let pending = lines.next();
+        Self {
+            data,
+            lines,
+            pending,
+        }
     }
+}
+
+impl<'a> Iterator for TerminatedLines<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let line = self.pending.take()?;
+        let start = offset_within(self.data, line);
+        self.pending = self.lines.next();
+        let end = match self.pending {
+            Some(next) => offset_within(self.data, next),
+            None => self.data.len(),
+        };
+        Some((line, &self.data[start..end]))
+    }
+}
+
+/// How a surviving line is written out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rendering {
+    /// The line plus the requested terminator, normalizing the input's own.
+    Terminated(Terminator),
+    /// One JSON record per line, closed by a summary record.
+    Json,
+    /// The line exactly as it appeared, terminator and all.
+    Verbatim,
 }
 
 /// Everything the writer needs, decided once from `Args`.
 #[derive(Clone, Copy)]
 struct OutputConfig<'a> {
-    json: bool,
-    terminator: Terminator,
-    quiet: bool,
-    /// Input name carried into the JSON envelope.
+    rendering: Rendering,
+    /// The input's path, carried into the JSON envelope.
     path: &'a str,
 }
 
@@ -357,27 +285,32 @@ fn write_line(
     output: &mut dyn Write,
     config: &OutputConfig,
     line: &[u8],
+    span: &[u8],
     index: usize,
 ) -> io::Result<()> {
-    if config.quiet {
-        return Ok(());
+    match config.rendering {
+        Rendering::Json => write_line_record(output, config.path, line, index, None),
+        Rendering::Verbatim => output.write_all(span),
+        Rendering::Terminated(terminator) => {
+            output.write_all(line)?;
+            output.write_all(&[terminator.as_byte()])
+        }
     }
-    if config.json {
-        output.write_all(br#"{"type":"line","data":{"path":"#)?;
-        json_text_field_to(output, config.path.as_bytes())?;
-        output.write_all(br#","lines":"#)?;
-        json_text_field_to(output, line)?;
-        write!(output, r#","line_number":{}}}}}"#, index + 1)?;
-        return output.write_all(b"\n");
-    }
-    output.write_all(line)?;
-    output.write_all(&[config.terminator.as_byte()])
 }
 
-/// Deduplicate lines, writing to output stream (for stdin or explicit output file).
+/// Write the summary record that closes a JSON stream.
+fn write_summary_json(output: &mut dyn Write, path: &str, counts: DedupCounts) -> io::Result<()> {
+    output.write_all(br#"{"type":"summary","data":{"path":"#)?;
+    json_text_field_to(output, path.as_bytes())?;
+    writeln!(
+        output,
+        r#","unique_lines":{},"total_lines":{}}}}}"#,
+        counts.unique, counts.total
+    )
+}
+
+/// Deduplicate `data` into `output`, keeping the first occurrence of each line.
 /// When `utf8` is true, handles all Unicode newlines (LF, CR, CRLF, NEL, LS, PS).
-/// When `utf8` is false, only handles LF newlines.
-/// Output is normalized to LF newlines.
 fn dedup_to_writer(
     data: &[u8],
     output: &mut dyn Write,
@@ -389,32 +322,35 @@ fn dedup_to_writer(
     let mut scratch = Vec::new();
     let mut counts = DedupCounts::default();
 
-    let lines = LineIter::new(data, Newlines::from_utf8(utf8));
-
-    for line in lines {
+    for (line, span) in TerminatedLines::new(data, Newlines::from_utf8(utf8)) {
         counts.total += 1;
-        let line_offset = line.as_ptr() as usize - data.as_ptr() as usize;
+        let line_offset = offset_within(data, line);
         let hash = compute_hash(line, ignore_case, &mut scratch);
 
-        let is_duplicate = seen.find(hash).any(|entry| {
-            let existing = &data[entry.offset as usize..(entry.offset + entry.length) as usize];
-            lines_equal(existing, line, ignore_case)
-        });
-
-        if !is_duplicate {
-            seen.insert(hash, line_offset as u64, line.len() as u64);
-            write_line(output, config, line, counts.unique)?;
+        if seen.insert_if_absent(hash, line, data, ignore_case, line_offset as u64) {
+            write_line(output, config, line, span, counts.unique)?;
             counts.unique += 1;
         }
     }
 
-    output.flush()?;
+    if config.rendering == Rendering::Json {
+        write_summary_json(output, config.path, counts)?;
+    }
     Ok(counts)
 }
 
 // endregion: Deduplication Functions
 
 // region: CLI
+
+/// How records are rendered.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    /// One surviving line per record.
+    Text,
+    /// JSON Lines, one record per line plus a closing summary.
+    Json,
+}
 
 /// Deduplicate lines in files
 #[derive(Parser)]
@@ -424,120 +360,127 @@ struct Args {
     /// Input file (use '-' or omit for stdin)
     input: Option<String>,
 
-    /// Output file (use '-' or omit for stdout, or omit for in-place)
-    #[arg(short, long)]
+    /// Write to this file instead of stdout
+    #[arg(long, conflicts_with_all = ["in_place", "dry_run"])]
     output: Option<String>,
 
-    /// Case-insensitive deduplication (full Unicode case folding)
-    #[arg(short = 'i', long)]
-    ignore_case: bool,
-
-    /// Rewrite the input file in place instead of writing to stdout
-    #[arg(long, conflicts_with_all = ["output", "quiet"])]
+    /// Rewrite the input file, swapping the result in atomically once it is on disk
+    #[arg(long, conflicts_with_all = ["dry_run", "null", "quiet"])]
     in_place: bool,
 
-    /// Show count of unique lines
-    #[arg(short = 'c', long)]
-    count: bool,
+    /// Report what would be dropped without writing anything
+    #[arg(long)]
+    dry_run: bool,
 
-    /// Enable UTF-8 mode (handle Unicode newlines: CR, CRLF, NEL, LS, PS)
+    /// Fold case when comparing lines; implies --utf8
+    #[arg(long)]
+    ignore_case: bool,
+
+    /// Treat the input as UTF-8 text
     #[arg(long)]
     utf8: bool,
 
-    /// Emit JSON Lines, one record per emitted line
-    #[arg(long, conflicts_with = "null", help_heading = "Output Formats")]
-    json: bool,
+    /// Render records as plain lines or as JSON Lines
+    #[arg(long, value_enum, default_value_t = Format::Text, help_heading = "Output Formats")]
+    format: Format,
 
-    /// NUL-terminate each output line instead of newline
-    #[arg(short = '0', long, help_heading = "Output Formats")]
+    /// Print one line about the whole run on stderr
+    #[arg(long, conflicts_with = "dry_run", help_heading = "Output Formats")]
+    summary: bool,
+
+    /// NUL-terminate each output record instead of newline, for `xargs -0`
+    #[arg(long, help_heading = "Output Formats")]
     null: bool,
 
-    /// Suppress output; exit 0 if any duplicate was dropped, 1 otherwise
-    #[arg(short = 'q', long, conflicts_with_all = ["output", "json", "null"], help_heading = "Output Formats")]
+    /// Suppress all output; exit 0 if any line was written, 1 otherwise
+    #[arg(long, conflicts_with_all = ["output", "dry_run", "null"], help_heading = "Output Formats")]
     quiet: bool,
 }
 
-fn main() {
+/// Render a validation failure the way clap renders a parse failure: same `error:` prefix,
+/// same usage block, same exit code. The kind is never displayed, so one kind serves all.
+fn reject(message: impl std::fmt::Display) -> clap::Error {
+    Args::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+}
+
+/// Every constraint that depends on an argument's *value*, which clap cannot declare.
+fn validate(args: &Args) -> Result<(), clap::Error> {
+    if args.format == Format::Json {
+        if args.null {
+            return Err(reject("--format json cannot be combined with --null"));
+        }
+        if args.quiet {
+            return Err(reject("--format json cannot be combined with --quiet"));
+        }
+    }
+    if args.in_place && args.input.as_deref().is_none_or(|path| path == "-") {
+        return Err(reject(
+            "--in-place requires a file argument (cannot rewrite stdin)",
+        ));
+    }
+    Ok(())
+}
+
+fn main() -> std::process::ExitCode {
     let args = Args::parse();
+    // Every byte this run prints goes here, so the records stay in one order.
+    let mut output = stdout_writer();
+    report("sz-dedup", run(&args, &mut output, &mut io::stderr()))
+}
 
-    // UTF-8 mode is implicit when case-insensitive (case folding requires UTF-8)
+/// The run's output and the notes about it are two different streams, and the caller passes
+/// both: `output` carries what the run produced, `notes` carries what it has to say about
+/// the run. Only the second may be prose, and only the second goes to stderr, so redirecting
+/// stdout gives a file of data rather than data with a sentence appended.
+fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Status, Failure> {
+    validate(args)?;
+
+    // Case folding is a Unicode operation, so it brings the Unicode newline set with it.
     let utf8_mode = args.utf8 || args.ignore_case;
+    let path = args.input.as_deref().unwrap_or("-");
 
-    let mut stdout = io::stdout();
+    let input = get_input(args.input.as_deref()).at(path)?;
+    let data = input.as_bytes();
 
-    // In-place is opt-in: the default writes to stdout like every other binary,
-    // so `sz-dedup file | head` cannot destroy the input.
-    let in_place = args.in_place;
-    if in_place && args.input.as_deref().unwrap_or("-") == "-" {
-        eprintln!("Error: --in-place requires a file argument (cannot rewrite stdin)");
-        ExitCode::Error.exit(&mut stdout);
-    }
-
-    let config = OutputConfig {
-        json: args.json,
-        terminator: Terminator::from_null(args.null),
-        quiet: args.quiet,
-        path: args.input.as_deref().unwrap_or("-"),
-    };
-
-    let counts = if in_place {
-        // In-place mode: mutable mmap, compact, truncate
-        let input_path = args.input.as_ref().unwrap();
-
-        let mut input = match get_input_mutable(input_path) {
-            Ok(input) => input,
-            Err(error) => exit_with_error(
-                &mut stdout,
-                &error,
-                "Error opening file for in-place modification",
-            ),
-        };
-
-        let data = input.as_mut_bytes().unwrap();
-        let (new_len, counts) = dedup_in_place(data, args.ignore_case, utf8_mode);
-
-        if let Err(error) = input.truncate_and_flush(new_len as u64) {
-            exit_with_error(&mut stdout, &error, "Error truncating file");
-        }
-
-        counts
+    // The destination decides the rendering: a rewritten file must differ from the original
+    // only by the lines that were dropped, and JSON is only legal where the records do not
+    // share stdout with the bytes they describe.
+    let (destination, rendering) = if args.in_place {
+        (Destination::Replacing(path), Rendering::Verbatim)
     } else {
-        // Streaming mode: read-only input, write to output
-        let input = match get_input(args.input.as_deref()) {
-            Ok(input) => input,
-            Err(error) => exit_with_error(&mut stdout, &error, "Error reading input"),
+        let rendering = match args.format {
+            Format::Json => Rendering::Json,
+            Format::Text => Rendering::Terminated(Terminator::from_null(args.null)),
         };
-
-        let data = input.as_bytes();
-
-        let mut output = match get_output(args.output.as_deref()) {
-            Ok(output) => output,
-            Err(error) => exit_with_error(&mut stdout, &error, "Error opening output"),
+        let destination = if args.dry_run || args.quiet {
+            Destination::Discard
+        } else {
+            match args.output.as_deref().filter(|name| *name != "-") {
+                Some(name) => Destination::Creating(name),
+                None => Destination::Stdout,
+            }
         };
-
-        match dedup_to_writer(data, &mut output, args.ignore_case, utf8_mode, &config) {
-            Ok(counts) => counts,
-            Err(error) => exit_on_write_error(&mut output, &error, "Error deduplicating"),
-        }
+        (destination, rendering)
     };
+    let config = OutputConfig { rendering, path };
+    let counts = destination.write("sz-dedup", output, |output| {
+        dedup_to_writer(data, output, args.ignore_case, utf8_mode, &config)
+    })?;
 
-    // The summary always terminates a `--json` run. In-place mode has no per-line
-    // stream at all, so it is the entire report there.
-    if args.json {
-        let _ = stdout.write_all(br#"{"type":"summary","data":{"path":"#);
-        let _ = json_text_field_to(&mut stdout, config.path.as_bytes());
-        let _ = writeln!(
-            stdout,
-            r#","unique_lines":{},"total_lines":{}}}}}"#,
-            counts.unique, counts.total
-        );
-    } else if args.count {
-        eprintln!("{} unique lines", counts.unique);
+    if args.format == Format::Json {
+        // A run with no record stream still owes its one summary record.
+        if args.in_place || args.dry_run {
+            write_summary_json(output, path, counts).at("-")?;
+        }
+    } else if args.summary || args.dry_run {
+        // Prose about the run, so it goes to `notes`: `sz-dedup --summary f > unique.txt`
+        // must not append a sentence to the lines it just wrote. `--format json` puts the
+        // same numbers on the record stream, where a program can read them.
+        writeln!(notes, "{} unique lines of {}", counts.unique, counts.total).at("-")?;
     }
+    output.flush().at("-")?;
 
-    if args.quiet {
-        ExitCode::from_found(counts.dropped_any()).exit(&mut stdout);
-    }
+    Ok(Status::from_found(counts.unique > 0))
 }
 
 // endregion: CLI
@@ -547,95 +490,80 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn text_config() -> OutputConfig<'static> {
         OutputConfig {
-            json: false,
-            terminator: Terminator::Newline,
-            quiet: false,
+            rendering: Rendering::Terminated(Terminator::Newline),
+            path: "-",
+        }
+    }
+
+    fn verbatim_config() -> OutputConfig<'static> {
+        OutputConfig {
+            rendering: Rendering::Verbatim,
             path: "-",
         }
     }
 
     #[test]
     fn inserts_and_finds_entries_by_hash() {
-        let mut set = AppendOnlyFlatHashSet::new();
-        set.insert(123, 0, 10);
-        set.insert(456, 20, 5);
-        set.insert(123, 50, 8); // Same hash, different entry
+        let mut data = vec![b'a'; 10];
+        data.resize(50, b'.');
+        data.extend_from_slice(b"bbbbbbbb");
 
+        let mut set = AppendOnlyFlatHashSet::new();
+        assert!(set.insert_if_absent(123, &data[0..10], &data, false, 0));
+        assert!(set.insert_if_absent(456, &data[20..25], &data, false, 20));
+        // Same hash, different bytes: a collision keeps both.
+        assert!(set.insert_if_absent(123, &data[50..58], &data, false, 50));
         assert_eq!(set.populated_count, 3);
-        assert_eq!(set.find(123).count(), 2);
-        assert_eq!(set.find(456).count(), 1);
-        assert_eq!(set.find(789).count(), 0);
+
+        // An exact repeat of either is refused without adding a slot.
+        assert!(!set.insert_if_absent(123, &data[0..10], &data, false, 0));
+        assert!(!set.insert_if_absent(123, &data[50..58], &data, false, 50));
+        assert_eq!(set.populated_count, 3);
     }
 
     #[test]
     fn grows_and_rehashes_beyond_capacity() {
+        let data: &[u8] = b"";
         let mut set = AppendOnlyFlatHashSet::new();
-        // Insert more than 60% of initial capacity to trigger growth
-        for i in 1..=700 {
-            set.insert(i, i * 10, i);
+        for hash in 1..=700u64 {
+            assert!(set.insert_if_absent(hash, data, data, false, 0));
         }
         assert!(set.slots.len() > 1024);
         assert_eq!(set.populated_count, 700);
 
-        // Verify all entries are still findable
-        for i in 1..=700 {
-            assert_eq!(set.find(i).count(), 1);
+        // Every entry survives the rehash, which a second insert proves by being refused.
+        for hash in 1..=700u64 {
+            assert!(!set.insert_if_absent(hash, data, data, false, 0));
         }
+        assert_eq!(set.populated_count, 700);
     }
 
     #[test]
-    fn dedups_repeated_lines_in_place() {
-        let mut data = b"line1\nline2\nline1\nline3\n".to_vec();
-        let (new_len, counts) = dedup_in_place(&mut data, false, false);
+    fn folds_unicode_case_when_comparing_lines() {
+        let data = "MÜNCHEN\nmünchen\nberlin\n".as_bytes();
+        let mut output = Vec::new();
 
-        assert_eq!(counts.unique, 3);
-        let result = String::from_utf8(data[..new_len].to_vec()).unwrap();
-        let lines: Vec<_> = result.lines().collect();
-        assert_eq!(lines, vec!["line1", "line2", "line3"]);
-    }
-
-    #[test]
-    fn dedups_in_place_ignoring_case() {
-        let mut data = b"Hello\nhello\nworld\nWORLD\n".to_vec();
-        let (new_len, counts) = dedup_in_place(&mut data, true, true);
+        let counts = dedup_to_writer(data, &mut output, true, true, &text_config()).unwrap();
 
         assert_eq!(counts.unique, 2);
-        let result = String::from_utf8(data[..new_len].to_vec()).unwrap();
-        let lines: Vec<_> = result.lines().collect();
-        assert_eq!(lines, vec!["Hello", "world"]);
+        assert_eq!(output, "MÜNCHEN\nberlin\n".as_bytes());
     }
 
     #[test]
-    fn dedups_in_place_folding_unicode() {
-        let mut data = "MÜNCHEN\nmünchen\nberlin\n".as_bytes().to_vec();
-        let (new_len, counts) = dedup_in_place(&mut data, true, true);
+    fn keeps_every_terminator_the_input_used() {
+        // The in-place rendering: a rewritten file must differ from the original only
+        // by the lines that were dropped.
+        let data = "a\r\nb\u{2028}a\r\nc".as_bytes();
+        let mut output = Vec::new();
 
-        assert_eq!(counts.unique, 2);
-        let result = String::from_utf8(data[..new_len].to_vec()).unwrap();
-        let lines: Vec<_> = result.lines().collect();
-        assert_eq!(lines, vec!["MÜNCHEN", "berlin"]);
-    }
+        let counts = dedup_to_writer(data, &mut output, false, true, &verbatim_config()).unwrap();
 
-    #[test]
-    fn collapses_all_duplicate_lines_in_place() {
-        let mut data = b"dup\ndup\ndup\ndup\n".to_vec();
-        let (new_len, counts) = dedup_in_place(&mut data, false, false);
-
-        assert_eq!(counts.unique, 1);
-        assert_eq!(&data[..new_len], b"dup\n");
-    }
-
-    #[test]
-    fn keeps_unique_lines_in_place() {
-        let mut data = b"a\nb\nc\n".to_vec();
-        let original_len = data.len();
-        let (new_len, counts) = dedup_in_place(&mut data, false, false);
-
-        assert_eq!(counts.unique, 3);
-        assert_eq!(new_len, original_len);
+        assert_eq!(counts.total, 4);
+        assert_eq!(output, "a\r\nb\u{2028}c".as_bytes());
     }
 
     #[test]
@@ -694,6 +622,117 @@ mod tests {
         let counts = dedup_to_writer(data, &mut output, false, false, &text_config()).unwrap();
 
         assert_eq!(counts.unique, 2); // "" and "text"
+    }
+
+    #[test]
+    fn declares_no_short_flags() {
+        let mut command = Args::command();
+        command.build();
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "output",
+                "in-place",
+                "dry-run",
+                "ignore-case",
+                "utf8",
+                "format",
+                "summary",
+                "null",
+                "quiet",
+                "help",
+                "version",
+            ]
+        );
+    }
+
+    /// Parse and then apply the value-conditional checks, as `run` does.
+    fn accepts(flags: &[&str]) -> bool {
+        let arguments = ["sz-dedup", "f"].into_iter().chain(flags.iter().copied());
+        Args::try_parse_from(arguments).is_ok_and(|args| validate(&args).is_ok())
+    }
+
+    #[test]
+    fn declares_the_conflicts_that_used_to_pass_silently() {
+        assert!(accepts(&["--in-place"]));
+        for flags in [
+            vec!["--in-place", "--null"],
+            vec!["--in-place", "--output", "o"],
+            vec!["--in-place", "--dry-run"],
+            vec!["--quiet", "--format", "json"],
+            vec!["--null", "--format", "json"],
+            vec!["--summary", "--dry-run"],
+        ] {
+            assert!(!accepts(&flags), "expected {:?} to be rejected", flags);
+        }
+        assert!(
+            accepts(&["--summary", "--format", "json"]),
+            "--summary names the record json already emits"
+        );
+        assert!(
+            accepts(&["--quiet", "--summary"]),
+            "--quiet governs stdout, and a summary is written to stderr"
+        );
+    }
+
+    #[test]
+    fn refuses_to_rewrite_stdin_in_place() {
+        for arguments in [
+            vec!["sz-dedup", "--in-place"],
+            vec!["sz-dedup", "--in-place", "-"],
+        ] {
+            let args = Args::try_parse_from(&arguments).unwrap();
+            assert!(validate(&args).is_err(), "expected {:?} to fail", arguments);
+        }
+    }
+
+    #[test]
+    fn rewrites_an_empty_file_as_a_no_op() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("empty.txt");
+        fs::write(&path, b"").unwrap();
+        let config = verbatim_config();
+
+        let counts = Destination::Replacing(path.to_str().unwrap())
+            .write("sz-dedup", &mut io::sink(), |output| {
+                dedup_to_writer(b"", output, false, false, &config)
+            })
+            .unwrap();
+
+        assert_eq!(counts, DedupCounts::default());
+        assert_eq!(fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn closes_a_json_stream_with_its_summary() {
+        let data = b"a\na\n";
+        let mut output = Vec::new();
+        let config = OutputConfig {
+            rendering: Rendering::Json,
+            path: "trex.txt",
+        };
+
+        dedup_to_writer(data, &mut output, false, false, &config).unwrap();
+
+        let text = String::from_utf8(output).unwrap();
+        let records: Vec<_> = text.lines().collect();
+        assert_eq!(records.len(), 2);
+        assert!(records[1].contains(r#""type":"summary""#));
+        assert!(records[1].contains(r#""unique_lines":1,"total_lines":2"#));
     }
 
     #[test]

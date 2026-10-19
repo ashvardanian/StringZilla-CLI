@@ -255,6 +255,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -414,9 +425,9 @@ dependencies = [
 
 [[package]]
 name = "stringzilla"
-version = "5.0.3"
+version = "5.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0892c20dc05b4db5cc3ecc394ecdc2f610c90aca75bbef77f9f8ab115c99f91"
+checksum = "dbcaa1f7662e1c6b2e6ff64450655cb8830763ebf8bd02038795c2689dd3cc68"
 dependencies = [
  "allocator-api2",
  "cc",
@@ -428,9 +439,13 @@ dependencies = [
 name = "stringzilla-cli"
 version = "0.1.0"
 dependencies = [
+ "allocator-api2",
  "clap",
+ "forkunion",
  "glob",
  "ignore",
+ "io-uring",
+ "libc",
  "memmap2",
  "stringtape",
  "stringzilla",
