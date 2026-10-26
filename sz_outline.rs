@@ -302,40 +302,16 @@ fn parse_markdown<'a>(data: &'a [u8], newlines: Newlines) -> Vec<OutlineElement<
             )
             .with_length(line_len, 1);
             push_element(&mut elements, current_section, element);
-        }
-        // Blockquote: starts with `>`
-        else if trimmed.starts_with(b">") {
+        } else if let Some(block) = markdown_block(trimmed) {
             open_or_extend(
                 &mut elements,
                 &mut open_block,
                 current_section,
-                Block::Blockquote,
+                block,
                 start,
             );
-        }
-        // Table: contains `|`
-        else if !trimmed.is_empty() && find(trimmed, b"|").is_some() {
-            open_or_extend(
-                &mut elements,
-                &mut open_block,
-                current_section,
-                Block::Table,
-                start,
-            );
-        }
-        // Blank line ends the open block
-        else if trimmed.is_empty() {
+        } else {
             close_block(&mut elements, &mut open_block, current_section, interrupted);
-        }
-        // Anything else is paragraph text
-        else {
-            open_or_extend(
-                &mut elements,
-                &mut open_block,
-                current_section,
-                Block::Paragraph,
-                start,
-            );
         }
     }
 
@@ -352,6 +328,19 @@ fn parse_markdown<'a>(data: &'a [u8], newlines: Newlines) -> Vec<OutlineElement<
         end_of_input,
     );
     elements
+}
+
+/// Classify prose after headings and images; an empty line closes the current block.
+fn markdown_block(line: &[u8]) -> Option<Block> {
+    if line.is_empty() {
+        None
+    } else if line.starts_with(b">") {
+        Some(Block::Blockquote)
+    } else if find(line, b"|").is_some() {
+        Some(Block::Table)
+    } else {
+        Some(Block::Paragraph)
+    }
 }
 
 /// Record an element under the current section, or at the top level when there is none.
@@ -467,7 +456,6 @@ fn parse_image(line: &[u8]) -> Option<&[u8]> {
 /// Parse C/C++ source file and extract outline elements
 fn parse_c<'a>(data: &'a [u8], newlines: Newlines) -> Vec<OutlineElement<'a>> {
     let mut elements: Vec<OutlineElement<'a>> = Vec::new();
-    let mut line_number = 0usize;
 
     // State for function body tracking
     let mut brace_depth = 0i32;
@@ -478,29 +466,13 @@ fn parse_c<'a>(data: &'a [u8], newlines: Newlines) -> Vec<OutlineElement<'a>> {
     let mut in_multiline_comment = false;
     let mut pending_signature: Option<(usize, usize, Vec<u8>)> = None;
 
-    for line in LineIter::new(data, newlines) {
-        line_number += 1;
+    for (line_index, line) in LineIter::new(data, newlines).enumerate() {
+        let line_number = line_index + 1;
         let line_start = offset_within(data, line);
         let line_end = line_start + line.len();
 
-        // Handle multi-line comments
-        if in_multiline_comment {
-            if find(line, b"*/").is_some() {
-                in_multiline_comment = false;
-            }
+        let Some(effective_line) = code_line(line, &mut in_multiline_comment) else {
             continue;
-        }
-
-        // Check for comment start
-        if find(line, b"/*").is_some() && find(line, b"*/").is_none() {
-            in_multiline_comment = true;
-            continue;
-        }
-
-        // Skip single-line comments for parsing
-        let effective_line = match find(line, b"//") {
-            Some(position) => &line[..position],
-            None => line,
         };
 
         let trimmed = effective_line.trim_ascii();
@@ -608,6 +580,24 @@ fn parse_c<'a>(data: &'a [u8], newlines: Newlines) -> Vec<OutlineElement<'a>> {
     }
 
     elements
+}
+
+/// Skip comment lines and remove a trailing single-line comment before parsing code.
+fn code_line<'a>(line: &'a [u8], in_multiline_comment: &mut bool) -> Option<&'a [u8]> {
+    if *in_multiline_comment {
+        if find(line, b"*/").is_some() {
+            *in_multiline_comment = false;
+        }
+        return None;
+    }
+    if find(line, b"/*").is_some() && find(line, b"*/").is_none() {
+        *in_multiline_comment = true;
+        return None;
+    }
+    Some(match find(line, b"//") {
+        Some(position) => &line[..position],
+        None => line,
+    })
 }
 
 /// Result of attempting to parse a function line

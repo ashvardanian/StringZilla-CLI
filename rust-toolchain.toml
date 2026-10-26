@@ -1,0 +1,5 @@
+# StringZilla v6 needs Rust 1.100; use the tested nightly until that release is stable.
+[toolchain]
+channel = "nightly-2026-10-08"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

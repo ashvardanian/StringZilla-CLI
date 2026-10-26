@@ -1088,17 +1088,20 @@ mod tests {
         );
     }
 
-    /// A walked file is opened by its path, not by its lossy rendering, so a name that is
-    /// not valid UTF-8 still gets segmented rather than failing to open.
+    /// Walked files are opened by their paths, including names with non-ASCII bytes.
     #[cfg(unix)]
     #[test]
-    fn segments_a_walked_name_that_is_not_utf8() {
+    fn segments_walked_files_with_non_ascii_names() {
         use std::os::unix::ffi::OsStrExt;
 
         let directory = tempfile::TempDir::new().unwrap();
-        let awkward = directory
-            .path()
-            .join(std::ffi::OsStr::from_bytes(b"bad\xff\xfename.txt"));
+        // APFS requires valid UTF-8; other Unix runs keep the raw-byte regression case.
+        let name: &[u8] = if cfg!(target_os = "macos") {
+            "café.txt".as_bytes()
+        } else {
+            b"bad\xff\xfename.txt"
+        };
+        let awkward = directory.path().join(std::ffi::OsStr::from_bytes(name));
         std::fs::write(&awkward, b"alpha beta gamma\n").unwrap();
         std::fs::write(directory.path().join("plain.txt"), b"delta epsilon\n").unwrap();
 

@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use std::ops::RangeInclusive;
 
 use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
-use stringzilla::sz::{FindSplits, MatcherType};
+use stringzilla::sz::{FindSplits, Matcher};
 
 use shared::*;
 
@@ -172,7 +172,7 @@ fn split_fields(
     if line.is_empty() {
         return 0;
     }
-    let mut splits = FindSplits::new(line, MatcherType::Find(delimiter)).map(|field| Span {
+    let mut splits = FindSplits::new(line, Matcher::Substring(delimiter)).map(|field| Span {
         offset: offset_within(line, field),
         length: field.len(),
     });
@@ -421,7 +421,7 @@ mod tests {
     fn counts_records_a_quiet_run_never_writes() {
         // `--quiet` extracts into a sink, so the count that becomes the exit status
         // is the same one a printing run would report.
-        let selection = ColumnSelection::new(&[0..=0], b"\t", None);
+        let selection = ColumnSelection::new(std::slice::from_ref(&(0..=0)), b"\t", None);
         let config = text_config(b"\t");
 
         let mut state = ColsState::default();
@@ -731,7 +731,7 @@ mod tests {
 
         let (output, count) = extract(
             data,
-            &ColumnSelection::new(&[1..=1], b"\t", None),
+            &ColumnSelection::new(std::slice::from_ref(&(1..=1)), b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );
@@ -775,7 +775,7 @@ mod tests {
 
         let (output, count) = extract(
             data,
-            &ColumnSelection::new(&[1..=1], b"\t", Some(3)),
+            &ColumnSelection::new(std::slice::from_ref(&(1..=1)), b"\t", Some(3)),
             Newlines::Lf,
             &text_config(b"\t"),
         );
@@ -796,7 +796,7 @@ mod tests {
 
         let (output, _) = extract(
             data,
-            &ColumnSelection::new(&[0..=0], b"\t", None),
+            &ColumnSelection::new(std::slice::from_ref(&(0..=0)), b"\t", None),
             Newlines::Lf,
             &config,
         );
@@ -869,7 +869,7 @@ mod tests {
     fn splits_rows_on_unicode_newlines_under_utf8() {
         // Line separators, which only the Unicode newline set breaks on.
         let data = "a\tb\u{2028}c\td\n".as_bytes();
-        let selection = ColumnSelection::new(&[1..=1], b"\t", None);
+        let selection = ColumnSelection::new(std::slice::from_ref(&(1..=1)), b"\t", None);
 
         let (output, count) = extract(data, &selection, Newlines::Unicode, &text_config(b"\t"));
         assert_eq!(count, 2);
@@ -892,9 +892,9 @@ mod tests {
 
         for (newline_set, newlines) in [("lf", Newlines::Lf), ("unicode", Newlines::Unicode)] {
             for selection in [
-                ColumnSelection::new(&[1..=1], b"\t", None),
+                ColumnSelection::new(std::slice::from_ref(&(1..=1)), b"\t", None),
                 ColumnSelection::new(&[0..=0, 2..=2], b"\t", None),
-                ColumnSelection::new(&[1..=1], b"\t", Some(3)),
+                ColumnSelection::new(std::slice::from_ref(&(1..=1)), b"\t", Some(3)),
             ] {
                 for config in [text_config(b"\t"), text_config(b","), json] {
                     let whole = extract(data, &selection, newlines, &config);
@@ -917,7 +917,7 @@ mod tests {
         let (output, count) = extract_streamed(
             b"",
             7,
-            &ColumnSelection::new(&[0..=0], b"\t", None),
+            &ColumnSelection::new(std::slice::from_ref(&(0..=0)), b"\t", None),
             Newlines::Lf,
             &text_config(b"\t"),
         );

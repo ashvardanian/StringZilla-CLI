@@ -249,15 +249,17 @@ type Outcome = Result<Hashed, io::Error>;
 
 /// Why a slot stopped.
 ///
-/// An errno rather than an `io::Error`, because a worker may not allocate and
-/// `io::Error::new(kind, string)` does. The path is attached at report time, which is also the
-/// only place `shared::At` can turn it into a `Failure`.
+/// Keep the OS code or the portable error kind rather than an `io::Error`, because a worker
+/// may not allocate. The path is attached at report time, which is also the only place
+/// `shared::At` can turn it into a `Failure`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stopped {
     /// The file delivered its last byte.
     Ended,
     /// A read came back with this errno.
     Errno(i32),
+    /// A read failed without an OS error code.
+    Kind(io::ErrorKind),
     /// A read short of the end returned zero: the file shrank underneath the run.
     Shrank,
 }
@@ -267,6 +269,7 @@ impl Stopped {
         match self {
             Stopped::Ended => None,
             Stopped::Errno(errno) => Some(io::Error::from_raw_os_error(errno)),
+            Stopped::Kind(kind) => Some(io::Error::from(kind)),
             Stopped::Shrank => Some(io::Error::from(io::ErrorKind::UnexpectedEof)),
         }
     }
@@ -496,7 +499,11 @@ fn advance_group(
         let held: &dyn Fleet = fleet;
         let group = &mut staging[..count];
         if count >= LANES_WORTH_A_GROUP {
-            if sz::sha256_multistate_update_by(group, |lane| held.chunk(members[lane])).is_err() {
+            let mut chunks = [&[][..]; LANE_COUNT];
+            for (chunk, &slot) in chunks[..count].iter_mut().zip(&members[..count]) {
+                *chunk = held.chunk(slot);
+            }
+            if sz::sha256_multistate_update(group, &chunks[..count]).is_err() {
                 return Err(io::Error::from(io::ErrorKind::InvalidInput));
             }
         } else {
@@ -654,8 +661,10 @@ impl Fleet for BlockingFleet {
                     Ok(taken) => filled += taken,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => {
-                        let errno = error.raw_os_error().unwrap_or(libc::EIO);
-                        self.stop(slot, Stopped::Errno(errno));
+                        let why = error
+                            .raw_os_error()
+                            .map_or(Stopped::Kind(error.kind()), Stopped::Errno);
+                        self.stop(slot, why);
                         break;
                     }
                 }
@@ -2692,8 +2701,10 @@ mod tests {
 
     #[test]
     fn writes_coreutils_format_byte_for_byte() {
-        let (_directory, paths) = scratch_files(&[7]);
-        let outcomes = hash_paths(&measured_files(&paths), &plan_with(DIRECT_IO_ALIGNMENT, 1));
+        let hashed = Hashed {
+            digest: [0x11; 32],
+            bytes: 7,
+        };
         let config = OutputConfig {
             format: Format::Coreutils,
             terminator: Terminator::Newline,
@@ -2703,18 +2714,14 @@ mod tests {
         assert_eq!(
             write_digests_to(
                 &mut rendered,
-                hashed(paths.iter().map(PathBuf::as_path), &outcomes),
+                std::iter::once((Path::new("file.bin"), &hashed)),
                 &config
             )
             .unwrap(),
             1
         );
 
-        let expected = format!(
-            "{}  {}\n",
-            hex(&sz::Sha256::hash(&fs::read(&paths[0]).unwrap())),
-            paths[0].display()
-        );
+        let expected = format!("{}  file.bin\n", "11".repeat(32));
         assert_eq!(String::from_utf8(rendered).unwrap(), expected);
     }
 
@@ -2894,37 +2901,42 @@ mod tests {
 
     #[test]
     fn reads_the_bsd_layout_it_writes() {
-        let (_directory, paths) = scratch_files(&[64, 4095]);
-        let digests = digests_directly(&paths);
-
-        let mut rendered = Vec::new();
-        let outcomes: Vec<Option<Outcome>> = digests
-            .iter()
-            .zip(&paths)
-            .map(|(digest, path)| {
-                Some(Ok(Hashed {
-                    digest: *digest,
-                    bytes: std::fs::metadata(path).unwrap().len(),
-                }))
-            })
-            .collect();
+        let entries = [
+            (
+                Path::new("file0.bin"),
+                Hashed {
+                    digest: [0x11; 32],
+                    bytes: 64,
+                },
+            ),
+            (
+                Path::new(r"C:\data\file1.bin"),
+                Hashed {
+                    digest: [0x22; 32],
+                    bytes: 4095,
+                },
+            ),
+        ];
         let config = OutputConfig {
             format: Format::Bsd,
             terminator: Terminator::from_null(false),
         };
+        let mut rendered = Vec::new();
         write_digests_to(
             &mut rendered,
-            hashed(paths.iter().map(PathBuf::as_path), &outcomes),
+            entries.iter().map(|(path, hashed)| (*path, hashed)),
             &config,
         )
         .unwrap();
 
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.starts_with("SHA256 ("), "{}", text);
-        for (line, digest) in text.lines().zip(&digests) {
+        assert_eq!(text.lines().count(), entries.len());
+        for (line, (path, hashed)) in text.lines().zip(entries) {
             let mut line = line.as_bytes().to_vec();
             let parsed = parse_check_line(&mut line).expect("a BSD line is a checksum line");
-            assert_eq!(&parsed.digest, digest);
+            assert_eq!(parsed.digest, hashed.digest);
+            assert_eq!(parsed.path, path);
         }
     }
 

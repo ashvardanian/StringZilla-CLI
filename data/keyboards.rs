@@ -9,6 +9,7 @@
 //!
 //! XKB names keys by position rather than by legend - `AE01` through `AB10` name a row and a column
 //! - so one adjacency graph over positions serves every layout and a layout is only a permutation of
+//!
 //! characters onto keys. That is why a table this small covers Latin, Cyrillic, Greek, Hebrew and
 //! Arabic alike.
 

@@ -1303,7 +1303,7 @@ fn json_escape_byteset() -> sz::Byteset {
     *ESCAPES.get_or_init(|| {
         let mut set = sz::Byteset::from(b"\"\\".as_slice());
         for control in 0u8..0x20 {
-            set.add_u8(control);
+            set.add(control);
         }
         set
     })

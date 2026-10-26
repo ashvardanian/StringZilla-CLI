@@ -253,7 +253,7 @@ struct Literal<'a> {
 
 impl<'a> Literal<'a> {
     /// Analyze `pattern` once.
-    fn new(pattern: &'a [u8], casing: Casing) -> Self {
+    fn new(pattern: &'a [u8], casing: Casing) -> io::Result<Self> {
         let (folded, longest_match) = match casing {
             Casing::Cased => (None, pattern.len()),
             Casing::Uncased => {
@@ -269,18 +269,18 @@ impl<'a> Literal<'a> {
                         &mut heap[..]
                     }
                 };
-                let folded_len = utf8_uncased_fold(pattern, scratch);
+                let folded_len = utf8_uncased_fold(pattern, scratch).map_err(io::Error::other)?;
                 (
                     Some(Utf8UncasedNeedle::new(pattern)),
                     folded_len.saturating_mul(4),
                 )
             }
         };
-        Literal {
+        Ok(Literal {
             pattern,
             folded,
             longest_match,
-        }
+        })
     }
 
     /// The next match at or after the start of `rest`, as an offset and the length the match
@@ -814,7 +814,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         }
     }
 
-    let literal = Literal::new(pattern, Casing::from_ignore_case(args.ignore_case));
+    let literal = Literal::new(pattern, Casing::from_ignore_case(args.ignore_case)).at(path)?;
     let edit = match whole {
         Some(data) if args.match_kind == Match::LineHash => resolve_lines(args, data, path)?,
         Some(data) => Edit::Substring {
@@ -951,7 +951,7 @@ mod tests {
         limit: usize,
     ) -> (Vec<u8>, usize) {
         let mut buf = Vec::new();
-        let literal = Literal::new(pattern, Casing::from_ignore_case(ignore_case));
+        let literal = Literal::new(pattern, Casing::from_ignore_case(ignore_case)).unwrap();
         let count = replace_to(data, &literal, replacement, limit, &mut buf).unwrap();
         (buf, count)
     }
@@ -1232,7 +1232,7 @@ mod tests {
             assert_eq!(
                 count_matches(
                     data,
-                    &Literal::new(pattern, Casing::from_ignore_case(ignore_case)),
+                    &Literal::new(pattern, Casing::from_ignore_case(ignore_case)).unwrap(),
                     usize::MAX,
                 ),
                 replaced,
@@ -1470,7 +1470,7 @@ mod tests {
     ) -> (Vec<u8>, usize) {
         let mut refill = Refill::new(data, capacity);
         let mut written = Vec::new();
-        let literal = Literal::new(pattern, Casing::from_ignore_case(ignore_case));
+        let literal = Literal::new(pattern, Casing::from_ignore_case(ignore_case)).unwrap();
         let (count, bytes) =
             replace_stream(&mut refill, &literal, replacement, limit, &mut written).unwrap();
         assert_eq!(bytes, data.len(), "the stream read every byte");
@@ -1586,7 +1586,10 @@ aaa
         // A match spans at most four times the folded pattern: every character is at most
         // four UTF-8 bytes and folds to at least one. Checked against the widest real
         // expansions rather than only against the arithmetic.
-        assert_eq!(Literal::new(b"abc", Casing::Cased).longest_match(), 3);
+        assert_eq!(
+            Literal::new(b"abc", Casing::Cased).unwrap().longest_match(),
+            3
+        );
         for (pattern, haystack) in [
             (&b"ss"[..], "ẞ".as_bytes()),
             (&b"fi"[..], "ﬁ".as_bytes()),
@@ -1594,7 +1597,9 @@ aaa
             (&b"i"[..], "İ".as_bytes()),
             (&b"k"[..], "\u{212a}".as_bytes()),
         ] {
-            let bound = Literal::new(pattern, Casing::Uncased).longest_match();
+            let bound = Literal::new(pattern, Casing::Uncased)
+                .unwrap()
+                .longest_match();
             assert!(
                 haystack.len() <= bound,
                 "{:?} matched {} bytes, past the bound of {}",

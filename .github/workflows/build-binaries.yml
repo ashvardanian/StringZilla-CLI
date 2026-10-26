@@ -56,12 +56,6 @@ jobs:
             ext: .exe
 
     env:
-      # Ubuntu names the wrapper `musl-gcc` on both architectures, but `cc` probes only
-      # `aarch64-linux-musl-gcc` for the arm64 target and falls back to the plain glibc `cc`
-      # when it misses, compiling StringZilla's C half against the wrong libc while rustc
-      # links musl. Naming the compiler explicitly is what prevents that.
-      CC_x86_64_unknown_linux_musl: musl-gcc
-      CC_aarch64_unknown_linux_musl: musl-gcc
       # Unset, the C objects inherit the runner SDK's floor while rustc uses its own, and the
       # result refuses to load on older macOS. Empty on every non-Apple target, where it is
       # ignored.
@@ -85,13 +79,11 @@ jobs:
           "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        if: ${{ !endsWith(matrix.target, '-linux-musl') }}
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          toolchain: nightly-2026-10-08
           targets: ${{ matrix.target }}
-
-      - name: Install musl toolchain
-        if: endsWith(matrix.target, '-linux-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Get version
         id: version
@@ -99,10 +91,22 @@ jobs:
         run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
       # No `--features`: `sz-outline` and `sz-fuzzy-find` carry `required-features`, so a
-      # default build skips them and `stringzilla/cpus` never reaches a release artifact.
+      # default build skips them. The archive count below checks the selected tools.
       # The count assertion in `Stage archive` is what enforces that in both directions.
       - name: Build
+        if: ${{ !endsWith(matrix.target, '-linux-musl') }}
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # musl-tools provides no C++ compiler. Build both native dependencies with a complete
+      # musl toolchain, on the same x86-64 or ARM64 runner that checks the resulting binaries.
+      - name: Build standalone Linux binaries
+        if: endsWith(matrix.target, '-linux-musl')
+        run: |
+          toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          docker build --build-arg RUST_TOOLCHAIN="$toolchain" \
+            --file .github/Dockerfile.musl --tag stringzilla-cli-musl .github
+          docker run --rm --volume "$PWD:/work" stringzilla-cli-musl \
+            cargo build --release --locked --target ${{ matrix.target }}
 
       # Must precede the smoke test: `strip = true` in `[profile.release]` runs after the
       # linker has ad-hoc-signed the arm64 Mach-O, invalidating the signature, and macOS then
@@ -245,8 +249,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [build, package_deb]
-    permissions:
-      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
