@@ -4,6 +4,7 @@
 
 Most text processing command-line utilities have obscure syntax, limited portability across operating systems, can't deal with larger-than-memory datasets, and are not actively leveraging modern SIMD capabilities, such as AVX-512 on x86 and SVE on ARM.
 This utility is written in Rust, leveraging StringZilla for both pipe and file-based text processing across Linux, macOS, and Windows.
+Search plain text, compressed archives, SQLite tables, Git repositories and Jupyter notebooks, selecting the fields that carry the text you need.
 Install it straight from the GitHub repository:
 
 ```bash
@@ -97,6 +98,65 @@ $ alias gnu-sha256sum=/opt/homebrew/bin/gsha256sum # GNU coreutils 9.11
 Two input shapes run through the suite.
 `sz-find`, `sz-count`, `sz-segment-utf8` and `sz-sha256` take any number of files or directories and walk them, gitignore-aware, under `--glob`, `--type`, `--max-depth`, `--hidden`, `--no-ignore` and `--follow`; each emits one record per file, tagged by path.
 The rest take a single input, because they rewrite a stream rather than report on it — `--in-place` has no meaning spread over many files, and `sz-split` already spends its second argument on the output prefix.
+
+### Compressed and Structured Inputs
+
+`sz-find` and `sz-fuzzy-find` search decoded text inside containers, preserving the location of every match.
+`--input-format auto` detects file formats from their contents; `--input-format text`, `sqlite`, `git` or `notebook` chooses the interpretation explicitly.
+Ordinary directory arguments walk working files; `--input-format git` opens the repository, including bare repositories and `.git` directories.
+`--select` chooses the input fields to search, while `--fields` continues to choose output columns.
+Repeat `--select` to search several fields independently: a match never crosses a field, row, cell or archive-member boundary.
+
+| Input | Searchable text | Source location |
+| :---- | :-------------- | :-------------- |
+| gzip, BGZF, Zstandard, xz, bzip2 | Decompressed text | Input path and decompressed byte offset |
+| tar, compressed tar, ZIP | Selected members, decoded according to their contents | Archive path, member path and location within the member |
+| SQLite | `table.column`, such as `history.command` or `history.cwd` | Database path, table, primary key or rowid, and column |
+| Git | `files.content`, `files.path`, `commits.message`, `commits.author.name`, `commits.author.email` | Repository, commit object ID, and path for file matches |
+| Jupyter `.ipynb` | `cells.source`, `cells.outputs.text`, `cells.outputs.data.text/plain`, `cells.metadata.tags` | Notebook path, zero-based cell index, cell ID when present, and field |
+
+Compression is detected from the bytes, so BGZF stored as `.gz` still uses its independently decodable blocks.
+Like [FasterFASTA](https://github.com/unum-science/FasterFASTA#scaling), BGZF and indexed multi-block xz decode across blocks; ordinary gzip, Zstandard and single-block xz stream forward.
+Search consumes decoded windows without unpacking archives to disk or retaining a whole decompressed file.
+`--glob` filters archive member paths as well as ordinary paths.
+
+```bash
+$ sz-find 'timeout' server.log.gz
+$ sz-find --glob '*.log' 'timeout' logs.tar.zst
+$ sz-find --glob '*.ipynb' --select cells.source 'read_csv' experiments.zip
+```
+
+SQLite inputs open read-only and read committed state through SQLite, including its write-ahead log.
+Select columns explicitly; text values are searched without stringifying numbers, blobs or SQL NULLs.
+Each result retains its row identity, so repeated commands from different sessions remain distinguishable.
+
+```bash
+$ sz-find --select history.command 'cargo bench' ~/.local/share/atuin/history.db
+$ sz-find --select history.command --select history.cwd --format json 'StringZilla' history.db
+```
+
+Git file searches default to the `HEAD` tree; `--revision` selects another revision without checking it out.
+Commit-field searches walk commits reachable from that revision, or the range supplied to `--revision`.
+File selectors require a single revision; commit ranges apply to commit selectors.
+`--glob` restricts paths within the selected tree, and results carry resolved object IDs so a branch moving does not change what a match refers to.
+
+```bash
+$ sz-find --input-format git --revision HEAD --select files.content --glob '*.rs' 'unsafe' .
+$ sz-find --input-format git --revision v0.1.0..HEAD --select commits.message 'Unicode' .git
+$ sz-find --input-format git --select commits.author.email 'example.org' project.git
+```
+
+Notebook searches default to cell source, joining source-string arrays and decoding JSON escapes before matching.
+Outputs and metadata are searched only when selected; text outputs remain distinct from cell source and binary MIME payloads.
+Line numbers and byte offsets refer to the decoded field, with the cell and field identifying its place in the notebook.
+
+```bash
+$ sz-find --select cells.source 'read_csv' analysis.ipynb
+$ sz-find --select cells.outputs.text --select cells.outputs.data.text/plain 'Traceback' analysis.ipynb
+$ sz-find --select cells.metadata.tags 'benchmark' analysis.ipynb
+```
+
+`--format json` includes the source location alongside every match, so exported results retain the member, row, revision or cell needed to find the original text.
 
 ### `sz-find`: Unicode Aware Substring Search
 

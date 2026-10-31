@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+check_rust=1
+if [[ ${1:-} == --staged ]]; then
+    if ! git diff --cached --name-only | rg '(\.rs$|(^|/)(Cargo\.(toml|lock)|rust-toolchain\.toml)$|^\.githooks/)' >/dev/null; then
+        check_rust=0
+    fi
+    snapshot=$(mktemp -d)
+    trap 'rm -rf "$snapshot"' EXIT
+    git checkout-index --all --prefix="$snapshot/"
+    git diff --cached --check
+    git diff --cached --unified=0 -- '*.rs' |
+        awk '/^\+[^+]/{if ($0 ~ /\.collect\(|\.to_vec\(|\.to_owned\(|\.clone\(|Vec::|vec!\[|Box::/) print "review storage: " substr($0, 2)}'
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target/check-index}"
+    cd "$snapshot"
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+else
+    git diff --check
+fi
+
+# Match comment banners, but leave Markdown rules and table separators alone.
+if matches=$(rg -n '(^|[[:space:]])(//|#|/\*|\*)[[:space:]]*(={4,}|-{4,})' \
+    --glob '*.rs' --glob '*.sh' --glob '*.md' --glob '!target/**' .); then
+    printf '%s\n' "$matches" >&2
+    echo 'error: remove comment banners' >&2
+    exit 1
+fi
+
+[[ $check_rust == 1 ]] || exit 0
+cargo fmt --check
+cargo clippy --locked --all-targets --features outline,fuzzy-find
