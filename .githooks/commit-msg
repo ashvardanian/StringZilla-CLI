@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# StringZilla-CLI commit-msg: enforce the commit-message contract.
+#
+#   1. The subject starts with an approved verb prefix - Add / Break / Chore / Docs / Fix / Improve /
+#      Make - followed by a capitalized summary, so the history reads as a consistent changelog.
+#      Merge commits are exempt (Git writes their subject). A release is exactly `Release: vX.Y.Z`
+#      or `Release: vX.Y.Z-rc.N`, every staged version site must carry that version, and no other
+#      commit may change `VERSION`.
+#   2. No AI-assistant attribution: no `Co-authored-by` bot trailer, no "Generated with/by <assistant>",
+#      no assistant name / vendor URL, no robot emoji. Authorship is the human who committed.
+#
+# Bypass knowingly (you almost never should) with: git commit --no-verify
+
+set -u
+
+message_file="$1"
+
+# Comment lines (git's `#` scissors and helptext) never reach the final message - ignore them.
+payload=$(grep -v '^#' "$message_file")
+# The subject is the first non-blank line of what remains.
+subject=$(printf '%s\n' "$payload" | grep -vE '^[[:space:]]*$' | head -1)
+
+failed=0
+
+# 1. Verb prefix. Merge commits carry Git's own subject and are exempt.
+case "$subject" in
+Merge*) ;;
+# Releases are cut by hand, so this check is all that stands between a typo and a published package.
+Release:*)
+    version=$(printf '%s\n' "$subject" | sed -nE 's/^Release: v([0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$/\1/p')
+    if [ -z "$version" ]; then
+        echo "commit-msg: a release subject is exactly 'Release: vX.Y.Z' or 'Release: vX.Y.Z-rc.N'."
+        echo "            Got: $subject"
+        failed=1
+    else
+        stale=""
+        [ "$(git show :VERSION 2>/dev/null)" = "$version" ] || stale="$stale VERSION"
+        git show :Cargo.toml 2>/dev/null | grep -qxF "version = \"$version\"" || stale="$stale Cargo.toml"
+        git show :Cargo.lock 2>/dev/null | grep -A1 -xF 'name = "stringzilla-cli"' | grep -qxF "version = \"$version\"" || stale="$stale Cargo.lock"
+        git show :.claude-plugin/marketplace.json 2>/dev/null | grep -qF "\"version\": \"$version\"," || stale="$stale .claude-plugin/marketplace.json"
+        git show :.codex-plugin/plugin.json 2>/dev/null | grep -qF "\"version\": \"$version\"," || stale="$stale .codex-plugin/plugin.json"
+        if [ -n "$stale" ]; then
+            echo "commit-msg: these staged files don't carry $version:$stale"
+            failed=1
+        fi
+    fi
+    ;;
+*)
+    if git diff --cached --name-only | grep -qx VERSION; then
+        echo "commit-msg: VERSION only changes in a 'Release: vX.Y.Z' commit."
+        failed=1
+    fi
+    if ! printf '%s\n' "$subject" |
+        grep -qE '^(Add|Break|Chore|Docs|Fix|Improve|Make): [A-Z]'; then
+        echo "commit-msg: the subject must be '<Verb>: <Capitalized summary>' with an approved verb -"
+        echo "            Add Break Chore Docs Fix Improve Make."
+        echo "            Got: ${subject:-<empty>}"
+        failed=1
+    fi
+    ;;
+esac
+
+# 2. AI-assistant attribution - matched generically across assistants and vendors, not one product.
+offenders=$(printf '%s\n' "$payload" | grep -inE \
+    'co-authored-by:.*(\[bot\]|\bbot\b|claude|chatgpt|gpt-[0-9]|openai|copilot|gemini|\bbard\b|cursor|codeium|devin)|generated (with|by).*\b(ai|llm|claude|chatgpt|gpt|copilot|gemini|cursor|anthropic|openai)\b|\b(anthropic|openai)\.com|claude\.ai|chatgpt\.com|claude-session|🤖' || true)
+if [ -n "$offenders" ]; then
+    echo "commit-msg: this message carries AI-assistant attribution - this history stays human-authored."
+    echo "            Offending lines:"
+    printf '%s\n' "$offenders" | head -8
+    failed=1
+fi
+
+if [ "$failed" -ne 0 ]; then
+    echo ""
+    echo "Fix the subject / trailer and commit again. Bypass knowingly with: git commit --no-verify"
+    exit 1
+fi
+exit 0

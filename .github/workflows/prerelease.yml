@@ -1,0 +1,108 @@
+name: Pre-Release
+
+on:
+  pull_request:
+    branches: ["main", "main-dev"]
+
+# One run per PR branch, superseded by the next push. A `push` trigger here would schedule a
+# second run of the same commit, which this group would then cancel and report as a failure.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hooks:
+    name: Run Git Hooks
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # `pre-commit` formats, lints and greps the staged tree, so it needs the toolchain and `rg`.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Run the Hooks Over New Commits
+        run: .github/scripts/check-commits.sh "${{ github.event.pull_request.base.sha }}"
+
+  lint_workflows:
+    name: Lint Workflows
+    needs: hooks
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      # Pinned: unpinned, an upstream lint rule reddens an untouched branch.
+      - name: Run actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          bash <(curl -sSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "${ACTIONLINT_VERSION}"
+          ./actionlint -color
+
+  lint_rust:
+    name: Lint Rust
+    needs: hooks
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (outline)
+        run: cargo clippy --all-targets --features outline -- -D warnings
+      # Mid-rewrite; only has to compile.
+      - name: Clippy (fuzzy-find, warnings allowed)
+        run: cargo clippy --all-targets --features fuzzy-find
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: hooks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26, windows-2025]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --release
+      # Feature-gated binaries carry unit tests the default run never builds.
+      - name: Test the opt-in tools
+        run: |
+          cargo test --release --features outline
+          cargo test --release --features fuzzy-find
+
+  # The same matrix the release runs, minus the uploads, so a broken runner label or a
+  # narrowed SIMD tier is caught on the pull request. The top-level `contents: read` above
+  # caps what this can do regardless of `upload`, since a called workflow cannot escalate
+  # past its caller's grant.
+  build_binaries:
+    name: Build Binaries
+    needs: hooks
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+      upload: false

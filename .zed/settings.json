@@ -1,0 +1,80 @@
+// Zed workspace settings for StringZilla-CLI.
+// JSONC: comments are allowed.  Project-level overrides of your user settings.
+//
+// This repo is Rust plus one long README, so it carries far less than the polyglot
+// projects: no C++/CUDA remap, no clangd, no Swift or Java toolchains.
+{
+    // Zed ships Rust and Markdown; TOML covers Cargo.toml editing.
+    "auto_install_extensions": { "toml": true },
+
+    // Keep Zed's project panel, search, and file-watcher out of the build tree.
+    // `target` alone is tens of thousands of files and makes the file-finder unusable.
+    "file_scan_exclusions": [
+        "**/.git",
+        "**/target",
+        "**/node_modules",
+        "**/.tmp"
+    ],
+
+    // Editor defaults, applied everywhere unless a language overrides them.
+    "format_on_save": "on",
+    "tab_size": 4,
+    "hard_tabs": false,
+    "ensure_final_newline_on_save": true,
+    "remove_trailing_whitespace_on_save": true,
+
+    // Everything navigational on the left dock; Git defaults to the right.
+    "project_panel": { "dock": "left" },
+    "git_panel": { "dock": "left" },
+    "outline_panel": { "dock": "left" },
+
+    "languages": {
+        // rustfmt via rust-analyzer, which reads the repo's own defaults.
+        "Rust": { "format_on_save": "on", "tab_size": 4 },
+
+        "TOML": { "tab_size": 4 },
+        "JSON": { "tab_size": 4 },
+        "YAML": { "tab_size": 2 },
+
+        // The reason this file exists.  Zed's bundled Markdown formatter rewrites `__bold__`
+        // to `**bold**` and `_italic_` to `*italic*`, which is the opposite of the house
+        // style the README is written in.  remark does sentence-per-line wrapping and takes
+        // the emphasis characters as arguments, so the file survives a save unchanged.
+        //
+        // `remark-math` is deliberately absent — it exists in the sibling projects to keep
+        // `$...$` LaTeX from having its subscript underscores escaped, and there is none here.
+        //
+        // `remark-frontmatter` is required by the agent skills under `.agents/skills/`: without
+        // it the opening `---` parses as a thematic break and the YAML below it as a paragraph,
+        // so `when_to_use` comes back as `when\_to\_use` and the skill stops loading.
+        //
+        // `remark-gfm-alerts.mjs` beside this file keeps `> [!WARNING]` callouts intact.  remark
+        // sees the marker as ordinary text and escapes its leading `[`, since that could open a
+        // link reference, and `> \[!WARNING]` stops GitHub rendering the callout.
+        //
+        // `--no-install` pins to repo-local node_modules: run `npm install` once per clone
+        // (package.json beside this file carries the two devDependencies), or comment this
+        // block out and format the README by hand.
+        "Markdown": {
+            "format_on_save": "on",
+            "formatter": {
+                "external": {
+                    "command": "npx",
+                    "arguments": [
+                        "--no-install",
+                        "remark",
+                        "--quiet",
+                        "--use",
+                        "remark-frontmatter",
+                        "--use",
+                        "remark-gfm",
+                        "--use",
+                        "./.zed/remark-gfm-alerts.mjs",
+                        "-s",
+                        "emphasis:'_',strong:'_',bullet:'-'"
+                    ]
+                }
+            }
+        }
+    }
+}
