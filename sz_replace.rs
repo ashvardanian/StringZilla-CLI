@@ -269,7 +269,8 @@ impl<'a> Literal<'a> {
                         &mut heap[..]
                     }
                 };
-                let folded_len = utf8_uncased_fold(pattern, scratch);
+                let folded_len = utf8_uncased_fold(pattern, scratch)
+                    .expect("scratch holds the maximum threefold expansion");
                 (
                     Some(Utf8UncasedNeedle::new(pattern)),
                     folded_len.saturating_mul(4),

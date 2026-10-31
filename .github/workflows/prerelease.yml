@@ -2,7 +2,7 @@ name: Pre-Release
 
 on:
   pull_request:
-    branches: ["main*"]
+    branches: ["main", "main-dev"]
 
 # One run per PR branch, superseded by the next push. A `push` trigger here would schedule a
 # second run of the same commit, which this group would then cancel and report as a failure.
@@ -14,36 +14,29 @@ permissions:
   contents: read
 
 jobs:
-  versioning:
-    name: Update Version
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+  hooks:
+    name: Run Git Hooks
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          fetch-tags: true
-          persist-credentials: false
-      - name: Run TinySemVer
-        uses: ashvardanian/tinysemver@v3
+      # `pre-commit` formats, lints and greps the staged tree, so it needs the toolchain and `rg`.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
-          verbose: "true"
-          version-file: "VERSION"
-          update-version-in: |
-            Cargo.toml:^version = "(\d+\.\d+\.\d+)"
-            Cargo.lock:name = "stringzilla-cli"\nversion = "(\d+\.\d+\.\d+)"
-            README.md:--tag v(\d+\.\d+\.\d+)
-            README.md:stringzilla-cli-v(\d+\.\d+\.\d+)-
-            README.md:stringzilla-cli_(\d+\.\d+\.\d+)_amd64
-            README.md:releases/download/v(\d+\.\d+\.\d+)/
-            .claude-plugin/marketplace.json:"version": "(\d+\.\d+\.\d+)"
-            .codex-plugin/plugin.json:"version": "(\d+\.\d+\.\d+)"
-          dry-run: "true"
+          components: rustfmt, clippy
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Run the Hooks Over New Commits
+        run: .github/scripts/check-commits.sh "${{ github.event.pull_request.base.sha }}"
 
   lint_workflows:
     name: Lint Workflows
-    runs-on: ubuntu-24.04
+    needs: hooks
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -58,7 +51,8 @@ jobs:
 
   lint_rust:
     name: Lint Rust
-    runs-on: ubuntu-24.04
+    needs: hooks
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -79,12 +73,13 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
+    needs: hooks
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
+        os: [ubuntu-26.04, macos-26, windows-2025]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -106,6 +101,7 @@ jobs:
   # past its caller's grant.
   build_binaries:
     name: Build Binaries
+    needs: hooks
     uses: ./.github/workflows/build-binaries.yml
     with:
       ref: ${{ github.event.pull_request.head.sha }}

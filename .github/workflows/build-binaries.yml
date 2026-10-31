@@ -9,7 +9,7 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: "Commit-ish to build. Release passes `main` to pick up the version bump."
+        description: "Commit-ish to build."
         type: string
         required: true
       upload:
@@ -27,22 +27,22 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             archive: tar.gz
             expect: x86-64
             simd: zmm
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             archive: tar.gz
             expect: ARM aarch64
             simd: \bz[0-9]+\.[bhsd]\b
           - target: aarch64-apple-darwin
-            runner: macos-15
+            runner: macos-26
             archive: tar.gz
             expect: arm64
             macos_min: "11.0"
           - target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: macos-26-intel
             archive: tar.gz
             expect: x86_64
             macos_min: "10.15"
@@ -161,7 +161,7 @@ jobs:
       # Nothing reaches the release from here. A single `publish` job attaches everything at
       # once, so a release never carries a partial asset set.
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.target }}
           path: ${{ steps.stage.outputs.name }}.${{ matrix.archive }}
@@ -170,7 +170,7 @@ jobs:
 
   package_deb:
     name: Package .deb (${{ matrix.debarch }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     needs: [build]
     strategy:
@@ -192,7 +192,7 @@ jobs:
         run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Download binaries
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: binaries-${{ matrix.target }}
 
@@ -229,7 +229,7 @@ jobs:
           test "$(dpkg-deb --contents "${{ steps.deb.outputs.file }}" | grep -c './usr/bin/sz-')" -eq 10
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: deb-${{ matrix.debarch }}
           path: ${{ steps.deb.outputs.file }}
@@ -242,7 +242,7 @@ jobs:
   publish:
     name: Publish Release Assets
     if: inputs.upload
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     needs: [build, package_deb]
     permissions:
@@ -254,7 +254,7 @@ jobs:
           ref: ${{ inputs.ref }}
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -272,17 +272,8 @@ jobs:
           grep -c '\.zip$' SHA256SUMS | grep -qx 2
           grep -c '\.deb$' SHA256SUMS | grep -qx 2
 
-      # TinySemVer is a no-op when no commit since the last tag is releasable, so `main` may
-      # carry a version whose release already exists and is already populated. Uploading then
-      # would overwrite a published release's assets with a rebuild.
       - name: Upload to the release
         working-directory: dist
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="v$(cat ../VERSION)"
-          if ! gh release view "$TAG" --json isDraft >/dev/null 2>&1; then
-            echo "::error::No release $TAG exists; TinySemVer cut nothing for this push."
-            exit 1
-          fi
-          gh release upload "$TAG" ./* --clobber
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "v$(cat ../VERSION)" ./* --clobber

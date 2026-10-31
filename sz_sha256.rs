@@ -496,7 +496,11 @@ fn advance_group(
         let held: &dyn Fleet = fleet;
         let group = &mut staging[..count];
         if count >= LANES_WORTH_A_GROUP {
-            if sz::sha256_multistate_update_by(group, |lane| held.chunk(members[lane])).is_err() {
+            let mut chunks = [&[][..]; LANE_COUNT];
+            for (chunk, &slot) in chunks.iter_mut().zip(&members[..count]) {
+                *chunk = held.chunk(slot);
+            }
+            if sz::sha256_multistate_update(group, &chunks[..count]).is_err() {
                 return Err(io::Error::from(io::ErrorKind::InvalidInput));
             }
         } else {

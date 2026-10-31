@@ -197,7 +197,8 @@ fn compute_hash(line: &[u8], ignore_case: bool, scratch: &mut Vec<u8>) -> u64 {
         if scratch.len() < needed {
             scratch.resize(needed, 0);
         }
-        let folded_len = sz::utf8_uncased_fold(line, &mut scratch[..]);
+        let folded_len = sz::utf8_uncased_fold(line, &mut scratch[..])
+            .expect("scratch holds the maximum threefold expansion");
         sz::hash(&scratch[..folded_len])
     } else {
         sz::hash(line)

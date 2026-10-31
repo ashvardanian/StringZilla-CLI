@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # StringZilla-CLI commit-msg: enforce the commit-message contract.
 #
-#   1. The subject starts with an approved verb prefix - Add / Break / Build / Chore / Docs / Fix /
-#      Improve / Make / Release - followed by a capitalized summary, so the history reads as a
-#      consistent changelog. Merge commits are exempt (Git writes their subject).
+#   1. The subject starts with an approved verb prefix - Add / Break / Chore / Docs / Fix / Improve /
+#      Make - followed by a capitalized summary, so the history reads as a consistent changelog.
+#      Merge commits are exempt (Git writes their subject). A release is exactly `Release: vX.Y.Z`
+#      or `Release: vX.Y.Z-rc.N`, every staged version site must carry that version, and no other
+#      commit may change `VERSION`.
 #   2. No AI-assistant attribution: no `Co-authored-by` bot trailer, no "Generated with/by <assistant>",
 #      no assistant name / vendor URL, no robot emoji. Authorship is the human who committed.
 #
@@ -20,14 +22,38 @@ subject=$(printf '%s\n' "$payload" | grep -vE '^[[:space:]]*$' | head -1)
 
 failed=0
 
-# 1. Verb prefix. Merge commits carry Git's own subject and are the only exemption.
+# 1. Verb prefix. Merge commits carry Git's own subject and are exempt.
 case "$subject" in
 Merge*) ;;
+# Releases are cut by hand, so this check is all that stands between a typo and a published package.
+Release:*)
+    version=$(printf '%s\n' "$subject" | sed -nE 's/^Release: v([0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$/\1/p')
+    if [ -z "$version" ]; then
+        echo "commit-msg: a release subject is exactly 'Release: vX.Y.Z' or 'Release: vX.Y.Z-rc.N'."
+        echo "            Got: $subject"
+        failed=1
+    else
+        stale=""
+        [ "$(git show :VERSION 2>/dev/null)" = "$version" ] || stale="$stale VERSION"
+        git show :Cargo.toml 2>/dev/null | grep -qxF "version = \"$version\"" || stale="$stale Cargo.toml"
+        git show :Cargo.lock 2>/dev/null | grep -A1 -xF 'name = "stringzilla-cli"' | grep -qxF "version = \"$version\"" || stale="$stale Cargo.lock"
+        git show :.claude-plugin/marketplace.json 2>/dev/null | grep -qF "\"version\": \"$version\"," || stale="$stale .claude-plugin/marketplace.json"
+        git show :.codex-plugin/plugin.json 2>/dev/null | grep -qF "\"version\": \"$version\"," || stale="$stale .codex-plugin/plugin.json"
+        if [ -n "$stale" ]; then
+            echo "commit-msg: these staged files don't carry $version:$stale"
+            failed=1
+        fi
+    fi
+    ;;
 *)
+    if git diff --cached --name-only | grep -qx VERSION; then
+        echo "commit-msg: VERSION only changes in a 'Release: vX.Y.Z' commit."
+        failed=1
+    fi
     if ! printf '%s\n' "$subject" |
-        grep -qE '^(Add|Break|Build|Chore|Docs|Fix|Improve|Make|Release): [A-Z]'; then
+        grep -qE '^(Add|Break|Chore|Docs|Fix|Improve|Make): [A-Z]'; then
         echo "commit-msg: the subject must be '<Verb>: <Capitalized summary>' with an approved verb -"
-        echo "            Add Break Build Chore Docs Fix Improve Make Release."
+        echo "            Add Break Chore Docs Fix Improve Make."
         echo "            Got: ${subject:-<empty>}"
         failed=1
     fi
