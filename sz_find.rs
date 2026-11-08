@@ -21,7 +21,7 @@ use std::path::Path;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringzilla::sz::{find, rfind, utf8_uncased_search, StringZillableBinary, Utf8UncasedNeedle};
+use stringzilla::{find, rfind, utf8_uncased_search, StringZillableBinary, Utf8UncasedNeedle};
 
 use shared::*;
 

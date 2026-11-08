@@ -16,7 +16,7 @@
 use std::io::{self, Read, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringzilla::sz::{find, utf8_uncased_fold, utf8_uncased_search, Utf8UncasedNeedle};
+use stringzilla::{find, utf8_uncased_fold, utf8_uncased_search, Utf8UncasedNeedle};
 
 use shared::*;
 

@@ -203,11 +203,9 @@ checksum = "3a3076410a55c90011c298b04d0cfa770b00fa04e1e3c97d3f6c9de105a03844"
 
 [[package]]
 name = "forkunion"
-version = "3.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c08014f7d40a9672ec8abf4afa3efb9488248e1e2254e9bbcd6fa2b2ec61fcf1"
+version = "4.0.0-rc.1"
 dependencies = [
- "cc",
+ "cmake",
 ]
 
 [[package]]
@@ -425,9 +423,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "stringtape"
-version = "2.4.2"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c2ad8ddd435760c2439d6548e52bca5097890f3af26b3c417af3a87ed28e0fa"
+checksum = "8b1d53a2189c6e282782aeac512b3153bad14da21c3e33bc0a415e24b3bcefbb"
 dependencies = [
  "allocator-api2",
 ]
@@ -443,7 +441,6 @@ dependencies = [
 name = "stringzilla-cli"
 version = "0.1.0"
 dependencies = [
- "allocator-api2",
  "clap",
  "forkunion",
  "glob",

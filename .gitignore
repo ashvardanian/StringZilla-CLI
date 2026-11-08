@@ -26,3 +26,6 @@ target
 # Node is here only for `remark`, which formats the README the way .zed/settings.json asks
 node_modules/
 package-lock.json
+
+# macOS Finder metadata
+.DS_Store

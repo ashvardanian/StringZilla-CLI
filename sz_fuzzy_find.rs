@@ -1,4 +1,5 @@
-//! Fuzzy substring search over StringZilla's `szs` kernels, where `sz-find` matches literally.
+//! Fuzzy substring search over StringZilla's multi-pattern kernels, where `sz-find` matches
+//! literally.
 //!
 //! A query is expanded into every string within `--max-distance` edits of it, and those variants
 //! are matched exactly by one Aho-Corasick automaton. The edit model therefore lives in the
@@ -10,29 +11,25 @@
 //!
 //! Every query's variants are pooled into one dictionary, so the corpus is walked once however many
 //! `--pattern` flags are given. BM25 scores that walk: a strictly positive weight per variant makes
-//! a positive score mean "matched", and `find_into` runs afterwards, over survivors only, when
+//! a positive score mean "matched", and locating runs afterwards, over survivors only, when
 //! spans are actually asked for.
 //!
 //! Exit: 0 matched something, 1 matched nothing, 2 could not run.
 
-use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringtape::{BytesTape, BytesTapeView};
-use stringzilla::szs::{
-    AnyBytesTape, Bm25Params, CaseSensitivity, DeviceScope, OverlapPolicy, Substrings,
-    SubstringsMatch, UnifiedAlloc, UnifiedVec,
+use stringzilla::{
+    Bm25Params, Capabilities, CaseSensitivity, Match, Stream, StringsView, SubstringsEngine,
+    SubstringsOverlapPolicy, UnifiedAllocator, SUBSTRINGS_HOT_STATES_AUTO,
+    SUBSTRINGS_MATCHES_BUDGET_AUTO,
 };
 
 use shared::folds::Fold;
 use shared::keyboards::Keyboard;
 use shared::misspellings;
 use shared::*;
-
-// region: Effort
 
 /// How hard the search tries, as an ordered ladder where each rung matches everything the rung
 /// below it matched.
@@ -124,7 +121,7 @@ impl Script {
         match codepoint as u32 {
             0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F => Some(Script::Latin),
             0x0370..=0x03FF | 0x1F00..=0x1FFF => Some(Script::Greek),
-            0x0400..=0x04FF | 0x0500..=0x052F => Some(Script::Cyrillic),
+            0x0400..=0x052F => Some(Script::Cyrillic),
             0x0530..=0x058F => Some(Script::Armenian),
             0x0590..=0x05FF => Some(Script::Hebrew),
             0x0600..=0x06FF | 0x0750..=0x077F => Some(Script::Arabic),
@@ -355,8 +352,8 @@ struct Vocabulary {
 impl Vocabulary {
     /// Build the ball of every query up to `max_distance`, drawing edits from `alphabet`.
     ///
-    /// Empty variants are dropped rather than indexed: an empty needle matches at every position and
-    /// `Substrings::new` rejects the whole dictionary over one.
+    /// Empty variants are dropped rather than indexed: an empty needle matches at every position,
+    /// and the engine refuses the whole dictionary over one.
     fn build(
         patterns: &[String],
         max_distance: usize,
@@ -490,112 +487,121 @@ fn edits_of(
 
 // region: Searching
 
+/// Where the kernels run: one stream, and the memory its kernels can read.
+///
+/// A CPU stream reads host memory where it lies, so only a GPU stream ever stages anything, and
+/// [`Runtime::unified`] is the host heap on a CPU stream rather than managed pages.
+struct Runtime {
+    stream: Stream,
+}
+
+impl Runtime {
+    fn cpu() -> Self {
+        Self {
+            stream: Stream::default(Capabilities::cpu_enabled()),
+        }
+    }
+
+    fn gpu(ordinal: usize) -> Result<Self, stringzilla::Status> {
+        let stream = Stream::new(Capabilities::cuda_enabled(ordinal)?, ordinal)?;
+        Ok(Self { stream })
+    }
+
+    fn is_gpu(&self) -> bool {
+        self.stream.capabilities().bits() & Capabilities::GPUS.bits() != 0
+    }
+
+    /// Memory the device reaches, for every buffer a kernel reads or writes.
+    fn unified(&self) -> UnifiedAllocator<'_> {
+        UnifiedAllocator::new(&self.stream)
+    }
+
+    /// An automaton over `needles` under the leftmost-longest cover, which a rewrite needs, and
+    /// which BM25 ignores, as it counts every overlapping occurrence.
+    fn compile<Needle: AsRef<[u8]>>(
+        &self,
+        needles: &[Needle],
+        case_sensitivity: CaseSensitivity,
+        purpose: &str,
+    ) -> Result<SubstringsEngine, Failure> {
+        SubstringsEngine::new(
+            needles,
+            case_sensitivity,
+            SubstringsOverlapPolicy::LeftmostLongest,
+            SUBSTRINGS_HOT_STATES_AUTO,
+            SUBSTRINGS_MATCHES_BUDGET_AUTO,
+            0,
+            &self.stream,
+        )
+        .map_err(|status| engine_failure(purpose, status))
+    }
+}
+
+/// Lines in memory the device reaches: a staged input, a few gathered lines, or a fold's product.
+///
+/// A rewrite reuses a slot larger than its product, so `lines` says how much of it this tape is,
+/// and the rest is capacity an earlier, larger input left behind.
+struct Tape<'a> {
+    data: Vec<u8, UnifiedAllocator<'a>>,
+    offsets: Vec<usize, UnifiedAllocator<'a>>,
+    lines: usize,
+}
+
+impl<'a> Tape<'a> {
+    /// Copies `lines` into one tape, sized by a first pass over them so it allocates once.
+    fn gathered<'b>(runtime: &'a Runtime, lines: impl Iterator<Item = &'b [u8]> + Clone) -> Self {
+        let bytes = lines.clone().map(<[u8]>::len).sum();
+        let mut data = Vec::with_capacity_in(bytes, runtime.unified());
+        let mut offsets = Vec::with_capacity_in(lines.clone().count() + 1, runtime.unified());
+        for line in lines {
+            offsets.push(data.len());
+            data.extend_from_slice(line);
+        }
+        offsets.push(data.len());
+        let lines = offsets.len() - 1;
+        Self {
+            data,
+            offsets,
+            lines,
+        }
+    }
+
+    /// Grows and never shrinks, so a run over files of similar shape allocates for the first only.
+    fn grown_to(&mut self, bytes: usize, entries: usize) {
+        if self.data.len() < bytes {
+            self.data.resize(bytes, 0);
+        }
+        if self.offsets.len() < entries {
+            self.offsets.resize(entries, 0);
+        }
+    }
+
+    fn view(&self) -> Result<StringsView<'_>, Failure> {
+        StringsView::from_u64_tape(&self.data, as_u64(&self.offsets[..=self.lines]))
+            .map_err(|status| engine_failure("tape", status))
+    }
+
+    fn line(&self, index: usize) -> &[u8] {
+        &self.data[self.offsets[index]..self.offsets[index + 1]]
+    }
+}
+
 /// The corpus in the one shape every kernel here wants: a contiguous byte run plus the offset each
-/// line starts at, which is what a tape already is.
+/// line starts at.
 ///
 /// An entry runs to the start of the next one and so carries its own terminator - the offsets are
 /// a partition, and a partition cannot leave gaps. Nothing matches into one, since no needle holds
-/// a newline, and [`trimmed`] takes it off again for the handful of lines that reach an output mode.
+/// a newline, and [`trimmed`] takes it off again for the few lines that reach an output mode.
 enum Corpus<'a> {
-    /// The bytes where the host can already read them: the mapping itself, or a rewrite's product.
-    Host {
-        data: Cow<'a, [u8]>,
-        offsets: Vec<u64>,
-    },
-    /// One staged copy in unified memory, because a CUDA scope cannot follow a host pointer.
-    ///
-    /// Staged once for a whole run rather than once per walk: the same corpus serves scoring,
-    /// locating, and every fold stage between them.
-    Staged(BytesTape<u64, UnifiedAlloc>),
-    /// A rewrite's product, left where the kernel that produced it wrote it.
-    ///
-    /// The slot is a run-owned buffer that outlives any one rewrite, so `lines` says how much of
-    /// it this corpus is - the rest is capacity a previous, larger input left behind.
-    Rewritten { slot: Rewrite, lines: usize },
-}
-
-/// The two buffers `replace_into` fills, which are the two buffers a tape is made of.
-///
-/// Where they are allocated is the whole point: unified memory lets a CUDA scope read the product
-/// back without a copy, and costs a host scope dearly - managed pages are not ordinary memory - so
-/// the choice follows the device rather than being made once for both.
-enum Rewrite {
-    Host {
-        data: Vec<u8>,
-        offsets: Vec<usize>,
-    },
-    Unified {
-        data: UnifiedVec<u8>,
-        offsets: UnifiedVec<usize>,
-    },
-}
-
-impl Rewrite {
-    fn allocate(device: &DeviceScope, bytes: usize, entries: usize) -> Self {
-        match device.is_gpu() {
-            false => Self::Host {
-                data: vec![0u8; bytes],
-                offsets: vec![0usize; entries],
-            },
-            true => {
-                let mut data: UnifiedVec<u8> = UnifiedVec::new_in(UnifiedAlloc);
-                let mut offsets: UnifiedVec<usize> = UnifiedVec::new_in(UnifiedAlloc);
-                data.resize(bytes, 0);
-                offsets.resize(entries, 0);
-                Self::Unified { data, offsets }
-            }
-        }
-    }
-
-    /// This slot, made large enough for one more rewrite.
-    ///
-    /// Grows and never shrinks, so a run over many files of similar shape allocates for the first
-    /// of them and for none of the rest.
-    fn grown_to(&mut self, bytes: usize, entries: usize) {
-        match self {
-            Self::Host { data, offsets } => {
-                if data.len() < bytes {
-                    data.resize(bytes, 0);
-                }
-                if offsets.len() < entries {
-                    offsets.resize(entries, 0);
-                }
-            }
-            Self::Unified { data, offsets } => {
-                if data.len() < bytes {
-                    data.resize(bytes, 0);
-                }
-                if offsets.len() < entries {
-                    offsets.resize(entries, 0);
-                }
-            }
-        }
-    }
-
-    /// How many bytes this slot can take, which is what a rewrite is offered before it asks for more.
-    fn written_capacity(&self) -> usize {
-        self.parts().0.len()
-    }
-
-    /// The prefix a rewrite of this shape writes into, since the slot itself may be larger.
-    fn parts_upto(&mut self, bytes: usize, entries: usize) -> (&mut [u8], &mut [usize]) {
-        match self {
-            Self::Host { data, offsets } => (&mut data[..bytes], &mut offsets[..entries]),
-            Self::Unified { data, offsets } => (&mut data[..bytes], &mut offsets[..entries]),
-        }
-    }
-
-    fn parts(&self) -> (&[u8], &[usize]) {
-        match self {
-            Self::Host { data, offsets } => (data, offsets),
-            Self::Unified { data, offsets } => (data, offsets),
-        }
-    }
+    /// The input itself, which a CPU stream reads in place.
+    Borrowed { data: &'a [u8], offsets: Vec<u64> },
+    /// A copy or a product in memory the device reaches.
+    Owned(Tape<'a>),
 }
 
 impl<'a> Corpus<'a> {
-    /// Cut an input into lines, copying the bytes only where the device cannot read them in place.
-    fn lines_of(device: &DeviceScope, data: &'a [u8], newlines: Newlines) -> Result<Self, Failure> {
+    /// Cuts an input into lines, copying the bytes only where the device cannot read them in place.
+    fn lines_of(runtime: &'a Runtime, data: &'a [u8], newlines: Newlines) -> Self {
         let mut offsets: Vec<u64> = Vec::new();
         let mut end = 0usize;
         for line in named_lines(data, newlines) {
@@ -603,81 +609,35 @@ impl<'a> Corpus<'a> {
             end = line.offset + line.whole.len();
         }
         offsets.push(end as u64);
-        Self::Host {
-            data: Cow::Borrowed(&data[..end]),
+        let corpus = Self::Borrowed {
+            data: &data[..end],
             offsets,
+        };
+        match runtime.is_gpu() {
+            false => corpus,
+            true => Self::gathered(runtime, (0..corpus.len()).map(|index| corpus.line(index))),
         }
-        .on(device)
     }
 
-    /// Gather already-selected lines into a corpus of their own.
-    ///
-    /// Unlike [`Corpus::lines_of`] this always copies, and answers for the few hundred lines an
-    /// output mode asks about rather than for a whole input.
-    fn gathered<'b>(
-        device: &DeviceScope,
-        lines: impl Iterator<Item = &'b [u8]> + Clone,
-    ) -> Result<Self, Failure> {
-        // Cloned rather than collected: the first pass sizes the buffer and the second fills it,
-        // so a caller with the lines already in hand never builds a vector of slices to be read
-        // twice and dropped.
-        let mut data = Vec::with_capacity(lines.clone().map(|line| line.len()).sum());
-        let mut offsets = Vec::with_capacity(lines.clone().count() + 1);
-        for line in lines {
-            offsets.push(data.len() as u64);
-            data.extend_from_slice(line);
-        }
-        offsets.push(data.len() as u64);
-        Self::Host {
-            data: Cow::Owned(data),
-            offsets,
-        }
-        .on(device)
+    /// Gathers already-selected lines into a corpus of their own, which always copies, and so
+    /// answers for the few hundred lines an output mode asks about rather than a whole input.
+    fn gathered<'b>(runtime: &'a Runtime, lines: impl Iterator<Item = &'b [u8]> + Clone) -> Self {
+        Self::Owned(Tape::gathered(runtime, lines))
     }
 
-    /// This corpus where the device can reach it, which for a host scope is where it already is.
-    ///
-    /// The one place the staging decision is made, so no verb below has to ask again which memory
-    /// its haystacks live in.
-    fn on(self, device: &DeviceScope) -> Result<Self, Failure> {
-        // A rewrite's product is already unified, and a host scope reads unified memory fine, so
-        // neither device has anything left to do to it.
-        if !device.is_gpu() || matches!(self, Self::Rewritten { .. }) {
-            return Ok(self);
-        }
-        let mut tape: BytesTape<u64, UnifiedAlloc> =
-            BytesTape::with_capacity_in(self.bytes().len(), self.len() + 1, UnifiedAlloc)
-                .map_err(|error| engine_failure("corpus staging", error))?;
-        for index in 0..self.len() {
-            tape.push(self.line(index))
-                .map_err(|error| engine_failure("corpus staging", error))?;
-        }
-        Ok(Self::Staged(tape))
-    }
-
-    /// What the engines are handed: three words, and no copy at the call site.
-    fn haystacks(&self) -> AnyBytesTape<'_> {
+    /// What the engines are handed: a view over these bytes, with no copy at the call site.
+    fn haystacks(&self) -> Result<StringsView<'_>, Failure> {
         match self {
-            // Safety: the offsets ascend, start at zero and end at `data.len()`, since every
-            // constructor above builds them as a partition of exactly these bytes.
-            Self::Host { data, offsets } => {
-                AnyBytesTape::View64(unsafe { BytesTapeView::from_raw_parts(data, offsets) })
-            }
-            Self::Staged(tape) => AnyBytesTape::View64(tape.view()),
-            Self::Rewritten { slot, lines } => {
-                let (data, offsets) = slot.parts();
-                AnyBytesTape::View64(unsafe {
-                    BytesTapeView::from_raw_parts(data, as_u64(&offsets[..lines + 1]))
-                })
-            }
+            Self::Borrowed { data, offsets } => StringsView::from_u64_tape(data, offsets)
+                .map_err(|status| engine_failure("corpus", status)),
+            Self::Owned(tape) => tape.view(),
         }
     }
 
     fn len(&self) -> usize {
         match self {
-            Self::Host { offsets, .. } => offsets.len() - 1,
-            Self::Staged(tape) => tape.len(),
-            Self::Rewritten { lines, .. } => *lines,
+            Self::Borrowed { offsets, .. } => offsets.len() - 1,
+            Self::Owned(tape) => tape.lines,
         }
     }
 
@@ -685,52 +645,40 @@ impl<'a> Corpus<'a> {
         self.len() == 0
     }
 
-    /// Every byte the corpus spans, which is what a length-normalized BM25 needs.
-    fn bytes(&self) -> &[u8] {
+    /// Every byte the corpus spans, which is what a length-normalized BM25 divides by.
+    fn byte_count(&self) -> usize {
         match self {
-            Self::Host { data, .. } => data,
-            Self::Staged(tape) => tape.data_slice(),
-            Self::Rewritten { slot, lines } => {
-                let (data, offsets) = slot.parts();
-                &data[..offsets[*lines]]
-            }
+            Self::Borrowed { data, .. } => data.len(),
+            Self::Owned(tape) => tape.offsets[tape.lines],
         }
     }
 
     /// One entry, terminator and all.
     fn line(&self, index: usize) -> &[u8] {
         match self {
-            Self::Host { data, offsets } => {
+            Self::Borrowed { data, offsets } => {
                 &data[offsets[index] as usize..offsets[index + 1] as usize]
             }
-            Self::Staged(tape) => &tape[index],
-            Self::Rewritten { slot, .. } => {
-                let (data, offsets) = slot.parts();
-                &data[offsets[index]..offsets[index + 1]]
-            }
+            Self::Owned(tape) => tape.line(index),
+        }
+    }
+
+    /// The buffer this corpus was written into, given up so the next rewrite can use it again.
+    fn reclaimed(self) -> Option<Tape<'a>> {
+        match self {
+            Self::Owned(tape) => Some(tape),
+            Self::Borrowed { .. } => None,
         }
     }
 }
 
-/// The same offsets seen as the width a tape addresses them with.
+/// The same offsets seen as the width a tape view reads them with.
 ///
-/// `replace_into` writes `usize` and a tape view reads `u64`; on every target this suite builds for
+/// A rewrite writes `usize` and a tape view reads `u64`; on every target this suite builds for
 /// those are one type, and the assertion below is what says so.
 fn as_u64(offsets: &[usize]) -> &[u64] {
     const _: () = assert!(std::mem::size_of::<usize>() == std::mem::size_of::<u64>());
     unsafe { std::slice::from_raw_parts(offsets.as_ptr().cast::<u64>(), offsets.len()) }
-}
-
-impl Corpus<'_> {
-    /// The buffer this corpus was written into, given up so the next rewrite can use it again.
-    ///
-    /// Only a rewrite's product has one; a mapping and a staged tape own nothing a run can pass on.
-    fn reclaimed(self) -> Option<Rewrite> {
-        match self {
-            Self::Rewritten { slot, .. } => Some(slot),
-            _ => None,
-        }
-    }
 }
 
 /// An entry without whatever separated it from the next one.
@@ -771,80 +719,74 @@ impl SearchConfig {
     }
 }
 
-/// Every match in `corpus`, under the leftmost-longest cover.
+/// Every match in `corpus` under the automaton's cover, ascending by line and then by offset.
 ///
-/// Two walks rather than one: sizing the match buffer needs a count, and the engine will not
-/// answer both from a single pass. Both callers pay it, so both call this.
+/// Two walks rather than one: the first has no room for matches and writes only the boundary of
+/// every line, whose last entry is the total, so the second is sized exactly.
 fn cover(
-    automaton: &Substrings,
-    device: &DeviceScope,
+    automaton: &mut SubstringsEngine,
+    runtime: &Runtime,
     corpus: &Corpus,
-    counting: &'static str,
-    locating: &'static str,
-) -> Result<Vec<SubstringsMatch>, Failure> {
+) -> Result<Vec<Match>, Failure> {
     if corpus.is_empty() {
         return Ok(Vec::new());
     }
-    let haystacks = corpus.haystacks();
-    let mut counts = vec![0usize; corpus.len()];
-    let total = automaton
-        .count_into(
-            device,
-            &haystacks,
-            OverlapPolicy::LeftmostLongest,
-            &mut counts,
-        )
-        .map_err(|error| engine_failure(counting, error))?;
-
-    let mut matches = vec![SubstringsMatch::default(); total];
-    let written = automaton
-        .find_into(
-            device,
-            &haystacks,
-            OverlapPolicy::LeftmostLongest,
-            &mut matches,
-        )
-        .map_err(|error| engine_failure(locating, error))?;
-    matches.truncate(written);
-    Ok(matches)
+    let haystacks = corpus.haystacks()?;
+    let mut offsets = Vec::new_in(runtime.unified());
+    offsets.resize(corpus.len() + 1, 0usize);
+    let mut matches = Vec::new_in(runtime.unified());
+    runtime
+        .stream
+        .scope(|scope| automaton.find(scope, haystacks, &mut matches, &mut offsets))
+        .map_err(|status| engine_failure("match counting", status))?;
+    matches.resize(offsets[corpus.len()], Match::default());
+    runtime
+        .stream
+        .scope(|scope| automaton.find(scope, haystacks, &mut matches, &mut offsets))
+        .map_err(|status| engine_failure("match location", status))?;
+    let mut found = matches.to_vec();
+    found.sort_unstable_by_key(|one| (one.haystack_index, one.byte_offset));
+    Ok(found)
 }
 
-/// The pooled dictionary, the automaton compiled from it, and the device that walks it.
+/// The pooled dictionary, the automaton compiled from it, and the runtime that walks it.
 ///
 /// One engine serves the whole run: every `--pattern` contributes its variants to a single
 /// dictionary, so the corpus is walked once rather than once per query.
-struct Engine {
-    device: DeviceScope,
-    automaton: Substrings,
-    vocabulary: Vocabulary,
+struct Engine<'a> {
+    runtime: &'a Runtime,
+    automaton: SubstringsEngine,
+    /// Each needle's BM25 weight, where the device reads it.
+    weights: Vec<f32, UnifiedAllocator<'a>>,
     /// Applied to corpus and query alike before anything is matched.
-    folder: Option<Folder>,
+    folder: Option<Folder<'a>>,
 }
 
-impl Engine {
-    /// Expand every query into its ball and compile the pooled result.
+impl<'a> Engine<'a> {
+    /// Expands every query into its ball and compiles the pooled result.
     fn build(
         patterns: &[String],
         config: &SearchConfig,
         keyboard: &Keyboard,
         folds: &[Fold],
-        device: DeviceScope,
+        runtime: &'a Runtime,
     ) -> Result<Self, Failure> {
         // The query is folded first, so the ball is built in the domain the corpus will be matched
-        // in rather than in the one the user typed.
-        // An empty chain is no chain: no automaton is compiled, no rewrite runs, and no offset
-        // map can exist to be consulted later.
-        let folder = match folds.is_empty() {
+        // in rather than in the one the user typed. An empty chain is no chain: no automaton is
+        // compiled, no rewrite runs, and no offset map can exist to be consulted later.
+        let mut folder = match folds.is_empty() {
             true => None,
-            false => Some(Folder::new(&device, folds, config.case_sensitivity)?),
+            false => Some(Folder::new(runtime, folds, config.case_sensitivity)?),
         };
-        let patterns: Vec<String> = match &folder {
+        let patterns: Vec<String> = match &mut folder {
             Some(folder) => {
                 let sources = patterns.iter().map(|one| one.as_bytes());
-                let folded = folder.apply(&device, &Corpus::gathered(&device, sources)?)?;
-                (0..folded.len())
+                let folded = folder.apply(runtime, &Corpus::gathered(runtime, sources))?;
+                let patterns = (0..folded.len())
                     .map(|index| String::from_utf8_lossy(folded.line(index)).into_owned())
-                    .collect()
+                    .collect();
+                folder.reclaim(folded);
+                patterns
             }
             None => patterns.to_vec(),
         };
@@ -862,97 +804,85 @@ impl Engine {
                 note: "every query was empty; pass a pattern with at least one character",
             });
         }
-        let automaton = Substrings::new(&device, &vocabulary.needles, config.case_sensitivity)
-            .map_err(|error| engine_failure("multi-pattern search", error))?;
+        let automaton = runtime.compile(
+            &vocabulary.needles,
+            config.case_sensitivity,
+            "multi-pattern search",
+        )?;
+        let mut weights = Vec::with_capacity_in(vocabulary.weights.len(), runtime.unified());
+        weights.extend_from_slice(&vocabulary.weights);
         Ok(Self {
-            device,
+            runtime,
             automaton,
-            vocabulary,
+            weights,
             folder,
         })
     }
 
-    /// Score every line in one BM25 walk.
+    /// Scores every line in one BM25 walk.
     ///
     /// Weights are strictly positive, so a positive score is exactly "at least one variant of at
     /// least one query occurs in this line" - no separate counting walk is needed to decide it.
-    fn score(&self, corpus: &Corpus) -> Result<Vec<f32>, Failure> {
-        let mut scores = vec![0.0f32; corpus.len()];
+    fn score(&mut self, corpus: &Corpus) -> Result<Vec<f32, UnifiedAllocator<'a>>, Failure> {
+        let mut scores = Vec::new_in(self.runtime.unified());
+        scores.resize(corpus.len(), 0.0f32);
         if corpus.is_empty() {
             return Ok(scores);
         }
 
         // Under a fold the corpus is rewritten once and matched in the folded domain; the caller
         // still holds the original lines, which is what gets printed.
-        let folded = match &self.folder {
-            Some(folder) => Some(folder.apply(&self.device, corpus)?),
+        let folded = match &mut self.folder {
+            Some(folder) => Some(folder.apply(self.runtime, corpus)?),
             None => None,
         };
         let corpus: &Corpus = folded.as_ref().unwrap_or(corpus);
-        let haystacks = corpus.haystacks();
+        let haystacks = corpus.haystacks()?;
 
         // Length normalization divides by the corpus mean, and BM25 refuses a mean that is not
         // positive rather than quietly ignoring it, so an all-empty corpus scores unnormalized.
-        let mean = corpus.bytes().len() as f32 / corpus.len() as f32;
-        let parameters = if mean > 0.0 {
-            Bm25Params::normalized(mean)
-        } else {
-            Bm25Params::unnormalized()
+        let mean = corpus.byte_count() as f32 / corpus.len() as f32;
+        let parameters = match mean > 0.0 {
+            true => Bm25Params::normalized(mean),
+            false => Bm25Params::unnormalized(),
         };
+        let (automaton, weights) = (&mut self.automaton, &self.weights);
+        self.runtime
+            .stream
+            .scope(|scope| {
+                automaton.bm25_scores(scope, haystacks, None, &parameters, weights, &mut scores, 1)
+            })
+            .map_err(|status| engine_failure("BM25 scoring", status))?;
 
-        self.automaton
-            .score_bm25_into(
-                &self.device,
-                &haystacks,
-                &self.vocabulary.weights,
-                None,
-                parameters,
-                &mut scores,
-            )
-            .map_err(|error| engine_failure("BM25 scoring", error))?;
-        drop(haystacks);
-
-        // Nothing reads the folded bytes past this point, so the buffer goes back for the next file.
-        if let (Some(folder), Some(folded)) = (&self.folder, folded) {
+        // Nothing reads the folded bytes past this point, so the buffer serves the next file.
+        if let (Some(folder), Some(folded)) = (&mut self.folder, folded) {
             folder.reclaim(folded);
         }
         Ok(scores)
     }
 
-    /// Count and find in one place, over whatever haystacks the caller hands in.
-    ///
-    /// Deliberately a second, much smaller walk than scoring: sizing a match buffer needs a prior
-    /// count, and paying for both over the whole corpus would triple the work to answer a question
-    /// only a few hundred lines ever ask.
-    fn find(&self, corpus: &Corpus) -> Result<Vec<SubstringsMatch>, Failure> {
-        cover(
-            &self.automaton,
-            &self.device,
-            corpus,
-            "match counting",
-            "match location",
-        )
-    }
-
-    /// Locate the variants inside lines that already scored, always in the caller's own bytes.
+    /// Locates the variants inside lines that already scored, always in the caller's own bytes.
     ///
     /// The domain the automaton walked is this method's business alone: an output mode receives
     /// spans it can slice directly and never learns whether a fold ran.
-    fn locate(&self, survivors: &Corpus) -> Result<Vec<Located>, Failure> {
-        match &self.folder {
+    fn locate(&mut self, survivors: &Corpus) -> Result<Vec<Located>, Failure> {
+        let Self {
+            runtime,
+            automaton,
+            folder,
+            ..
+        } = self;
+        match folder {
             // Matched domain and printed domain agree, so the automaton's own offsets already
             // answer and no map exists to consult.
-            None => Ok(self
-                .find(survivors)?
+            None => Ok(cover(automaton, runtime, survivors)?
                 .into_iter()
                 .map(Located::verbatim)
                 .collect()),
             // The automaton was compiled from folded needles, so it has to be shown folded bytes.
-            // Handing it the originals is what made `--show matches` under a fold report a subset.
             Some(folder) => {
-                let (rewrites, folded) = folder.rewrites(&self.device, survivors)?;
-                let located: Vec<Located> = self
-                    .find(&folded)?
+                let (rewrites, folded) = folder.rewrites(runtime, survivors)?;
+                let located = cover(automaton, runtime, &folded)?
                     .into_iter()
                     .map(|found| rewrites.located(found))
                     .collect();
@@ -973,7 +903,7 @@ struct Located {
 
 impl Located {
     /// A match found in the same bytes that will be printed, so its offsets already answer.
-    fn verbatim(found: SubstringsMatch) -> Self {
+    fn verbatim(found: Match) -> Self {
         Self {
             line_index: found.haystack_index,
             byte_offset: found.byte_offset,
@@ -992,9 +922,10 @@ enum Dictionary {
 }
 
 /// One or more transforms compiled into a single rewrite.
-struct Layer {
-    automaton: Substrings,
-    targets: Vec<String>,
+struct Layer<'a> {
+    automaton: SubstringsEngine,
+    /// What each source becomes, indexed like the sources, where the device reads them.
+    replacements: Tape<'a>,
 }
 
 /// The transforms a run folds through, applied to corpus and query alike.
@@ -1003,14 +934,14 @@ struct Layer {
 /// on until a script transform has produced a Latin syllable for it - but folds that cannot are
 /// one automaton, since running them in sequence would let only one of them fire at each position
 /// anyway. So the chain is partitioned into layers, and a layer is one walk.
-struct Folder {
-    layers: Vec<Layer>,
+struct Folder<'a> {
+    layers: Vec<Layer<'a>>,
     /// Buffers the chain hands out and takes back.
     ///
     /// A fold's product is a whole rewritten corpus, and a chain over many inputs would otherwise
     /// allocate one per layer per file. Two slots serve a chain of any length, and they are grown
     /// by the largest input seen rather than sized by the current one.
-    spare: RefCell<Vec<Rewrite>>,
+    spare: Vec<Tape<'a>>,
 }
 
 /// Whether `later` can share `earlier`'s automaton.
@@ -1046,256 +977,101 @@ fn spend_sources(folds: &[Fold]) -> Vec<Fold> {
     chain
 }
 
-impl Layer {
+impl<'a> Layer<'a> {
     /// One automaton over every source of every fold in the layer.
     ///
-    /// Concatenated in chain order, because `Substrings` numbers its needles in the order it is
-    /// given them and [`Layer::sites`] reads `targets[needle_index]` back out.
+    /// Concatenated in chain order, because the engine numbers its needles in the order it is
+    /// given them and the rewrite reads replacement `needle_index` back out.
     fn compile(
-        device: &DeviceScope,
+        runtime: &'a Runtime,
         folds: &[&Fold],
         case_sensitivity: CaseSensitivity,
     ) -> Result<Self, Failure> {
-        let mut sources = Vec::new();
-        let mut targets = Vec::new();
-        for fold in folds {
-            sources.extend(fold.sources.iter().cloned());
-            targets.extend(fold.targets.iter().cloned());
-        }
-        Ok(Self {
-            automaton: Substrings::new(device, &sources, case_sensitivity)
-                .map_err(|error| engine_failure("fold", error))?,
-            targets,
-        })
-    }
-}
-
-impl Folder {
-    /// Transform rules are written in lower case, so a cased fold would leave `Coronavirus` as
-    /// `Coronafirus` while `coronavirus` became `koronafirus` - the same word landing in two
-    /// domains. The fold therefore matches uncased whenever the search does, and the replacement is
-    /// inserted verbatim, which puts both spellings in one place.
-    fn new(
-        device: &DeviceScope,
-        folds: &[Fold],
-        case_sensitivity: CaseSensitivity,
-    ) -> Result<Self, Failure> {
-        let chain = spend_sources(folds);
-        let mut layers = Vec::new();
-        let mut open: Vec<&Fold> = Vec::new();
-        for fold in &chain {
-            if !open.is_empty() && !open.iter().all(|held| fusable(held, fold)) {
-                layers.push(Layer::compile(device, &open, case_sensitivity)?);
-                open.clear();
-            }
-            open.push(fold);
-        }
-        if !open.is_empty() {
-            layers.push(Layer::compile(device, &open, case_sensitivity)?);
-        }
-        Ok(Self {
-            layers,
-            spare: RefCell::new(Vec::new()),
-        })
-    }
-
-    /// One layer per fold and no sources spent, which is what a chain of rewrites has always been.
-    ///
-    /// Kept as the oracle [`Folder::new`] is differenced against, since fusing folds that can see
-    /// each other's output goes wrong quietly - the spans come back mapped to the wrong bytes
-    /// rather than the run failing.
-    #[cfg(test)]
-    fn sequential(
-        device: &DeviceScope,
-        folds: &[Fold],
-        case_sensitivity: CaseSensitivity,
-    ) -> Result<Self, Failure> {
-        let mut layers = Vec::with_capacity(folds.len());
-        for fold in folds {
-            layers.push(Layer::compile(device, &[fold], case_sensitivity)?);
-        }
-        Ok(Self {
-            layers,
-            spare: RefCell::new(Vec::new()),
-        })
-    }
-
-    /// A slot to write into, if the run has one to spare.
-    fn lend(&self) -> Option<Rewrite> {
-        self.spare.borrow_mut().pop()
-    }
-
-    /// Take a corpus back once nothing reads it, so its buffer serves the next fold or the next file.
-    fn reclaim(&self, corpus: Corpus<'_>) {
-        if let Some(slot) = corpus.reclaimed() {
-            self.spare.borrow_mut().push(slot);
-        }
-    }
-
-    /// The bytes each idle slot can hold, so a test can see that a second input reuses them.
-    #[cfg(test)]
-    fn spare_capacity(&self) -> Vec<usize> {
-        let mut sizes: Vec<usize> = self
-            .spare
-            .borrow()
+        let sources: Vec<&str> = folds
             .iter()
-            .map(|slot| slot.parts().0.len())
+            .flat_map(|fold| fold.sources.iter().map(String::as_str))
             .collect();
-        sizes.sort_unstable();
-        sizes
+        let targets = folds
+            .iter()
+            .flat_map(|fold| fold.targets.iter().map(String::as_bytes));
+        Ok(Self {
+            automaton: runtime.compile(&sources, case_sensitivity, "fold")?,
+            replacements: Tape::gathered(runtime, targets),
+        })
     }
 
-    /// Rewrite every haystack through every stage in turn, returning owned bytes since the product
-    /// of a rewrite is a new tape.
-    fn apply(&self, device: &DeviceScope, corpus: &Corpus) -> Result<Corpus<'static>, Failure> {
-        // A folder is only built from a non-empty chain, so a first stage always exists to produce
-        // the owned tape the rest of the chain then rewrites in turn.
-        let (first, rest) = self
-            .layers
-            .split_first()
-            .expect("a fold chain is never empty");
-        let mut carried = first.rewrite(device, corpus, self.lend())?;
-        for layer in rest {
-            let next = layer.rewrite(device, &carried, self.lend())?;
-            // The corpus just consumed is the buffer the layer after next will write into.
-            self.reclaim(carried);
-            carried = next;
-        }
-        Ok(carried)
+    /// How many bytes replacement `needle_index` writes, which is how far a rewrite drifts there.
+    fn produced(&self, needle_index: usize) -> usize {
+        let offsets = &self.replacements.offsets;
+        offsets[needle_index + 1] - offsets[needle_index]
     }
 
-    /// Where every stage rewrote these lines, as the map from the folded bytes back to the caller's.
+    /// This layer's rewrite of every haystack, into `spare` when the run has a slot to give.
     ///
-    /// Returned with the folded corpus the last stage produced, so locating never re-runs the chain.
-    ///
-    /// Built only when an output mode asks for spans, and only over the lines that already scored -
-    /// a corpus-wide map of `Han-Latin` would run several times the size of the corpus itself.
-    fn rewrites<'a>(
-        &self,
-        device: &DeviceScope,
-        corpus: &Corpus,
-    ) -> Result<(Rewrites, Corpus<'a>), Failure> {
-        let mut layers = Vec::with_capacity(self.layers.len());
-        let (first, rest) = self
-            .layers
-            .split_first()
-            .expect("a fold chain is never empty");
-        layers.push(first.sites(device, corpus)?);
-        let mut carried = first.rewrite(device, corpus, self.lend())?;
-        for layer in rest {
-            layers.push(layer.sites(device, &carried)?);
-            let next = layer.rewrite(device, &carried, self.lend())?;
-            self.reclaim(carried);
-            carried = next;
-        }
-        // The last stage's own output is the folded corpus, so the caller takes it from here rather
-        // than running the whole chain a second time to arrive at the same bytes.
-        Ok((Rewrites { layers }, carried))
-    }
-}
-
-impl Layer {
-    /// This layer's rewrite of every haystack.
+    /// A rewrite's output is the next corpus already, a contiguous run plus every boundary, so the
+    /// slot is handed on rather than split into one allocation per line. It is sized by the input,
+    /// which most folds barely grow; one that needs more says how much, and runs once more.
     fn rewrite(
-        &self,
-        device: &DeviceScope,
+        &mut self,
+        runtime: &'a Runtime,
         corpus: &Corpus,
-        spare: Option<Rewrite>,
-    ) -> Result<Corpus<'static>, Failure> {
+        spare: Option<Tape<'a>>,
+    ) -> Result<Corpus<'a>, Failure> {
         if corpus.is_empty() {
-            return Corpus::gathered(device, std::iter::empty());
+            return Ok(Corpus::gathered(runtime, std::iter::empty()));
         }
-        let haystacks = corpus.haystacks();
-        let bound = self
-            .automaton
-            .replace_bound(&self.targets, corpus.bytes().len())
-            .map_err(|error| engine_failure("fold sizing", error))?;
-
-        // `replace_into` writes a contiguous run and the boundary of every entry in it, which is
-        // the next corpus already, so the slot is handed on rather than split back into one
-        // allocation per line.
-        //
-        // Sized by what the last rewrite needed rather than by `replace_bound`, which is the
-        // widest-expanding needle applied to every input byte and on a Han corpus several times
-        // what a rewrite actually produces. A slot that turns out too small is grown once and the
-        // rewrite runs again - a refusal leaves the true boundaries behind, so the second attempt
-        // asks for the exact size rather than guessing at it.
+        let Self {
+            automaton,
+            replacements,
+        } = self;
+        let haystacks = corpus.haystacks()?;
+        let replacements = replacements.view()?;
         let lines = corpus.len();
-        let mut slot = spare.unwrap_or_else(|| Rewrite::allocate(device, corpus.bytes().len(), 0));
-        slot.grown_to(corpus.bytes().len(), lines + 1);
-
-        let mut capacity = slot.written_capacity();
-        if self
-            .fill(device, &haystacks, &mut slot, capacity, lines)
-            .is_err()
-        {
-            let needed = slot.parts().1[lines];
-            // The bound is the fallback for a backend that refuses before writing any boundary.
-            capacity = match needed > capacity && needed <= bound {
-                true => needed,
-                false => bound,
-            };
-            slot.grown_to(capacity, lines + 1);
-            self.fill(device, &haystacks, &mut slot, capacity, lines)
-                .map_err(|error| engine_failure("fold", error))?;
+        let mut slot = spare.unwrap_or_else(|| Tape::gathered(runtime, std::iter::empty()));
+        slot.grown_to(corpus.byte_count(), lines + 1);
+        let mut fill = |slot: &mut Tape| {
+            runtime
+                .stream
+                .scope(|scope| {
+                    automaton.replace(
+                        scope,
+                        haystacks,
+                        replacements,
+                        &mut slot.data,
+                        &mut slot.offsets[..=lines],
+                    )
+                })
+                .map_err(|status| engine_failure("fold", status))?;
+            Ok::<usize, Failure>(automaton.report().target_length)
+        };
+        let needed = fill(&mut slot)?;
+        if needed > slot.data.len() {
+            slot.grown_to(needed, lines + 1);
+            fill(&mut slot)?;
         }
-        Ok(Corpus::Rewritten { slot, lines })
-    }
-
-    /// One rewrite into the first `capacity` bytes of `slot`, reporting only whether it fit.
-    fn fill(
-        &self,
-        device: &DeviceScope,
-        haystacks: &AnyBytesTape<'_>,
-        slot: &mut Rewrite,
-        capacity: usize,
-        lines: usize,
-    ) -> Result<usize, stringzilla::szs::Error> {
-        let (data, offsets) = slot.parts_upto(capacity, lines + 1);
-        self.automaton.replace_into(
-            device,
-            haystacks,
-            OverlapPolicy::LeftmostLongest,
-            &self.targets,
-            data,
-            offsets,
-        )
+        slot.lines = lines;
+        Ok(Corpus::Owned(slot))
     }
 
     /// Where this layer fires, in the coordinates of the bytes handed to it.
     ///
-    /// The same `LeftmostLongest` cover the rewrite uses, so the sites found here are exactly the
+    /// The same leftmost-longest cover the rewrite uses, so the sites found here are exactly the
     /// substitutions that happened.
-    fn sites(&self, device: &DeviceScope, corpus: &Corpus) -> Result<LayerMap, Failure> {
+    fn sites(&mut self, runtime: &Runtime, corpus: &Corpus) -> Result<LayerMap, Failure> {
         let mut sites = Vec::new();
         let mut starts = vec![0usize; corpus.len() + 1];
-        if corpus.is_empty() {
-            return Ok(LayerMap { sites, starts });
-        }
-
-        let mut found = cover(
-            &self.automaton,
-            device,
-            corpus,
-            "fold counting",
-            "fold locating",
-        )?;
-        // The walk emits in order of match ends and interleaves haystacks, so the ascending order
-        // the drift arithmetic needs has to be asked for.
-        found.sort_unstable_by_key(|one| (one.haystack_index, one.byte_offset));
-
         let mut line = 0usize;
         let mut drift: i64 = 0;
-        for one in found {
+        for one in cover(&mut self.automaton, runtime, corpus)? {
             while line < one.haystack_index {
                 starts[line + 1] = sites.len();
                 line += 1;
                 drift = 0;
             }
             // Under case folding a needle's own length is not the match's - a one-byte needle
-            // matches a three-byte Kelvin sign - so the consumed length comes from the match and the
-            // produced length from the replacement.
-            let produced = self.targets[one.needle_index].len();
+            // matches a three-byte Kelvin sign - so the consumed length comes from the match and
+            // the produced length from the replacement.
+            let produced = self.produced(one.needle_index);
             sites.push(Site {
                 folded_offset: (one.byte_offset as i64 + drift) as usize,
                 folded_length: produced,
@@ -1308,6 +1084,117 @@ impl Layer {
             starts[tail + 1] = sites.len();
         }
         Ok(LayerMap { sites, starts })
+    }
+}
+
+impl<'a> Folder<'a> {
+    /// Transform rules are written in lower case, so a cased fold would leave `Coronavirus` as
+    /// `Coronafirus` while `coronavirus` became `koronafirus` - the same word landing in two
+    /// domains. The fold therefore matches uncased whenever the search does, and the replacement is
+    /// inserted verbatim, which puts both spellings in one place.
+    fn new(
+        runtime: &'a Runtime,
+        folds: &[Fold],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<Self, Failure> {
+        let chain = spend_sources(folds);
+        let mut layers = Vec::new();
+        let mut open: Vec<&Fold> = Vec::new();
+        for fold in &chain {
+            if !open.is_empty() && !open.iter().all(|held| fusable(held, fold)) {
+                layers.push(Layer::compile(runtime, &open, case_sensitivity)?);
+                open.clear();
+            }
+            open.push(fold);
+        }
+        if !open.is_empty() {
+            layers.push(Layer::compile(runtime, &open, case_sensitivity)?);
+        }
+        Ok(Self {
+            layers,
+            spare: Vec::new(),
+        })
+    }
+
+    /// One layer per fold and no sources spent, which is what a chain of rewrites has always been.
+    ///
+    /// Kept as the oracle [`Folder::new`] is differenced against, since fusing folds that can see
+    /// each other's output goes wrong quietly - the spans come back mapped to the wrong bytes
+    /// rather than the run failing.
+    #[cfg(test)]
+    fn sequential(
+        runtime: &'a Runtime,
+        folds: &[Fold],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<Self, Failure> {
+        let mut layers = Vec::with_capacity(folds.len());
+        for fold in folds {
+            layers.push(Layer::compile(runtime, &[fold], case_sensitivity)?);
+        }
+        Ok(Self {
+            layers,
+            spare: Vec::new(),
+        })
+    }
+
+    /// Takes a corpus back once nothing reads it, so its buffer serves the next fold or file.
+    fn reclaim(&mut self, corpus: Corpus<'a>) {
+        if let Some(slot) = corpus.reclaimed() {
+            self.spare.push(slot);
+        }
+    }
+
+    /// The bytes each idle slot can hold, so a test can see that a second input reuses them.
+    #[cfg(test)]
+    fn spare_capacity(&self) -> Vec<usize> {
+        let mut sizes: Vec<usize> = self.spare.iter().map(|slot| slot.data.len()).collect();
+        sizes.sort_unstable();
+        sizes
+    }
+
+    /// Rewrites every haystack through every layer in turn.
+    fn apply(&mut self, runtime: &'a Runtime, corpus: &Corpus) -> Result<Corpus<'a>, Failure> {
+        let Self { layers, spare } = self;
+        // A folder is only built from a non-empty chain, so a first layer always exists to produce
+        // the owned tape the rest of the chain then rewrites in turn.
+        let (first, rest) = layers
+            .split_first_mut()
+            .expect("a fold chain is never empty");
+        let mut carried = first.rewrite(runtime, corpus, spare.pop())?;
+        for layer in rest {
+            let next = layer.rewrite(runtime, &carried, spare.pop())?;
+            // The corpus just consumed is the buffer the layer after next will write into.
+            spare.extend(carried.reclaimed());
+            carried = next;
+        }
+        Ok(carried)
+    }
+
+    /// Where every layer rewrote these lines, as the map from the folded bytes back to the
+    /// caller's, returned with the folded corpus the last layer produced, so locating never re-runs
+    /// the chain.
+    ///
+    /// Built only when an output mode asks for spans, and only over the lines that already scored -
+    /// a corpus-wide map of `Han-Latin` would run several times the size of the corpus itself.
+    fn rewrites(
+        &mut self,
+        runtime: &'a Runtime,
+        corpus: &Corpus,
+    ) -> Result<(Rewrites, Corpus<'a>), Failure> {
+        let Self { layers, spare } = self;
+        let mut maps = Vec::with_capacity(layers.len());
+        let (first, rest) = layers
+            .split_first_mut()
+            .expect("a fold chain is never empty");
+        maps.push(first.sites(runtime, corpus)?);
+        let mut carried = first.rewrite(runtime, corpus, spare.pop())?;
+        for layer in rest {
+            maps.push(layer.sites(runtime, &carried)?);
+            let next = layer.rewrite(runtime, &carried, spare.pop())?;
+            spare.extend(carried.reclaimed());
+            carried = next;
+        }
+        Ok((Rewrites { layers: maps }, carried))
     }
 }
 
@@ -1384,7 +1271,7 @@ impl Rewrites {
     }
 
     /// Carry a whole match back, so the caller receives a span it can slice directly.
-    fn located(&self, found: SubstringsMatch) -> Located {
+    fn located(&self, found: Match) -> Located {
         let line = found.haystack_index;
         let start = self.backward(line, found.byte_offset, Edge::Start);
         let end = self.backward(line, found.byte_offset + found.byte_length, Edge::End);
@@ -1412,7 +1299,7 @@ struct OutputConfig {
 /// One input's lines and the score each earned.
 struct Searched<'a> {
     corpus: Corpus<'a>,
-    scores: Vec<f32>,
+    scores: Vec<f32, UnifiedAllocator<'a>>,
 }
 
 impl Searched<'_> {
@@ -1453,12 +1340,12 @@ impl Searched<'_> {
 }
 
 /// Cut one input into lines and score all of them in a single walk.
-fn search_lines<'a>(
-    data: &'a [u8],
-    engine: &Engine,
+fn search_lines<'data, 'runtime: 'data>(
+    data: &'data [u8],
+    engine: &mut Engine<'runtime>,
     config: &SearchConfig,
-) -> Result<Searched<'a>, Failure> {
-    let corpus = Corpus::lines_of(&engine.device, data, Newlines::from_utf8(config.utf8))?;
+) -> Result<Searched<'data>, Failure> {
+    let corpus = Corpus::lines_of(engine.runtime, data, Newlines::from_utf8(config.utf8));
     let scores = engine.score(&corpus)?;
     Ok(Searched { corpus, scores })
 }
@@ -1525,7 +1412,7 @@ impl Cost {
 enum Device {
     /// The GPU where one was built in, the CPU otherwise.
     Auto,
-    /// Every core unless `--threads` says otherwise.
+    /// The host CPU.
     Cpu,
     /// Requires a build with `--features cuda`.
     Gpu,
@@ -1581,10 +1468,6 @@ struct Args {
     /// Where the kernels run
     #[arg(long, value_enum)]
     device: Option<Device>,
-
-    /// CPU thread count, where 0 is every core [default: 0]
-    #[arg(long)]
-    threads: Option<usize>,
 
     /// GPU device index [default: 0]
     #[arg(long, requires = "device")]
@@ -1658,9 +1541,6 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     if args.gpu_id.is_some() && device != Device::Gpu {
         return Err(reject("--gpu-id needs --device gpu"));
     }
-    if args.threads.is_some() && device == Device::Gpu {
-        return Err(reject("--threads is a CPU setting, and --device is gpu"));
-    }
     if args.null && args.format == Some(Format::Json) {
         return Err(reject("--format json cannot be combined with --null"));
     }
@@ -1672,23 +1552,13 @@ fn validate(args: &Args) -> Result<(), clap::Error> {
     Ok(())
 }
 
-fn build_device(
-    device: Device,
-    threads: Option<usize>,
-    gpu_id: Option<usize>,
-) -> Result<DeviceScope, String> {
-    // `DeviceScope::default()` yields a single core; 0 means every core.
-    let cores = threads.unwrap_or(0);
-    let result = match device {
-        Device::Gpu => DeviceScope::gpu_device(gpu_id.unwrap_or(0)),
-        Device::Cpu | Device::Auto => DeviceScope::cpu_cores(cores),
-    };
-    // The library's error is a struct whose `Debug` leaks its variant names into a message
-    // a person reads, so only the sentence inside it is passed on.
-    result.map_err(|error| match device {
-        Device::Gpu => format!("--device gpu is unavailable: {}", error),
-        Device::Cpu | Device::Auto => format!("--threads {} is unavailable: {}", cores, error),
-    })
+/// The runtime `--device` names; `auto` keeps to the CPU, which every build has.
+fn build_runtime(device: Device, gpu_id: Option<usize>) -> Result<Runtime, String> {
+    match device {
+        Device::Gpu => Runtime::gpu(gpu_id.unwrap_or(0))
+            .map_err(|status| format!("--device gpu is unavailable: {status}")),
+        Device::Cpu | Device::Auto => Ok(Runtime::cpu()),
+    }
 }
 
 fn main() -> std::process::ExitCode {
@@ -1698,10 +1568,10 @@ fn main() -> std::process::ExitCode {
 }
 
 /// An engine fails to build on allocation or a device fault, never on a bad argument.
-fn engine_failure(engine: &str, error: impl std::fmt::Debug) -> Failure {
+fn engine_failure(engine: &str, status: stringzilla::Status) -> Failure {
     Failure::Io {
         path: engine.to_string(),
-        source: io::Error::other(format!("init failed: {:?}", error)),
+        source: io::Error::other(format!("init failed: {status}")),
     }
 }
 
@@ -1733,17 +1603,13 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
         });
     }
 
-    let device = build_device(
-        args.device.unwrap_or(Device::Auto),
-        args.threads,
-        args.gpu_id,
-    )
-    .map_err(|message| reject(&message))?;
+    let runtime = build_runtime(args.device.unwrap_or(Device::Auto), args.gpu_id)
+        .map_err(|message| reject(&message))?;
 
     let folds = resolve_folds(&args.fold, effort.folding())?;
 
     let config = SearchConfig::resolve(args, effort);
-    let engine = Engine::build(&patterns, &config, &keyboard, &folds, device)?;
+    let mut engine = Engine::build(&patterns, &config, &keyboard, &folds, &runtime)?;
 
     let output_config = OutputConfig {
         line_numbers: args.fields.contains(&Field::LineNumbers),
@@ -1765,7 +1631,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     let opened = inputs
         .iter()
         .map(|path| (path.as_str(), get_input(Some(path))));
-    let outcome = search_inputs(writer, notes, opened, &engine, &config, &output_config)?;
+    let outcome = search_inputs(writer, notes, opened, &mut engine, &config, &output_config)?;
 
     output.flush().at("-")?;
     if outcome.readable == 0 {
@@ -1810,7 +1676,7 @@ fn search_inputs<'a>(
     output: &mut dyn Write,
     notes: &mut dyn Write,
     inputs: impl IntoIterator<Item = (&'a str, io::Result<InputSource>)>,
-    engine: &Engine,
+    engine: &mut Engine,
     config: &SearchConfig,
     out_cfg: &OutputConfig,
 ) -> Result<Outcome, Failure> {
@@ -1875,7 +1741,7 @@ fn search_inputs<'a>(
             // lines that already scored rather than over the whole corpus.
             Show::Matches => {
                 let lines = survivors.iter().map(|(_, line, _)| *line);
-                let selected = Corpus::gathered(&engine.device, lines)?;
+                let selected = Corpus::gathered(engine.runtime, lines);
                 for located in engine.locate(&selected)? {
                     let (index, line, score) = survivors[located.line_index];
                     let span =
@@ -2019,7 +1885,6 @@ mod tests {
                 "top-k",
                 "min-score",
                 "device",
-                "threads",
                 "gpu-id",
                 "ignore-case",
                 "fields",
@@ -2068,16 +1933,6 @@ mod tests {
         let args = Args::try_parse_from(["sz-fuzzy-find", "--device", "cpu", "--gpu-id", "1", "a"])
             .unwrap();
         assert!(validate(&args).is_err());
-    }
-
-    #[test]
-    fn accepts_threads_under_the_default_device() {
-        // `--threads` used to demand `--device`, which the default already resolves to CPU.
-        let args = Args::try_parse_from(["sz-fuzzy-find", "--threads", "2", "a"]).unwrap();
-        assert!(validate(&args).is_ok());
-        let gpu = Args::try_parse_from(["sz-fuzzy-find", "--device", "gpu", "--threads", "2", "a"])
-            .unwrap();
-        assert!(validate(&gpu).is_err());
     }
 
     #[test]
@@ -2263,8 +2118,8 @@ mod tests {
 
     // region: Searching
 
-    fn cpu() -> DeviceScope {
-        DeviceScope::cpu_cores(1).expect("a CPU scope is always available")
+    fn cpu() -> Runtime {
+        Runtime::cpu()
     }
 
     fn config(max_distance: usize) -> SearchConfig {
@@ -2281,8 +2136,10 @@ mod tests {
 
     fn matching_lines(patterns: &[&str], data: &[u8], config: &SearchConfig) -> Vec<String> {
         let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
-        let engine = Engine::build(&patterns, config, &us(), &[], cpu()).expect("engine builds");
-        let found = search_lines(data, &engine, config).expect("search runs");
+        let runtime = cpu();
+        let mut engine =
+            Engine::build(&patterns, config, &us(), &[], &runtime).expect("engine builds");
+        let found = search_lines(data, &mut engine, config).expect("search runs");
         found
             .survivors(0.0, Newlines::from_utf8(config.utf8))
             .into_iter()
@@ -2328,14 +2185,15 @@ mod tests {
         let data = b"the color red\nnothing here\n";
         let patterns = vec!["color".to_string()];
         let config = config(0);
-        let engine = Engine::build(&patterns, &config, &us(), &[], cpu()).unwrap();
-        let found = search_lines(data, &engine, &config).unwrap();
+        let runtime = cpu();
+        let mut engine = Engine::build(&patterns, &config, &us(), &[], &runtime).unwrap();
+        let found = search_lines(data, &mut engine, &config).unwrap();
         let survivors: Vec<&[u8]> = found
             .survivors(0.0, Newlines::from_utf8(config.utf8))
             .into_iter()
             .map(|(_, line, _)| line)
             .collect();
-        let selected = Corpus::gathered(&engine.device, survivors.iter().copied()).unwrap();
+        let selected = Corpus::gathered(&runtime, survivors.iter().copied());
         let located = engine.locate(&selected).unwrap();
         assert_eq!(located.len(), 1);
         assert_eq!(located[0].line_index, 0);
@@ -2347,7 +2205,8 @@ mod tests {
     fn keeps_matches_when_one_input_is_missing() {
         let patterns = vec!["color".to_string()];
         let config = config(1);
-        let engine = Engine::build(&patterns, &config, &us(), &[], cpu()).unwrap();
+        let runtime = cpu();
+        let mut engine = Engine::build(&patterns, &config, &us(), &[], &runtime).unwrap();
         let out_cfg = OutputConfig {
             line_numbers: false,
             scores: false,
@@ -2366,7 +2225,7 @@ mod tests {
             &mut written,
             &mut io::sink(),
             inputs,
-            &engine,
+            &mut engine,
             &config,
             &out_cfg,
         )
@@ -2425,7 +2284,9 @@ mod tests {
         // And the claim is about what gets built, not only about what gets named.
         let patterns = vec!["color".to_string()];
         let config = config(1);
-        let engine = Engine::build(&patterns, &config, &us(), &[], cpu()).expect("engine builds");
+        let runtime = cpu();
+        let engine =
+            Engine::build(&patterns, &config, &us(), &[], &runtime).expect("engine builds");
         assert!(
             engine.folder.is_none(),
             "an empty chain compiled an automaton"
@@ -2500,7 +2361,6 @@ mod tests {
         assert_eq!(map.backward(0, 2, Edge::End), 5);
     }
 
-    #[test]
     /// Two folds share a walk only when neither can pick up where the other leaves off.
     #[test]
     fn fuses_only_folds_that_cannot_see_each_other() {
@@ -2550,23 +2410,30 @@ mod tests {
     /// The buffers a fold writes into outlive the file that sized them.
     #[test]
     fn folds_a_second_file_without_allocating_again() {
-        let (engine, config) = engine_at(Effort::Sounds, "phonetic");
-        let folder = engine.folder.as_ref().expect("Sounds folds");
+        let runtime = cpu();
+        let (mut engine, config) = engine_at(&runtime, Effort::Sounds, "phonetic");
+        let spare = |engine: &Engine| {
+            engine
+                .folder
+                .as_ref()
+                .expect("Sounds folds")
+                .spare_capacity()
+        };
 
         // A wide file first, so the slots are grown to fit it.
         let wide =
             "phonetic analysis of a fairly long line, repeated to give the fold work\n".repeat(64);
-        search_lines(wide.as_bytes(), &engine, &config).expect("wide file scores");
-        let after_wide = folder.spare_capacity();
+        search_lines(wide.as_bytes(), &mut engine, &config).expect("wide file scores");
+        let after_wide = spare(&engine);
         assert!(
             after_wide.iter().all(|bytes| *bytes > 0),
             "no slot came back from the first file: {after_wide:?}"
         );
 
         // Then a narrow one, which must fit in what the wide one left behind.
-        search_lines(b"phonetic\n", &engine, &config).expect("narrow file scores");
+        search_lines(b"phonetic\n", &mut engine, &config).expect("narrow file scores");
         assert_eq!(
-            folder.spare_capacity(),
+            spare(&engine),
             after_wide,
             "the second file grew a buffer it should have reused"
         );
@@ -2595,7 +2462,11 @@ mod tests {
         // Kana leads alone - six of its rules read a Latin vowel, so anything emitting one feeds
         // it. The four script transforms then share a walk. `Latin-ASCII` strips the tone marks
         // they emit, and phonetics read what it leaves.
-        let sizes: Vec<usize> = folder.layers.iter().map(|one| one.targets.len()).collect();
+        let sizes: Vec<usize> = folder
+            .layers
+            .iter()
+            .map(|one| one.replacements.lines)
+            .collect();
         assert_eq!(sizes.len(), 4, "seven folds, four walks: {sizes:?}");
         assert_eq!(sizes[0], 292, "Kana-Latin, less its 143 duplicated sources");
         assert_eq!(
@@ -2645,8 +2516,8 @@ mod tests {
         let lines: Vec<&[u8]> = probes.iter().map(|one| one.as_bytes()).collect();
 
         for case_sensitivity in [CaseSensitivity::Cased, CaseSensitivity::Uncased] {
-            let fused = Folder::new(&device, &folds, case_sensitivity).expect("layers compile");
-            let serial =
+            let mut fused = Folder::new(&device, &folds, case_sensitivity).expect("layers compile");
+            let mut serial =
                 Folder::sequential(&device, &folds, case_sensitivity).expect("stages compile");
             assert!(
                 fused.layers.len() < serial.layers.len(),
@@ -2654,7 +2525,7 @@ mod tests {
                 fused.layers.len()
             );
 
-            let corpus = Corpus::gathered(&device, lines.iter().copied()).expect("corpus gathers");
+            let corpus = Corpus::gathered(&device, lines.iter().copied());
             let by_layer = fused.apply(&device, &corpus).expect("fused folds");
             let by_stage = serial.apply(&device, &corpus).expect("sequential folds");
             assert_eq!(by_layer.len(), by_stage.len());
@@ -2691,6 +2562,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn chains_transliteration_before_phonetics() {
         let chain = Folding::Scripts.transforms();
         let at = |name: &str| chain.iter().position(|one| *one == name).expect(name);
@@ -2727,8 +2599,9 @@ mod tests {
 
     /// The lines one effort matches, as owned strings so rungs can be compared against each other.
     fn matched_at(effort: Effort, pattern: &str, data: &[u8]) -> Vec<String> {
-        let (engine, config) = engine_at(effort, pattern);
-        let found = search_lines(data, &engine, &config).expect("search runs");
+        let runtime = cpu();
+        let (mut engine, config) = engine_at(&runtime, effort, pattern);
+        let found = search_lines(data, &mut engine, &config).expect("search runs");
         found
             .survivors(0.0, Newlines::from_utf8(config.utf8))
             .into_iter()
@@ -2738,15 +2611,15 @@ mod tests {
 
     /// The matched spans one effort locates, sliced from the original lines.
     fn spans_at(effort: Effort, pattern: &str, data: &[u8]) -> Vec<String> {
-        let (engine, config) = engine_at(effort, pattern);
-        let found = search_lines(data, &engine, &config).expect("search runs");
+        let runtime = cpu();
+        let (mut engine, config) = engine_at(&runtime, effort, pattern);
+        let found = search_lines(data, &mut engine, &config).expect("search runs");
         let survivors: Vec<&[u8]> = found
             .survivors(0.0, Newlines::from_utf8(config.utf8))
             .into_iter()
             .map(|(_, line, _)| line)
             .collect();
-        let selected =
-            Corpus::gathered(&engine.device, survivors.iter().copied()).expect("corpus gathers");
+        let selected = Corpus::gathered(&runtime, survivors.iter().copied());
         engine
             .locate(&selected)
             .expect("locate runs")
@@ -2759,7 +2632,11 @@ mod tests {
             .collect()
     }
 
-    fn engine_at(effort: Effort, pattern: &str) -> (Engine, SearchConfig) {
+    fn engine_at<'a>(
+        runtime: &'a Runtime,
+        effort: Effort,
+        pattern: &str,
+    ) -> (Engine<'a>, SearchConfig) {
         let config = SearchConfig {
             max_distance: effort.max_distance(),
             alphabet: effort.alphabet(),
@@ -2772,7 +2649,7 @@ mod tests {
         let folds = resolve_folds(&[], effort.folding()).expect("folds resolve");
         let patterns = vec![pattern.to_string()];
         let engine =
-            Engine::build(&patterns, &config, &us(), &folds, cpu()).expect("engine builds");
+            Engine::build(&patterns, &config, &us(), &folds, runtime).expect("engine builds");
         (engine, config)
     }
 

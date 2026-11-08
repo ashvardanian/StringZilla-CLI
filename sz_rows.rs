@@ -17,7 +17,7 @@ use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
-use stringzilla::sz;
+use stringzilla as sz;
 
 use shared::*;
 

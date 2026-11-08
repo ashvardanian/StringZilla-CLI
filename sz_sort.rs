@@ -18,7 +18,7 @@ use std::io::{self, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use stringtape::{BytesCowsAuto, StringTapeError};
-use stringzilla::sz;
+use stringzilla as sz;
 
 use shared::*;
 
@@ -105,16 +105,12 @@ fn line_at<'a>(lines: &'a BytesCowsAuto<'a>, index: usize) -> &'a [u8] {
 /// Compute the sorted permutation directly via StringZilla's `argsort`, which folds
 /// case and reverses inside the kernel — so the case-insensitive path never
 /// materializes a folded key per line.
-fn sorted_order(
-    lines: &BytesCowsAuto<'_>,
-    order: SortOrder,
-) -> Result<Vec<sz::SortedIdx>, sz::Status> {
-    let mut permutation = vec![0usize; lines.len()];
-    sz::argsort_by(
-        |index| line_at(lines, index),
-        &mut permutation,
-        order.argsort_options(),
-    )?;
+fn sorted_order(lines: &BytesCowsAuto<'_>, order: SortOrder) -> Result<Vec<usize>, sz::Status> {
+    let slices: Vec<&[u8]> = (0..lines.len())
+        .map(|index| line_at(lines, index))
+        .collect();
+    let mut permutation = vec![0usize; slices.len()];
+    sz::argsort(&slices, &mut permutation, order.argsort_options())?;
     Ok(permutation)
 }
 
@@ -163,7 +159,7 @@ fn write_summary_json(
 /// Returns how many lines were written.
 fn write_sorted(
     lines: &BytesCowsAuto<'_>,
-    permutation: &[sz::SortedIdx],
+    permutation: &[usize],
     order: SortOrder,
     config: &OutputConfig,
     output: &mut dyn Write,

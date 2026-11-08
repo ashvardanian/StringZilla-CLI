@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringzilla::sz::{
+use stringzilla::{
     StringZillableUnary, Utf8Graphemes, Utf8Linebreaks, Utf8Segments, Utf8Sentences,
     Utf8SplitDelimiters, Utf8SplitNewlines, Utf8SplitWhitespaces, Utf8Wordbreaks,
 };

@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use std::ops::RangeInclusive;
 
 use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
-use stringzilla::sz::{FindSplits, Matcher};
+use stringzilla::{FindSplits, Matcher};
 
 use shared::*;
 

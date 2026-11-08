@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringzilla::sz::{find, StringZillableUnary};
+use stringzilla::{find, StringZillableUnary};
 
 use shared::*;
 

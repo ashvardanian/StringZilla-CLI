@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 
 use clap::{CommandFactory, Parser};
-use stringzilla::sz;
+use stringzilla as sz;
 
 use shared::*;
 

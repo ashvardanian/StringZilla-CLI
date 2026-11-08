@@ -29,7 +29,7 @@ use std::cmp::Ordering;
 use std::io::{self, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringzilla::sz;
+use stringzilla as sz;
 
 use shared::*;
 

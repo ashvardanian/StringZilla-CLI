@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use stringzilla::sz;
+use stringzilla as sz;
 
 use shared::*;
 
@@ -1266,31 +1266,31 @@ mod direct {
 
     // SAFETY: every request is forwarded to the global allocator under a layout that only widens
     // the alignment, and the same widening is applied when the block is handed back.
-    unsafe impl allocator_api2::alloc::Allocator for PageAligned {
+    unsafe impl std::alloc::Allocator for PageAligned {
         fn allocate(
             &self,
             layout: std::alloc::Layout,
-        ) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
             let paged = layout
                 .align_to(DIRECT_IO_ALIGNMENT)
-                .map_err(|_| allocator_api2::alloc::AllocError)?;
+                .map_err(|_| std::alloc::AllocError)?;
             // Zeroed rather than raw, so the pages are pre-faulted and the first read into a block
             // does not take a minor fault inside the hot loop.
-            allocator_api2::alloc::Global.allocate_zeroed(paged)
+            std::alloc::Global.allocate_zeroed(paged)
         }
 
         unsafe fn deallocate(&self, pointer: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
             let paged = layout
                 .align_to(DIRECT_IO_ALIGNMENT)
                 .expect("the widening that allocated this cannot fail to repeat");
-            unsafe { allocator_api2::alloc::Global.deallocate(pointer, paged) }
+            unsafe { std::alloc::Global.deallocate(pointer, paged) }
         }
     }
 
     /// One page-aligned allocation carved into equal blocks — the only heap a worker's reads ever
     /// touch, and an ordinary vector rather than a raw pointer and a hand-written `Drop`.
     pub struct BufferArena {
-        storage: allocator_api2::vec::Vec<u8, PageAligned>,
+        storage: Vec<u8, PageAligned>,
         block: usize,
     }
 
@@ -1299,7 +1299,7 @@ mod direct {
             let bytes = blocks
                 .checked_mul(block)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let mut storage = allocator_api2::vec::Vec::new_in(PageAligned);
+            let mut storage = Vec::new_in(PageAligned);
             storage
                 .try_reserve_exact(bytes)
                 .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;

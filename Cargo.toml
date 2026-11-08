@@ -3,6 +3,7 @@ authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
 categories = ["command-line-utilities", "text-processing"]
 description = "SIMD-accelerated command-line text processing utilities built on StringZilla"
 edition = "2021"
+rust-version = "1.100"
 keywords = ["cli", "text-processing", "simd", "performance"]
 license = "Apache-2.0"
 name = "stringzilla-cli"
@@ -34,14 +35,13 @@ fuzzy-find = []
 outline = []    # Pre-production, opt-in: `sz-outline` is being reimplemented
 
 [dependencies]
-allocator-api2 = "0.4"
 clap = { version = "4.5", features = ["derive"] } # CLI argument parsing 
-forkunion = "3.0.2" # Thread pool behind `sz-sha256`
+forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion" } # Thread pool behind `sz-sha256`
 glob = "0.3" # Glob pattern matching
 ignore = "0.4" # .gitignore support
 memmap2 = "0.9" # Memory-mapped file I/O
-stringtape = "2.4" # Compact (offset, length) storage for line collections
-stringzilla = "6.0.0-rc.1" # SIMD string operations
+stringtape = "2.5" # Compact (offset, length) storage for line collections
+stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla" } # SIMD string operations
 
 [dev-dependencies]
 tempfile = "3.10"

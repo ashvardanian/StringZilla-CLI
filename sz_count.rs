@@ -17,8 +17,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
-use stringzilla::sz;
-use stringzilla::sz::StringZillableUnary;
+use stringzilla as sz;
+use stringzilla::StringZillableUnary;
 
 use shared::*;
 

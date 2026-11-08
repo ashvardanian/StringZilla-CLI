@@ -761,11 +761,11 @@ The phonetic tables are authored from published algorithms rather than vendored,
 #### Execution Device (`--device`)
 
 ```bash
-$ sz-fuzzy-find --device cpu --threads 8 needle big.txt # CPU, 8 threads
-$ sz-fuzzy-find --device gpu needle big.txt             # GPU (see build note)
+$ sz-fuzzy-find --device cpu needle big.txt # CPU, on the calling thread
+$ sz-fuzzy-find --device gpu needle big.txt # GPU (see build note)
 ```
 
-Every core is used unless `--threads` says otherwise. The GPU path requires a CUDA build:
+The CPU path runs on the calling thread. The GPU path requires a CUDA build:
 
 ```bash
 # On systems with gcc > 14 + CUDA 12.x, point nvcc at a supported host compiler:

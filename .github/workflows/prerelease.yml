@@ -25,7 +25,7 @@ jobs:
           fetch-depth: 0
       # `pre-commit` formats, lints and greps the staged tree, so it needs the toolchain and `rg`.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: Install ripgrep
@@ -58,7 +58,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: Check formatting
@@ -84,7 +84,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release
       - name: Test

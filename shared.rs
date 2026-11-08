@@ -29,8 +29,8 @@ pub mod folds;
 pub mod misspellings;
 
 use memmap2::Mmap;
-use stringzilla::sz;
-use stringzilla::sz::{FindSplits, StringZillableBinary, StringZillableUnary, Utf8SplitNewlines};
+use stringzilla as sz;
+use stringzilla::{FindSplits, StringZillableBinary, StringZillableUnary, Utf8SplitNewlines};
 
 // region: Input Sources
 
